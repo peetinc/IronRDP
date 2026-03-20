@@ -2,29 +2,18 @@
     import { currentSession, setCurrentSessionActive, userInteractionService } from '../../services/session.service';
     import type { IronError, UserInteraction } from '../../../static/iron-remote-desktop';
     import type { Session } from '../../models/session';
-    import {
-        preConnectionBlob,
-        displayControl,
-        kdcProxyUrl,
-        vmConnect,
-        init,
-        type VmConnectMode,
-    } from '../../../static/iron-remote-desktop-rdp';
+    import { displayControl, kdcProxyUrl, init } from '../../../static/iron-remote-desktop-rdp';
     import { toast } from '$lib/messages/message-store';
     import { showLogin } from '$lib/login/login-store';
     import { onMount } from 'svelte';
 
     let username = 'Administrator';
-    let password = 'DevoLabs123!';
-    let gatewayAddress = 'ws://localhost:7171/jet/rdp';
-    let hostname = '10.10.0.3:3389';
+    let password = '';
+    let gatewayAddress = 'ws://localhost:8765';
+    let hostname = 'localhost:3389';
     let domain = '';
-    let authtoken = '';
     let kdc_proxy_url = '';
     let desktopSize = { width: 1280, height: 720 };
-    let pcb = '';
-    let vmconnectId = '';
-    let vmconnectMode: VmConnectMode = 'enhanced';
     let pop_up = false;
     let enable_clipboard = true;
 
@@ -44,46 +33,6 @@
     };
 
     const StartSession = async () => {
-        if (authtoken === '') {
-            const token_server_url = import.meta.env.VITE_IRON_TOKEN_SERVER_URL as string | undefined;
-            if (token_server_url === undefined || token_server_url.trim() === '') {
-                toast.set({
-                    type: 'error',
-                    message: 'Token server is not set and no token provided',
-                });
-                throw new Error('Token server is not set and no token provided');
-            }
-            try {
-                const response = await fetch(`${token_server_url}/forward`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                        dst_hst: hostname,
-                        jet_ap: 'rdp',
-                        jet_ttl: 3600,
-                        jet_rec: false,
-                    }),
-                });
-
-                const data = await response.json();
-                if (response.ok) {
-                    authtoken = data.token;
-                } else if (data.error !== undefined) {
-                    throw new Error(data.error);
-                } else {
-                    throw new Error('Unknown error occurred');
-                }
-            } catch (error) {
-                console.error('Error fetching token:', error);
-                toast.set({
-                    type: 'error',
-                    message: 'Error fetching token',
-                });
-            }
-        }
-
         toast.set({
             type: 'info',
             message: 'Connection in progress...',
@@ -96,11 +45,7 @@
                 hostname,
                 gatewayAddress,
                 domain,
-                authtoken,
                 desktopSize,
-                pcb,
-                vmconnectId,
-                vmconnectMode,
                 kdc_proxy_url,
                 enable_clipboard,
             });
@@ -122,17 +67,9 @@
             .withDestination(hostname)
             .withProxyAddress(gatewayAddress)
             .withServerDomain(domain)
-            .withAuthToken(authtoken)
+            .withAuthToken('')
             .withDesktopSize(desktopSize)
             .withExtension(displayControl(true));
-
-        if (pcb !== '') {
-            configBuilder.withExtension(preConnectionBlob(pcb));
-        }
-
-        if (vmconnectId !== '') {
-            configBuilder.withExtension(vmConnect(vmconnectId, vmconnectMode));
-        }
 
         if (kdc_proxy_url !== '') {
             configBuilder.withExtension(kdcProxyUrl(kdc_proxy_url));
@@ -218,25 +155,6 @@
                         <div class="field label border">
                             <input id="gatewayAddress" type="text" bind:value={gatewayAddress} />
                             <label for="gatewayAddress">Gateway Address</label>
-                        </div>
-                        <div class="field label border">
-                            <input id="authtoken" type="text" bind:value={authtoken} />
-                            <label for="authtoken">AuthToken (Optional)</label>
-                        </div>
-                        <div class="field label border">
-                            <input id="pcb" type="text" bind:value={pcb} />
-                            <label for="pcb">Legacy Pre Connection Blob</label>
-                        </div>
-                        <div class="field label border">
-                            <input id="vmconnect_id" type="text" bind:value={vmconnectId} />
-                            <label for="vmconnect_id">VMConnect VM ID</label>
-                        </div>
-                        <div class="field label border">
-                            <select id="vmconnect_mode" bind:value={vmconnectMode}>
-                                <option value="enhanced">Enhanced</option>
-                                <option value="basic">Basic</option>
-                            </select>
-                            <label for="vmconnect_mode">VMConnect Mode</label>
                         </div>
                         <div class="field label border">
                             <input id="desktopSizeW" type="text" bind:value={desktopSize.width} />

@@ -132,9 +132,7 @@ export class ConfigBuilder {
         if (this.proxyAddress === '') {
             throw new Error('proxy address has to be specified');
         }
-        if (this.authToken === '') {
-            throw new Error('authentication token has to be specified');
-        }
+        // authToken not required for direct connection mode (no RDCleanPath)
         const userData = { username: this.username, password: this.password };
         const proxyData = { address: this.proxyAddress, authToken: this.authToken };
 
