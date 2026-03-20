@@ -32,7 +32,7 @@ use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_core::WriteBuf;
-use ironrdp_futures::{FramedWrite, single_sequence_step_read};
+use ironrdp_futures::{FramedWrite, single_sequence_step, single_sequence_step_read};
 use rgb::AsPixels as _;
 use tap::prelude::*;
 use tracing::{debug, error, info, trace, warn};
@@ -350,9 +350,6 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             server_domain,
             password,
             proxy_address,
-            auth_token,
-            pcb,
-            vmconnect,
             kdc_proxy_url,
             client_name,
             desktop_size,
@@ -386,9 +383,6 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             server_domain = inner.server_domain.clone();
             password = inner.password.clone().context("password missing")?;
             proxy_address = inner.proxy_address.clone().context("proxy_address missing")?;
-            auth_token = inner.auth_token.clone().context("auth_token missing")?;
-            pcb = inner.pcb.clone();
-            vmconnect = inner.vmconnect.clone();
             kdc_proxy_url = inner.kdc_proxy_url.clone();
             client_name = inner.client_name.clone();
             desktop_size = inner.desktop_size;
@@ -423,14 +417,6 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                 enable_credssp: inner.enable_credssp,
                 enable_standard_rdp_security: inner.enable_standard_rdp_security,
             };
-        }
-
-        if pcb.is_some() && vmconnect.is_some() {
-            return Err(anyhow::Error::msg("generic preconnection blob and VMConnect are mutually exclusive").into());
-        }
-
-        if security.enable_standard_rdp_security && vmconnect.is_some() {
-            return Err(anyhow::Error::msg("standard RDP security and VMConnect are mutually exclusive").into());
         }
 
         info!("Connect to RDP host");
@@ -522,10 +508,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         let (connection_result, ws) = connect(ConnectParams {
             ws,
             config,
-            proxy_auth_token: auth_token,
             destination,
-            pcb,
-            vmconnect,
             kdc_proxy_url,
             clipboard_backend: clipboard.as_ref().map(|clip| clip.backend()),
             printer_backend,
@@ -1588,10 +1571,7 @@ async fn writer_task(
 struct ConnectParams {
     ws: WebSocket,
     config: connector::Config,
-    proxy_auth_token: String,
     destination: String,
-    pcb: Option<String>,
-    vmconnect: Option<String>,
     kdc_proxy_url: Option<String>,
     clipboard_backend: Option<WasmClipboardBackend>,
     printer_backend: Option<WasmPrinterBackend>,
@@ -1640,10 +1620,7 @@ async fn connect(
     ConnectParams {
         ws,
         config,
-        proxy_auth_token,
         destination,
-        pcb,
-        vmconnect,
         kdc_proxy_url,
         clipboard_backend,
         printer_backend,
@@ -1685,31 +1662,15 @@ async fn connect(
         );
     }
 
-    let kerberos_config = url::Url::parse(kdc_proxy_url.unwrap_or_default().as_str())
-        .ok()
-        .map(|url| KerberosConfig {
-            kdc_proxy_url: Some(url),
-            // HACK: It's supposed to be the computer name of the client, but since it's not easy to retrieve this information in the browser,
-            // we set the destination hostname instead because it happens to work.
-            hostname: destination.clone(),
-        });
+    // Direct connection mode: X.224 exchange happens directly over WebSocket.
+    // A TLS-terminating proxy handles TLS upgrade on the TCP side and sends
+    // back the server's DER-encoded public key as a length-prefixed message:
+    //   [0x00][len:4 BE][server_public_key_der]
+    // The 0x00 tag byte distinguishes this from RDP PDUs (which start with 0x03).
+    let (upgraded, server_public_key) = connect_direct(&mut framed, &mut connector).await?;
 
     let mut network_client = WasmNetworkClient;
     let server_name = connector::ServerName::from(destination.as_str());
-    let (upgraded, server_public_key) = connect_rdcleanpath(
-        &mut framed,
-        &mut connector,
-        &mut network_client,
-        RDCleanPathConnectParams {
-            server_name: server_name.clone(),
-            destination: destination.clone(),
-            proxy_auth_token,
-            pcb,
-            vmconnect,
-            kerberos_config: kerberos_config.clone(),
-        },
-    )
-    .await?;
 
     let connection_result = ironrdp_futures::connect_finalize(
         upgraded,
@@ -1718,7 +1679,12 @@ async fn connect(
         &mut network_client,
         server_name,
         server_public_key,
-        kerberos_config,
+        url::Url::parse(kdc_proxy_url.unwrap_or_default().as_str())
+            .ok()
+            .map(|url| KerberosConfig {
+                kdc_proxy_url: Some(url),
+                hostname: destination,
+            }),
     )
     .await?;
 
@@ -1727,231 +1693,75 @@ async fn connect(
     Ok((connection_result, ws))
 }
 
-struct RDCleanPathConnectParams {
-    server_name: connector::ServerName,
-    destination: String,
-    proxy_auth_token: String,
-    pcb: Option<String>,
-    vmconnect: Option<String>,
-    kerberos_config: Option<KerberosConfig>,
-}
-
-async fn connect_rdcleanpath<S, N>(
+/// Direct connection mode (no RDCleanPath).
+///
+/// The WebSocket connects to a TLS-terminating proxy that:
+/// 1. Relays X.224 connection request/confirm transparently
+/// 2. Performs TLS upgrade on the TCP side when the RDP server requests it
+/// 3. Sends the server's DER-encoded SubjectPublicKeyInfo back to the browser
+///    as a tagged message: [0x00][len:4 BE][spki_der_bytes]
+/// 4. Then relays all subsequent bytes transparently
+///
+/// The 0x00 tag byte distinguishes the key message from RDP PDUs (which start with 0x03).
+async fn connect_direct<S>(
     framed: &mut ironrdp_futures::Framed<S>,
     connector: &mut ClientConnector,
-    network_client: &mut N,
-    params: RDCleanPathConnectParams,
 ) -> Result<(ironrdp_futures::Upgraded, Vec<u8>), IronError>
 where
     S: ironrdp_futures::FramedRead + FramedWrite,
-    N: ironrdp_futures::NetworkClient,
 {
-    use ironrdp::connector::Sequence as _;
-    use x509_cert::der::Decode as _;
+    info!("Begin direct connection procedure");
 
+    // Step 1: X.224 connection request/confirm exchange happens directly over the WebSocket.
+    // The proxy relays these bytes transparently to the RDP target.
+    let mut buf = WriteBuf::new();
+
+    while !connector.should_perform_security_upgrade() {
+        single_sequence_step(framed, connector, &mut buf).await?;
+    }
+
+    // Step 2: The proxy has now upgraded the TCP side to TLS and sends us the
+    // server's public key as [0x00][len:4 BE][spki_der].
     #[derive(Clone, Copy, Debug)]
-    struct RDCleanPathHint;
+    struct ServerKeyHint;
 
-    const RDCLEANPATH_HINT: RDCleanPathHint = RDCleanPathHint;
-
-    impl ironrdp::pdu::PduHint for RDCleanPathHint {
+    impl ironrdp::pdu::PduHint for ServerKeyHint {
         fn find_size(&self, bytes: &[u8]) -> ironrdp::core::DecodeResult<Option<(bool, usize)>> {
-            match ironrdp_rdcleanpath::RDCleanPathPdu::detect(bytes) {
-                ironrdp_rdcleanpath::DetectionResult::Detected { total_length, .. } => Ok(Some((true, total_length))),
-                ironrdp_rdcleanpath::DetectionResult::NotEnoughBytes => Ok(None),
-                ironrdp_rdcleanpath::DetectionResult::Failed => Err(ironrdp::core::other_err!(
-                    "RDCleanPathHint",
-                    "detection failed (invalid PDU)"
-                )),
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            if bytes[0] != 0x00 {
+                return Err(ironrdp::core::other_err!(
+                    "ServerKeyHint",
+                    "expected tag 0x00 for server public key message"
+                ));
+            }
+            if bytes.len() < 5 {
+                return Ok(None);
+            }
+            let len = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
+            let total = 5 + len;
+            if bytes.len() < total {
+                Ok(None)
+            } else {
+                Ok(Some((true, total)))
             }
         }
     }
 
-    let RDCleanPathConnectParams {
-        server_name,
-        destination,
-        proxy_auth_token,
-        pcb,
-        vmconnect,
-        kerberos_config,
-    } = params;
-    let request_vmconnect = vmconnect.is_some();
+    let key_msg = framed
+        .read_by_hint(&ServerKeyHint)
+        .await
+        .context("read server public key from proxy")?;
 
-    let mut buf = WriteBuf::new();
+    let server_public_key = key_msg[5..].to_vec();
+    debug!("Received server public key ({} bytes) from proxy", server_public_key.len());
 
-    info!("Begin connection procedure");
+    // Step 3: Mark TLS upgrade as done (proxy handled it).
+    let should_upgrade = ironrdp_futures::skip_connect_begin(connector);
+    let upgraded = ironrdp_futures::mark_as_upgraded(should_upgrade, connector);
 
-    {
-        let rdcleanpath_req = if let Some(pcb_payload) = vmconnect {
-            ironrdp_rdcleanpath::RDCleanPathPdu::new_vmconnect_request(destination, proxy_auth_token, pcb_payload)
-                .context("build VMConnect RDCleanPath request")?
-        } else {
-            let connector::ClientConnectorState::ConnectionInitiationSendRequest = connector.state else {
-                return Err(anyhow::Error::msg("invalid connector state (send request)").into());
-            };
-
-            debug_assert!(connector.next_pdu_hint().is_none());
-
-            let written = connector.step_no_input(&mut buf)?;
-            let x224_pdu_len = written.size().expect("written size");
-            debug_assert_eq!(x224_pdu_len, buf.filled_len());
-            let x224_pdu = buf.filled().to_vec();
-            ironrdp_rdcleanpath::RDCleanPathPdu::new_request(x224_pdu, destination, proxy_auth_token, pcb)
-                .context("new RDCleanPath request")?
-        };
-        debug!(message = ?rdcleanpath_req, "Send RDCleanPath request");
-        let rdcleanpath_req = rdcleanpath_req.to_der().context("encode RDCleanPath request")?;
-
-        framed
-            .write_all(&rdcleanpath_req)
-            .await
-            .context("couldn't write RDCleanPath request")?;
-    }
-
-    {
-        let rdcleanpath_res = framed
-            .read_by_hint(&RDCLEANPATH_HINT)
-            .await
-            .context("read RDCleanPath request")?;
-
-        let rdcleanpath_res =
-            ironrdp_rdcleanpath::RDCleanPathPdu::from_der(&rdcleanpath_res).context("decode RDCleanPath response")?;
-
-        debug!(message = ?rdcleanpath_res, "Received RDCleanPath PDU");
-
-        let (x224_connection_response, server_cert_chain) = match (
-            request_vmconnect,
-            rdcleanpath_res.into_message().context("invalid RDCleanPath PDU")?,
-        ) {
-            (_, ironrdp_rdcleanpath::RDCleanPathMessage::Request { .. })
-            | (_, ironrdp_rdcleanpath::RDCleanPathMessage::VmConnectRequest { .. }) => {
-                return Err(anyhow::Error::msg("received an unexpected RDCleanPath type (request)").into());
-            }
-            (
-                false,
-                ironrdp_rdcleanpath::RDCleanPathMessage::Response {
-                    x224_connection_response,
-                    server_cert_chain,
-                    server_addr: _,
-                },
-            ) => (Some(x224_connection_response), server_cert_chain),
-            (
-                true,
-                ironrdp_rdcleanpath::RDCleanPathMessage::VmConnectResponse {
-                    server_cert_chain,
-                    server_addr: _,
-                },
-            ) => (None, server_cert_chain),
-            (true, ironrdp_rdcleanpath::RDCleanPathMessage::Response { .. }) => {
-                return Err(
-                    anyhow::Error::msg("response from RDCleanPath includes X.224 for a VMConnect request").into(),
-                );
-            }
-            (false, ironrdp_rdcleanpath::RDCleanPathMessage::VmConnectResponse { .. }) => {
-                return Err(
-                    anyhow::Error::msg("response from RDCleanPath is missing X.224 for an ordinary request").into(),
-                );
-            }
-            (_, ironrdp_rdcleanpath::RDCleanPathMessage::GeneralErr(error)) => {
-                let details = iron_remote_desktop::RDCleanPathDetails::new(
-                    error.http_status_code,
-                    error.wsa_last_error,
-                    error.tls_alert_code,
-                );
-                return Err(
-                    IronError::from(anyhow::Error::new(error).context("received an RDCleanPath error"))
-                        .with_kind(IronErrorKind::RDCleanPath)
-                        .with_rdcleanpath_details(details),
-                );
-            }
-            (
-                _,
-                ironrdp_rdcleanpath::RDCleanPathMessage::NegotiationErr {
-                    x224_connection_response,
-                },
-            ) => {
-                if let Ok(x224_confirm) = ironrdp_core::decode::<
-                    ironrdp::pdu::x224::X224<ironrdp::pdu::nego::ConnectionConfirm>,
-                >(&x224_connection_response)
-                {
-                    if let ironrdp::pdu::nego::ConnectionConfirm::Failure { code } = x224_confirm.0 {
-                        let negotiation_failure = connector::NegotiationFailure::from(code);
-                        return Err(IronError::from(
-                            anyhow::Error::new(negotiation_failure).context("RDP negotiation failed"),
-                        )
-                        .with_kind(IronErrorKind::NegotiationFailure));
-                    }
-                }
-
-                return Err(
-                    IronError::from(anyhow::Error::msg("received an RDCleanPath negotiation error"))
-                        .with_kind(IronErrorKind::RDCleanPath),
-                );
-            }
-        };
-
-        let standard_rdp_security = if let Some(x224_connection_response) = x224_connection_response.as_ref() {
-            let connector::ClientConnectorState::ConnectionInitiationWaitConfirm { .. } = connector.state else {
-                return Err(anyhow::Error::msg("invalid connector state (wait confirm)").into());
-            };
-
-            debug_assert!(connector.next_pdu_hint().is_some());
-
-            buf.clear();
-            let written = connector.step(x224_connection_response.as_bytes(), None, &mut buf)?;
-            debug_assert!(written.is_nothing());
-
-            let connector::ClientConnectorState::EnhancedSecurityUpgrade { selected_protocol } = &connector.state
-            else {
-                return Err(anyhow::Error::msg("invalid connector state (security upgrade)").into());
-            };
-
-            selected_protocol.is_standard_rdp_security()
-        } else {
-            false
-        };
-
-        let server_public_key = if standard_rdp_security {
-            // The proxy certificate is used to bind CredSSP to the TLS server. Standard RDP
-            // Security with ENCRYPTION_LEVEL_NONE performs neither exchange.
-            Vec::new()
-        } else {
-            let server_cert = server_cert_chain
-                .into_iter()
-                .next()
-                .context("server cert chain missing from rdcleanpath response")?;
-
-            let cert = x509_cert::Certificate::from_der(server_cert.as_bytes())
-                .context("failed to decode x509 certificate sent by proxy")?;
-
-            cert.tbs_certificate()
-                .subject_public_key_info()
-                .subject_public_key
-                .as_bytes()
-                .context("subject public key BIT STRING is not aligned")?
-                .to_owned()
-        };
-
-        let upgraded = match x224_connection_response {
-            Some(_) => {
-                let should_upgrade = ironrdp_futures::skip_connect_begin(connector);
-                ironrdp_futures::mark_as_upgraded(should_upgrade, connector)
-            }
-            None => ironrdp_vmconnect::connect_front(
-                ironrdp_vmconnect::pcb_sent_via_proxy(),
-                framed,
-                connector,
-                network_client,
-                server_name,
-                &server_public_key,
-                kerberos_config,
-            )
-            .await
-            .context("connect Hyper-V front over RDCleanPath")?,
-        };
-
-        Ok((upgraded, server_public_key))
-    }
+    Ok((upgraded, server_public_key))
 }
 
 #[expect(clippy::as_conversions, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
@@ -1961,10 +1771,6 @@ fn f64_to_u16_saturating_cast(value: f64) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use futures_util::io::Cursor;
-    use iron_remote_desktop::IronError as _;
-    use ironrdp_futures::bytes::BytesMut;
-
     use super::*;
 
     // Test helpers
@@ -1973,10 +1779,6 @@ mod tests {
         mpsc::UnboundedReceiver<RdpInputEvent>,
     ) {
         mpsc::unbounded()
-    }
-
-    fn rdcleanpath_framed(response: &[u8]) -> ironrdp_futures::LocalFuturesFramed<Cursor<Vec<u8>>> {
-        ironrdp_futures::LocalFuturesFramed::new_with_leftover(Cursor::new(Vec::new()), BytesMut::from(response))
     }
 
     fn connector_config(security: SecurityConfig) -> connector::Config {
@@ -1992,36 +1794,6 @@ mod tests {
             false,
             security,
         )
-    }
-
-    fn rdcleanpath_response(protocol: ironrdp::pdu::nego::SecurityProtocol) -> Vec<u8> {
-        let x224_response = ironrdp_core::encode_vec(&ironrdp::pdu::x224::X224(
-            ironrdp::pdu::nego::ConnectionConfirm::Response {
-                flags: ironrdp::pdu::nego::ResponseFlags::empty(),
-                protocol,
-            },
-        ))
-        .expect("encode X.224 connection response");
-
-        ironrdp_rdcleanpath::RDCleanPathPdu::new_response(
-            "127.0.0.1".to_owned(),
-            x224_response,
-            core::iter::empty::<Vec<u8>>(),
-        )
-        .expect("build RDCleanPath response")
-        .to_der()
-        .expect("encode RDCleanPath response")
-    }
-
-    fn rdcleanpath_connect_params() -> RDCleanPathConnectParams {
-        RDCleanPathConnectParams {
-            server_name: connector::ServerName::from("rdp.example.test"),
-            destination: "rdp.example.test".to_owned(),
-            proxy_auth_token: "test-token".to_owned(),
-            pcb: None,
-            vmconnect: None,
-            kerberos_config: None,
-        }
     }
 
     #[test]
@@ -2079,94 +1851,6 @@ mod tests {
             assert_eq!(config.enable_tls, expected_tls, "{case}");
             assert_eq!(config.enable_credssp, expected_credssp, "{case}");
         }
-    }
-
-    #[test]
-    fn standard_rdp_security_accepts_empty_rdcleanpath_certificate_chain() {
-        let response = rdcleanpath_response(ironrdp::pdu::nego::SecurityProtocol::empty());
-        let mut framed = rdcleanpath_framed(&response);
-        let mut connector = ClientConnector::new(
-            connector_config(SecurityConfig {
-                enable_credssp: false,
-                enable_standard_rdp_security: true,
-            }),
-            core::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 33899)),
-        );
-        let mut network_client = WasmNetworkClient;
-
-        let (upgraded, server_public_key) = connect_rdcleanpath(
-            &mut framed,
-            &mut connector,
-            &mut network_client,
-            rdcleanpath_connect_params(),
-        )
-        .now_or_never()
-        .expect("in-memory RDCleanPath I/O should be ready")
-        .unwrap_or_else(|error| panic!("Standard RDP Security negotiation failed: {}", error.backtrace()));
-
-        assert!(server_public_key.is_empty());
-        let request_len = framed.get_inner().0.get_ref().len();
-        assert_ne!(request_len, 0, "RDCleanPath request was sent");
-
-        // The fixture intentionally has no MCS response. Reaching EOF only after a second
-        // write proves finalization advanced past the no-op security upgrade and sent the
-        // client's MCS Connect Initial without trying to perform TLS first.
-        let finalize_result = ironrdp_futures::connect_finalize(
-            upgraded,
-            connector,
-            &mut framed,
-            &mut network_client,
-            connector::ServerName::from("rdp.example.test"),
-            server_public_key,
-            None,
-        )
-        .now_or_never()
-        .expect("in-memory finalization I/O should be ready");
-
-        assert!(
-            finalize_result.is_err(),
-            "fixture should end while awaiting the MCS response"
-        );
-        let final_len = framed.get_inner().0.get_ref().len();
-        assert!(
-            final_len > request_len,
-            "expected finalization to write more data: {final_len} <= {request_len}"
-        );
-    }
-
-    #[test]
-    fn enhanced_security_rejects_empty_rdcleanpath_certificate_chain() {
-        let response = rdcleanpath_response(ironrdp::pdu::nego::SecurityProtocol::SSL);
-        let mut framed = rdcleanpath_framed(&response);
-        let mut connector = ClientConnector::new(
-            connector_config(SecurityConfig {
-                enable_credssp: false,
-                enable_standard_rdp_security: false,
-            }),
-            core::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 33899)),
-        );
-        let mut network_client = WasmNetworkClient;
-
-        let error = match connect_rdcleanpath(
-            &mut framed,
-            &mut connector,
-            &mut network_client,
-            rdcleanpath_connect_params(),
-        )
-        .now_or_never()
-        .expect("in-memory RDCleanPath I/O should be ready")
-        {
-            Ok(_) => panic!("enhanced security accepted a missing proxy certificate"),
-            Err(error) => error,
-        };
-
-        assert!(
-            error
-                .backtrace()
-                .contains("server cert chain missing from rdcleanpath response"),
-            "unexpected error: {}",
-            error.backtrace()
-        );
     }
 
     #[test]

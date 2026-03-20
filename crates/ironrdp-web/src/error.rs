@@ -13,14 +13,6 @@ impl IronError {
         self
     }
 
-    pub(crate) fn with_rdcleanpath_details(mut self, details: RDCleanPathDetails) -> Self {
-        debug_assert!(
-            matches!(self.kind, IronErrorKind::RDCleanPath),
-            "rdcleanpath_details should only be set for RDCleanPath errors"
-        );
-        self.rdcleanpath_details = Some(details);
-        self
-    }
 }
 
 impl iron_remote_desktop::IronError for IronError {

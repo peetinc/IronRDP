@@ -3588,10 +3588,8 @@ dependencies = [
  "ironrdp-futures",
  "ironrdp-pdu",
  "ironrdp-propertyset",
- "ironrdp-rdcleanpath",
  "ironrdp-rdpfile",
  "ironrdp-svc",
- "ironrdp-vmconnect",
  "js-sys",
  "png",
  "resize",
@@ -3605,7 +3603,6 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "x509-cert",
 ]
 
 [[package]]
