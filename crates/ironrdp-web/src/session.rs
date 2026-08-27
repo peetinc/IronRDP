@@ -32,7 +32,7 @@ use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_core::WriteBuf;
-use ironrdp_futures::{FramedWrite, single_sequence_step, single_sequence_step_read};
+use ironrdp_futures::{FramedWrite as _, single_sequence_step, single_sequence_step_read};
 use rgb::AsPixels as _;
 use tap::prelude::*;
 use tracing::{debug, error, info, trace, warn};
@@ -52,6 +52,12 @@ use crate::image::extract_partial_image;
 use crate::input::InputTransaction;
 use crate::network_client::WasmNetworkClient;
 use crate::printer::{JsPrinterStreamCallbacks, WasmPrinter, WasmPrinterBackend, wasm_printer_pair};
+
+/// The RDP byte stream once TLS is up: everything after the handshake, including the
+/// whole active session, runs through it.
+pub(crate) type RdpStream = crate::tls::TlsStream<WebSocket>;
+
+type RdpFramed = ironrdp_futures::LocalFuturesFramed<RdpStream>;
 
 const DEFAULT_WIDTH: u16 = 1280;
 const DEFAULT_HEIGHT: u16 = 720;
@@ -551,7 +557,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
         let use_display_control = self.0.borrow().use_display_control;
 
-        let (connection_result, ws) = connect(ConnectParams {
+        let (connection_result, stream) = connect(ConnectParams {
             ws,
             config,
             destination,
@@ -570,7 +576,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
         info!("Connected!");
 
-        let (rdp_reader, rdp_writer) = futures_util::AsyncReadExt::split(ws);
+        let (rdp_reader, rdp_writer) = futures_util::AsyncReadExt::split(stream);
 
         let (writer_tx, writer_rx) = mpsc::unbounded();
 
@@ -657,7 +663,7 @@ pub(crate) struct Session {
     // Consumed when `run` is called
     input_events_rx: RefCell<Option<mpsc::UnboundedReceiver<RdpInputEvent>>>,
     connection_result: RefCell<Option<connector::ConnectionResult>>,
-    rdp_reader: RefCell<Option<ReadHalf<WebSocket>>>,
+    rdp_reader: RefCell<Option<ReadHalf<RdpStream>>>,
     clipboard: RefCell<Option<Option<WasmClipboard>>>,
     printer: RefCell<Option<Option<WasmPrinter>>>,
 }
@@ -1643,14 +1649,14 @@ fn build_config(
 
 async fn writer_task(
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    rdp_writer: WriteHalf<WebSocket>,
+    rdp_writer: WriteHalf<RdpStream>,
     outbound_limit: Option<usize>,
 ) {
     debug!("writer task started");
 
     async fn inner(
         mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
-        mut rdp_writer: WriteHalf<WebSocket>,
+        mut rdp_writer: WriteHalf<RdpStream>,
         outbound_limit: Option<usize>,
     ) -> anyhow::Result<()> {
         while let Some(frame) = rx.next().await {
@@ -1754,8 +1760,8 @@ async fn connect(
         computer_name,
         use_display_control,
     }: ConnectParams,
-) -> Result<(connector::ConnectionResult, WebSocket), IronError> {
-    let mut framed = ironrdp_futures::LocalFuturesFramed::new(ws);
+) -> Result<(connector::ConnectionResult, RdpStream), IronError> {
+    let framed = ironrdp_futures::LocalFuturesFramed::new(ws);
 
     // In web browser environments, we do not have an easy access to the local address of the socket.
     let dummy_client_addr = core::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 33899));
@@ -1820,13 +1826,10 @@ async fn connect(
             hostname: destination,
         });
 
-    // Direct connection mode: X.224 exchange happens directly over WebSocket.
-    // A TLS-terminating proxy handles TLS upgrade on the TCP side and sends
-    // back the server's DER-encoded public key as a length-prefixed message:
-    //   [0x00][len:4 BE][server_public_key_der]
-    // The 0x00 tag byte distinguishes this from RDP PDUs (which start with 0x03).
-    let (upgraded, server_public_key) = connect_direct(
-        &mut framed,
+    // Direct connection mode: the WebSocket carries raw RDP bytes and TLS is
+    // terminated right here in the browser (see `connect_direct`).
+    let (mut framed, upgraded, server_public_key) = connect_direct(
+        framed,
         &mut connector,
         vmconnect,
         &mut network_client,
@@ -1846,43 +1849,41 @@ async fn connect(
     )
     .await?;
 
-    let ws = framed.into_inner_no_leftover();
+    let stream = framed.into_inner_no_leftover();
 
-    Ok((connection_result, ws))
+    Ok((connection_result, stream))
 }
 
-/// Direct connection mode (no RDCleanPath).
+/// Direct connection mode (no RDCleanPath, no TLS-terminating proxy).
 ///
-/// The WebSocket connects to a TLS-terminating proxy that:
-/// 1. Relays X.224 connection request/confirm transparently
-/// 2. Performs TLS upgrade on the TCP side when the RDP server requests it
-/// 3. Sends the server's DER-encoded SubjectPublicKeyInfo back to the browser
-///    as a tagged message: [0x00][len:4 BE][spki_der_bytes]
-/// 4. Then relays all subsequent bytes transparently
+/// The WebSocket is a plain byte pipe to the RDP target — anything that relays bytes
+/// will do. This function drives the pre-TLS part of the sequence over that raw pipe,
+/// performs the TLS handshake in the browser (`crate::tls`), and returns a fresh
+/// [`ironrdp_futures::Framed`] over the TLS stream for CredSSP and everything after it.
 ///
-/// The 0x00 tag byte distinguishes the key message from RDP PDUs (which start with 0x03).
+/// 1. X.224 connection request/confirm, in the clear, until the server asks for the
+///    security upgrade.
+/// 2. TLS handshake, terminated here. The peer certificate yields the server public
+///    key CredSSP binds to — previously asserted by the relay, now observed directly.
+/// 3. `connect_finalize` continues on the TLS stream.
 ///
 /// When `vmconnect` is set, the target is a Hyper-V host console (port 2179) and the
-/// ordering changes per MS-RDPEPS: the browser sends the Preconnection Blob as the
-/// first frame (relayed pre-TLS by the proxy), the proxy immediately upgrades to TLS
-/// and sends back the server public key, then CredSSP runs *before* X.224 via
+/// ordering changes per MS-RDPEPS: the Preconnection Blob goes out first, in the clear,
+/// TLS follows immediately, and CredSSP runs *before* X.224 via
 /// [`ironrdp_vmconnect::connect_front`].
-async fn connect_direct<S>(
-    framed: &mut ironrdp_futures::Framed<S>,
+async fn connect_direct(
+    mut framed: ironrdp_futures::LocalFuturesFramed<WebSocket>,
     connector: &mut ClientConnector,
     vmconnect: Option<String>,
     network_client: &mut WasmNetworkClient,
     server_name: connector::ServerName,
     kerberos_config: Option<KerberosConfig>,
-) -> Result<(ironrdp_futures::Upgraded, Vec<u8>), IronError>
-where
-    S: ironrdp_futures::FramedRead + FramedWrite,
-{
+) -> Result<(RdpFramed, ironrdp_futures::Upgraded, Vec<u8>), IronError> {
     if let Some(pcb_payload) = vmconnect {
         info!("Begin direct VMConnect connection procedure");
 
-        // Hyper-V ordering: PCB → TLS → CredSSP → X.224. The proxy relays the
-        // PCB bytes to the target pre-TLS, then performs the TLS upgrade.
+        // Hyper-V ordering: PCB → TLS → CredSSP → X.224. The PCB is sent in the clear,
+        // before the handshake, and the host replies to it with the TLS ServerHello.
         let pcb_bytes = ironrdp_vmconnect::encode_preconnection_blob_payload(pcb_payload)
             .context("encode preconnection blob")?;
 
@@ -1891,11 +1892,14 @@ where
             .await
             .context("couldn't write preconnection blob")?;
 
-        let server_public_key = read_server_public_key(framed).await?;
+        let (mut framed, server_public_key) = upgrade_to_tls(framed, &server_name).await?;
 
         let upgraded = ironrdp_vmconnect::connect_front(
+            // The PCB was written above, on this stream, rather than by a proxy on our
+            // behalf; `pcb_sent_via_proxy` is only how the token is minted outside
+            // `send_preconnection_blob`, which wants a VM id and mode we do not have here.
             ironrdp_vmconnect::pcb_sent_via_proxy(),
-            framed,
+            &mut framed,
             connector,
             network_client,
             server_name,
@@ -1905,70 +1909,57 @@ where
         .await
         .context("connect Hyper-V front over direct WebSocket")?;
 
-        return Ok((upgraded, server_public_key));
+        return Ok((framed, upgraded, server_public_key));
     }
 
     info!("Begin direct connection procedure");
 
-    // Step 1: X.224 connection request/confirm exchange happens directly over the WebSocket.
-    // The proxy relays these bytes transparently to the RDP target.
+    // Step 1: X.224 connection request/confirm, in the clear.
     let mut buf = WriteBuf::new();
 
     while !connector.should_perform_security_upgrade() {
-        single_sequence_step(framed, connector, &mut buf).await?;
+        single_sequence_step(&mut framed, connector, &mut buf).await?;
     }
 
-    // Step 2: The proxy has now upgraded the TCP side to TLS and sent us the server's public key.
-    let server_public_key = read_server_public_key(framed).await?;
+    // Step 2: TLS handshake, terminated in the browser.
+    let (framed, server_public_key) = upgrade_to_tls(framed, &server_name).await?;
 
-    // Step 3: Mark TLS upgrade as done (proxy handled it).
+    // Step 3: tell the connector the upgrade happened. `connect_begin`'s own loop is
+    // skipped because step 1 above already ran it.
     let should_upgrade = ironrdp_futures::skip_connect_begin(connector);
     let upgraded = ironrdp_futures::mark_as_upgraded(should_upgrade, connector);
 
-    Ok((upgraded, server_public_key))
+    Ok((framed, upgraded, server_public_key))
 }
 
-/// Reads the proxy's server-public-key message: [0x00][len:4 BE][spki_der_bytes].
-async fn read_server_public_key<S>(framed: &mut ironrdp_futures::Framed<S>) -> Result<Vec<u8>, IronError>
-where
-    S: ironrdp_futures::FramedRead + FramedWrite,
-{
-    #[derive(Clone, Copy, Debug)]
-    struct ServerKeyHint;
+/// Takes the raw WebSocket out of `framed`, performs the TLS handshake over it, and
+/// returns a [`ironrdp_futures::Framed`] over the resulting TLS stream.
+async fn upgrade_to_tls(
+    framed: ironrdp_futures::LocalFuturesFramed<WebSocket>,
+    server_name: &connector::ServerName,
+) -> Result<(RdpFramed, Vec<u8>), IronError> {
+    let (ws, leftover) = framed.into_inner();
 
-    impl ironrdp::pdu::PduHint for ServerKeyHint {
-        fn find_size(&self, bytes: &[u8]) -> ironrdp::core::DecodeResult<Option<(bool, usize)>> {
-            if bytes.is_empty() {
-                return Ok(None);
-            }
-            if bytes[0] != 0x00 {
-                return Err(ironrdp::core::other_err!(
-                    "ServerKeyHint",
-                    "expected tag 0x00 for server public key message"
-                ));
-            }
-            if bytes.len() < 5 {
-                return Ok(None);
-            }
-            let len = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
-            let total = 5 + len;
-            if bytes.len() < total {
-                Ok(None)
-            } else {
-                Ok(Some((true, total)))
-            }
-        }
+    // Nothing is expected between the last pre-TLS PDU and the ServerHello: the server
+    // does not speak again until it has seen our ClientHello. Bytes here would be part
+    // of the TLS stream we are about to open, and there is no way to feed them to
+    // rustls after the fact — so fail loudly rather than silently dropping them.
+    if !leftover.is_empty() {
+        return Err(IronError::from(anyhow::anyhow!(
+            "{} unread bytes before the TLS handshake",
+            leftover.len()
+        ))
+        .with_kind(IronErrorKind::General));
     }
 
-    let key_msg = framed
-        .read_by_hint(&ServerKeyHint)
+    let (tls_stream, server_public_key) = crate::tls::upgrade(ws, server_name.as_str())
         .await
-        .context("read server public key from proxy")?;
+        .context("TLS handshake")?;
 
-    let server_public_key = key_msg[5..].to_vec();
-    debug!("Received server public key ({} bytes) from proxy", server_public_key.len());
-
-    Ok(server_public_key)
+    Ok((
+        ironrdp_futures::LocalFuturesFramed::new(tls_stream),
+        server_public_key,
+    ))
 }
 
 #[expect(clippy::as_conversions, clippy::cast_sign_loss, clippy::cast_possible_truncation)]

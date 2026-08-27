@@ -14,6 +14,13 @@ extern crate getrandom as _;
 extern crate getrandom2 as _;
 extern crate getrandom4 as _;
 extern crate time as _;
+// Pulled in only to turn on `rustls-pki-types`' `web` feature: without it, the
+// `UnixTime::now()` rustls calls during a handshake resolves to `SystemTime::now()`,
+// which panics on `wasm32-unknown-unknown`.
+extern crate rustls_pki_types as _;
+// Ditto for `ring`'s `wasm32_unknown_unknown_js`, which is what gives its `SystemRandom`
+// an implementation on this target — see the Cargo.toml comment.
+extern crate ring as _;
 
 mod canvas;
 mod clipboard;
@@ -25,6 +32,7 @@ mod network_client;
 mod printer;
 mod rdp_file;
 mod session;
+mod tls;
 
 mod wasm_bridge {
     use tracing::debug;

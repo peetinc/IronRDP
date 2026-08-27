@@ -1870,6 +1870,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures-rustls"
+version = "0.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8f2f12607f92c69b12ed746fabf9ca4f5c482cba46679c1a75b874ed7c26adb"
+dependencies = [
+ "futures-io",
+ "rustls",
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "futures-sink"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3522,6 +3533,7 @@ dependencies = [
  "chrono",
  "futures",
  "futures-channel",
+ "futures-rustls",
  "futures-util",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
@@ -3542,6 +3554,8 @@ dependencies = [
  "png",
  "resize",
  "rgb",
+ "ring",
+ "rustls-pki-types",
  "semver",
  "smallvec",
  "tap",
@@ -3551,6 +3565,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "x509-cert",
 ]
 
 [[package]]
