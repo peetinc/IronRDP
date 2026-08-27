@@ -43,7 +43,7 @@ use std::rc::Rc;
 use futures_util::future::LocalBoxFuture;
 use futures_util::lock::Mutex;
 use js_sys::{Array, IteratorNext, Reflect, Uint8Array};
-use tracing::warn;
+use tracing::{debug, warn};
 use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -117,67 +117,157 @@ impl WebFsDrive {
         }
         Ok(current)
     }
+
+    /// [`DriveFs::stat`]'s actual logic, split out from the trait method so the latter can log a
+    /// single `[rdpdr-drive]` diagnostic line at its one exit point regardless of which branch
+    /// below produced the result (this function has none of its own logging).
+    async fn stat_inner(&self, path: &str) -> Result<FsEntry, FsError> {
+        let components = normalize_path(path)?;
+        let Some((name, parent_components)) = components.split_last() else {
+            // The share root itself: always a directory.
+            return Ok(dir_entry(String::new()));
+        };
+        let parent = self.resolve_dir(parent_components).await?;
+
+        match JsFuture::from(parent.get_file_handle(name)).await {
+            Ok(value) => {
+                let file_handle: FileSystemFileHandle = value.unchecked_into();
+                let file = get_file(&file_handle).await?;
+                Ok(file_entry(name.clone(), &file))
+            }
+            // `getFileHandle` on a name that exists but is a directory throws
+            // `TypeMismatchError`, not `NotFoundError` — see this module's doc comment.
+            Err(err) if is_type_mismatch(&err) => {
+                JsFuture::from(parent.get_directory_handle(name))
+                    .await
+                    .map_err(fs_error_from_js)?;
+                Ok(dir_entry(name.clone()))
+            }
+            Err(err) => Err(fs_error_from_js(err)),
+        }
+    }
+
+    /// [`DriveFs::list`]'s actual logic — see [`Self::stat_inner`]'s doc comment for why this is
+    /// split out.
+    async fn list_inner(&self, path: &str) -> Result<Vec<FsEntry>, FsError> {
+        let components = normalize_path(path)?;
+        let dir = self.resolve_dir(&components).await?;
+        let iterator = dir.entries();
+
+        let mut out = Vec::new();
+        loop {
+            let next_promise = iterator.next().map_err(fs_error_from_js)?;
+            let next_value = JsFuture::from(next_promise).await.map_err(fs_error_from_js)?;
+            let next: IteratorNext = next_value.unchecked_into();
+            if next.done() {
+                break;
+            }
+
+            // `entries()` yields `[name, handle]` pairs.
+            let pair: Array = next.value().unchecked_into();
+            let name = pair.get(0).as_string().unwrap_or_default();
+            let handle_value = pair.get(1);
+
+            if let Some(file_handle) = handle_value.dyn_ref::<FileSystemFileHandle>() {
+                let file = get_file(file_handle).await?;
+                out.push(file_entry(name, &file));
+            } else {
+                out.push(dir_entry(name));
+            }
+        }
+        Ok(out)
+    }
+
+    /// [`DriveFs::open_file`]'s actual logic — see [`Self::stat_inner`]'s doc comment for why
+    /// this is split out (this one in particular has an early `return Err(err)` mid-body that a
+    /// single trailing log statement in the trait method would otherwise miss entirely).
+    async fn open_file_inner(&self, path: &str, write: bool, create: bool, truncate: bool) -> Result<u32, FsError> {
+        let components = normalize_path(path)?;
+        let (name, parent_components) = components.split_last().ok_or(FsError::AccessDenied)?;
+        let parent = self.resolve_dir(parent_components).await?;
+
+        let get_options = FileSystemGetFileOptions::new();
+        get_options.set_create(create);
+        let file_handle: FileSystemFileHandle = JsFuture::from(parent.get_file_handle_with_options(name, &get_options))
+            .await
+            .map_err(fs_error_from_js)?
+            .unchecked_into();
+
+        let writable = if write {
+            // `keep_existing_data: true` per the plan this task implements: RDPDR writes land
+            // at arbitrary offsets, so the writable must start from the file's current
+            // content rather than an empty one. `truncate` (when requested) is then applied
+            // explicitly below instead of by the writable's own creation-time truncation.
+            let writable_options = FileSystemCreateWritableOptions::new();
+            writable_options.set_keep_existing_data(true);
+            let writable: FileSystemWritableFileStream =
+                JsFuture::from(file_handle.create_writable_with_options(&writable_options))
+                    .await
+                    .map_err(fs_error_from_js)?
+                    .unchecked_into();
+
+            if truncate {
+                let truncated = match writable.truncate_with_f64(0.0) {
+                    Ok(promise) => JsFuture::from(promise).await.map_err(fs_error_from_js),
+                    Err(err) => Err(fs_error_from_js(err)),
+                };
+                if let Err(err) = truncated {
+                    // The writable was already created and never gets stored in `handles`
+                    // now — abort it so the browser releases its file lock deterministically
+                    // instead of waiting on GC to drop an unclosed writable.
+                    abort_best_effort(&writable).await;
+                    return Err(err);
+                }
+            }
+            Some(Rc::new(WritableSlot {
+                stream: writable,
+                lock: Mutex::new(()),
+            }))
+        } else {
+            None
+        };
+
+        let handle = self.allocate_handle();
+        self.handles.borrow_mut().insert(
+            handle,
+            OpenWebFile {
+                file_handle,
+                writable,
+                path: path.to_owned(),
+            },
+        );
+        Ok(handle)
+    }
 }
 
 impl DriveFs for WebFsDrive {
     fn stat(&self, path: &str) -> LocalBoxFuture<'_, Result<FsEntry, FsError>> {
         let path = path.to_owned();
         Box::pin(async move {
-            let components = normalize_path(&path)?;
-            let Some((name, parent_components)) = components.split_last() else {
-                // The share root itself: always a directory.
-                return Ok(dir_entry(String::new()));
-            };
-            let parent = self.resolve_dir(parent_components).await?;
-
-            match JsFuture::from(parent.get_file_handle(name)).await {
-                Ok(value) => {
-                    let file_handle: FileSystemFileHandle = value.unchecked_into();
-                    let file = get_file(&file_handle).await?;
-                    Ok(file_entry(name.clone(), &file))
-                }
-                // `getFileHandle` on a name that exists but is a directory throws
-                // `TypeMismatchError`, not `NotFoundError` — see this module's doc comment.
-                Err(err) if is_type_mismatch(&err) => {
-                    JsFuture::from(parent.get_directory_handle(name))
-                        .await
-                        .map_err(fs_error_from_js)?;
-                    Ok(dir_entry(name.clone()))
-                }
-                Err(err) => Err(fs_error_from_js(err)),
+            let result = self.stat_inner(&path).await;
+            // Diagnostic instrumentation (kept, not removed after debugging).
+            match &result {
+                Ok(entry) if entry.is_dir => debug!("[rdpdr-drive] web_fs.stat path={path:?} result=ok-dir"),
+                Ok(_) => debug!("[rdpdr-drive] web_fs.stat path={path:?} result=ok-file"),
+                Err(err) => debug!("[rdpdr-drive] web_fs.stat path={path:?} result=err:{err:?}"),
             }
+            result
         })
     }
 
     fn list(&self, path: &str) -> LocalBoxFuture<'_, Result<Vec<FsEntry>, FsError>> {
         let path = path.to_owned();
         Box::pin(async move {
-            let components = normalize_path(&path)?;
-            let dir = self.resolve_dir(&components).await?;
-            let iterator = dir.entries();
-
-            let mut out = Vec::new();
-            loop {
-                let next_promise = iterator.next().map_err(fs_error_from_js)?;
-                let next_value = JsFuture::from(next_promise).await.map_err(fs_error_from_js)?;
-                let next: IteratorNext = next_value.unchecked_into();
-                if next.done() {
-                    break;
-                }
-
-                // `entries()` yields `[name, handle]` pairs.
-                let pair: Array = next.value().unchecked_into();
-                let name = pair.get(0).as_string().unwrap_or_default();
-                let handle_value = pair.get(1);
-
-                if let Some(file_handle) = handle_value.dyn_ref::<FileSystemFileHandle>() {
-                    let file = get_file(file_handle).await?;
-                    out.push(file_entry(name, &file));
-                } else {
-                    out.push(dir_entry(name));
-                }
+            let result = self.list_inner(&path).await;
+            // Diagnostic instrumentation (kept, not removed after debugging).
+            match &result {
+                Ok(entries) => debug!(
+                    "[rdpdr-drive] web_fs.list path={path:?} result=ok({} entries)",
+                    entries.len()
+                ),
+                Err(err) => debug!("[rdpdr-drive] web_fs.list path={path:?} result=err:{err:?}"),
             }
-            Ok(out)
+            result
         })
     }
 
@@ -190,62 +280,17 @@ impl DriveFs for WebFsDrive {
     ) -> LocalBoxFuture<'_, Result<u32, FsError>> {
         let path = path.to_owned();
         Box::pin(async move {
-            let components = normalize_path(&path)?;
-            let (name, parent_components) = components.split_last().ok_or(FsError::AccessDenied)?;
-            let parent = self.resolve_dir(parent_components).await?;
-
-            let get_options = FileSystemGetFileOptions::new();
-            get_options.set_create(create);
-            let file_handle: FileSystemFileHandle =
-                JsFuture::from(parent.get_file_handle_with_options(name, &get_options))
-                    .await
-                    .map_err(fs_error_from_js)?
-                    .unchecked_into();
-
-            let writable = if write {
-                // `keep_existing_data: true` per the plan this task implements: RDPDR writes land
-                // at arbitrary offsets, so the writable must start from the file's current
-                // content rather than an empty one. `truncate` (when requested) is then applied
-                // explicitly below instead of by the writable's own creation-time truncation.
-                let writable_options = FileSystemCreateWritableOptions::new();
-                writable_options.set_keep_existing_data(true);
-                let writable: FileSystemWritableFileStream =
-                    JsFuture::from(file_handle.create_writable_with_options(&writable_options))
-                        .await
-                        .map_err(fs_error_from_js)?
-                        .unchecked_into();
-
-                if truncate {
-                    let truncated = match writable.truncate_with_f64(0.0) {
-                        Ok(promise) => JsFuture::from(promise).await.map_err(fs_error_from_js),
-                        Err(err) => Err(fs_error_from_js(err)),
-                    };
-                    if let Err(err) = truncated {
-                        // The writable was already created and never gets stored in `handles`
-                        // now — abort it so the browser releases its file lock deterministically
-                        // instead of waiting on GC to drop an unclosed writable.
-                        abort_best_effort(&writable).await;
-                        return Err(err);
-                    }
-                }
-                Some(Rc::new(WritableSlot {
-                    stream: writable,
-                    lock: Mutex::new(()),
-                }))
-            } else {
-                None
-            };
-
-            let handle = self.allocate_handle();
-            self.handles.borrow_mut().insert(
-                handle,
-                OpenWebFile {
-                    file_handle,
-                    writable,
-                    path,
-                },
-            );
-            Ok(handle)
+            let result = self.open_file_inner(&path, write, create, truncate).await;
+            // Diagnostic instrumentation (kept, not removed after debugging).
+            match &result {
+                Ok(handle) => debug!(
+                    "[rdpdr-drive] web_fs.open_file path={path:?} write={write} create={create} truncate={truncate} result=ok(handle={handle})"
+                ),
+                Err(err) => debug!(
+                    "[rdpdr-drive] web_fs.open_file path={path:?} write={write} create={create} truncate={truncate} result=err:{err:?}"
+                ),
+            }
+            result
         })
     }
 

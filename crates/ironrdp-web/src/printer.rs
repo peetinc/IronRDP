@@ -247,6 +247,15 @@ impl RdpdrBackend for WasmPrinterBackend {
     fn handle_printer_io_request(&mut self, req: PrinterIoRequest) -> PduResult<Vec<SvcMessage>> {
         match req {
             PrinterIoRequest::Create(create) => {
+                debug!(
+                    "[rdpdr-printer] IN Create device_id={} completion_id={} file_id={} path={:?}",
+                    create.device_io_request.device_id,
+                    create.device_io_request.completion_id,
+                    create.device_io_request.file_id,
+                    create.path,
+                );
+                let completion_id = create.device_io_request.completion_id;
+                let device_id = create.device_io_request.device_id;
                 let file_id = self.allocate_file_id();
                 let io_status = if self.proxy.send_job_created(file_id) {
                     self.open_files.insert(file_id, OpenPrintJob { bytes_written: 0 });
@@ -268,12 +277,22 @@ impl RdpdrBackend for WasmPrinterBackend {
                         Information::empty()
                     },
                 };
+                debug!(
+                    "[rdpdr-printer] OUT DeviceCreateResponse completion_id={completion_id} device_id={device_id} file_id={file_id} status={io_status:?}"
+                );
                 Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCreateResponse(response))])
             }
             PrinterIoRequest::Write(write) => {
                 let file_id = write.device_io_request.file_id;
+                let completion_id = write.device_io_request.completion_id;
+                let device_id = write.device_io_request.device_id;
+                let offset = write.offset;
                 let device_io_request = write.device_io_request;
                 let write_data = write.write_data;
+                debug!(
+                    "[rdpdr-printer] IN Write device_id={device_id} completion_id={completion_id} file_id={file_id} offset={offset} length={}",
+                    write_data.len()
+                );
                 // INVARIANT: write.write_data was decoded via a u32-length-prefixed
                 // wire field (MS-RDPEFS 2.2.1.4.4 DR_WRITE_REQ Length), so its
                 // in-memory Vec length always round-trips back to a u32.
@@ -333,10 +352,18 @@ impl RdpdrBackend for WasmPrinterBackend {
                     device_io_reply: DeviceIoResponse::new(device_io_request, io_status),
                     length: if io_status == NtStatus::SUCCESS { data_len } else { 0 },
                 };
+                debug!(
+                    "[rdpdr-printer] OUT DeviceWriteResponse completion_id={completion_id} device_id={device_id} file_id={file_id} status={io_status:?}"
+                );
                 Ok(vec![SvcMessage::from(RdpdrPdu::DeviceWriteResponse(response))])
             }
             PrinterIoRequest::Close(close) => {
                 let file_id = close.device_io_request.file_id;
+                let completion_id = close.device_io_request.completion_id;
+                let device_id = close.device_io_request.device_id;
+                debug!(
+                    "[rdpdr-printer] IN Close device_id={device_id} completion_id={completion_id} file_id={file_id}"
+                );
                 let io_status = if let Some(job) = self.open_files.remove(&file_id) {
                     debug!(
                         file_id,
@@ -356,6 +383,9 @@ impl RdpdrBackend for WasmPrinterBackend {
                 let response = DeviceCloseResponse {
                     device_io_response: DeviceIoResponse::new(close.device_io_request, io_status),
                 };
+                debug!(
+                    "[rdpdr-printer] OUT DeviceCloseResponse completion_id={completion_id} device_id={device_id} file_id={file_id} status={io_status:?}"
+                );
                 Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(response))])
             }
         }

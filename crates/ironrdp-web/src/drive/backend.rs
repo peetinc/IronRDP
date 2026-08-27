@@ -130,6 +130,12 @@ impl WasmDriveBackend {
 
     fn dispatch_create(&self, create: DeviceCreateRequest) -> Vec<SvcMessage> {
         if self.read_only && is_write_intent(&create) {
+            log_outgoing(
+                "DeviceCreateResponse",
+                create.device_io_request.completion_id,
+                create.device_io_request.device_id,
+                NtStatus::ACCESS_DENIED,
+            );
             let response = DeviceCreateResponse {
                 device_io_reply: DeviceIoResponse::new(create.device_io_request, NtStatus::ACCESS_DENIED),
                 file_id: 0,
@@ -143,6 +149,12 @@ impl WasmDriveBackend {
         // one caller, so it enforces that here rather than leaving it to whatever a given
         // `DriveFs` implementation happens to check internally.
         if !path_is_valid(&create.path) {
+            log_outgoing(
+                "DeviceCreateResponse",
+                create.device_io_request.completion_id,
+                create.device_io_request.device_id,
+                NtStatus::ACCESS_DENIED,
+            );
             let response = DeviceCreateResponse {
                 device_io_reply: DeviceIoResponse::new(create.device_io_request, NtStatus::ACCESS_DENIED),
                 file_id: 0,
@@ -196,6 +208,12 @@ impl WasmDriveBackend {
                 Err(err) => (create_status_for(&err), 0, Information::empty()),
             };
 
+            log_outgoing(
+                "DeviceCreateResponse",
+                device_io_request.completion_id,
+                device_io_request.device_id,
+                status,
+            );
             let response = DeviceCreateResponse {
                 device_io_reply: DeviceIoResponse::new(device_io_request, status),
                 file_id,
@@ -215,6 +233,12 @@ impl WasmDriveBackend {
     fn dispatch_query_information(&self, req: ServerDriveQueryInformationRequest) -> Vec<SvcMessage> {
         let file_id = req.device_io_request.file_id;
         let Some(path) = self.state.borrow().get(file_id).map(|entry| entry.path.clone()) else {
+            log_outgoing(
+                "ClientDriveQueryInformationResponse",
+                req.device_io_request.completion_id,
+                req.device_io_request.device_id,
+                NtStatus::INVALID_HANDLE,
+            );
             let response = ClientDriveQueryInformationResponse {
                 device_io_response: DeviceIoResponse::new(req.device_io_request, NtStatus::INVALID_HANDLE),
                 buffer: None,
@@ -240,6 +264,12 @@ impl WasmDriveBackend {
                 },
                 Err(err) => (nt_status_for(&err), None),
             };
+            log_outgoing(
+                "ClientDriveQueryInformationResponse",
+                device_io_request.completion_id,
+                device_io_request.device_id,
+                status,
+            );
             let response = ClientDriveQueryInformationResponse {
                 device_io_response: DeviceIoResponse::new(device_io_request, status),
                 buffer,
@@ -260,6 +290,12 @@ impl WasmDriveBackend {
     fn dispatch_close(&self, req: DeviceCloseRequest) -> Vec<SvcMessage> {
         let file_id = req.device_io_request.file_id;
         let Some(entry) = self.state.borrow_mut().close(file_id) else {
+            log_outgoing(
+                "DeviceCloseResponse",
+                req.device_io_request.completion_id,
+                req.device_io_request.device_id,
+                NtStatus::INVALID_HANDLE,
+            );
             let response = DeviceCloseResponse {
                 device_io_response: DeviceIoResponse::new(req.device_io_request, NtStatus::INVALID_HANDLE),
             };
@@ -269,6 +305,12 @@ impl WasmDriveBackend {
         let Some(fs_handle) = entry.fs_handle else {
             // Directory handles have nothing to close on the `DriveFs` side (see
             // `OpenEntry::fs_handle`'s doc comment in `state.rs`).
+            log_outgoing(
+                "DeviceCloseResponse",
+                req.device_io_request.completion_id,
+                req.device_io_request.device_id,
+                NtStatus::SUCCESS,
+            );
             let response = DeviceCloseResponse {
                 device_io_response: DeviceIoResponse::new(req.device_io_request, NtStatus::SUCCESS),
             };
@@ -284,6 +326,12 @@ impl WasmDriveBackend {
                 Ok(()) => NtStatus::SUCCESS,
                 Err(err) => nt_status_for(&err),
             };
+            log_outgoing(
+                "DeviceCloseResponse",
+                device_io_request.completion_id,
+                device_io_request.device_id,
+                status,
+            );
             let response = DeviceCloseResponse {
                 device_io_response: DeviceIoResponse::new(device_io_request, status),
             };
@@ -313,6 +361,12 @@ impl WasmDriveBackend {
                 ),
                 None => (NtStatus::NO_MORE_FILES, None),
             };
+            log_outgoing(
+                "ClientDriveQueryDirectoryResponse",
+                device_io_request.completion_id,
+                device_io_request.device_id,
+                status,
+            );
             let response = ClientDriveQueryDirectoryResponse {
                 device_io_reply: DeviceIoResponse::new(device_io_request, status),
                 buffer,
@@ -324,6 +378,12 @@ impl WasmDriveBackend {
         // whatever search pattern `req.path` carries (e.g. `\dir\*.txt` or an exact filename
         // for an existence check) against each entry's name before caching.
         let Some(path) = self.state.borrow().get(file_id).map(|entry| entry.path.clone()) else {
+            log_outgoing(
+                "ClientDriveQueryDirectoryResponse",
+                device_io_request.completion_id,
+                device_io_request.device_id,
+                NtStatus::INVALID_HANDLE,
+            );
             let response = ClientDriveQueryDirectoryResponse {
                 device_io_reply: DeviceIoResponse::new(device_io_request, NtStatus::INVALID_HANDLE),
                 buffer: None,
@@ -360,6 +420,12 @@ impl WasmDriveBackend {
                 }
                 Err(err) => (nt_status_for(&err), None),
             };
+            log_outgoing(
+                "ClientDriveQueryDirectoryResponse",
+                device_io_request.completion_id,
+                device_io_request.device_id,
+                status,
+            );
             let response = ClientDriveQueryDirectoryResponse {
                 device_io_reply: DeviceIoResponse::new(device_io_request, status),
                 buffer,
@@ -379,6 +445,12 @@ impl WasmDriveBackend {
         let file_id = req.device_io_request.file_id;
         let device_io_request = req.device_io_request;
         let Some(fs_handle) = self.state.borrow().get(file_id).and_then(|entry| entry.fs_handle) else {
+            log_outgoing(
+                "DeviceReadResponse",
+                device_io_request.completion_id,
+                device_io_request.device_id,
+                NtStatus::INVALID_HANDLE,
+            );
             let response = DeviceReadResponse {
                 device_io_reply: DeviceIoResponse::new(device_io_request, NtStatus::INVALID_HANDLE),
                 read_data: Vec::new(),
@@ -397,6 +469,12 @@ impl WasmDriveBackend {
                 Ok(data) => (NtStatus::SUCCESS, data),
                 Err(err) => (nt_status_for(&err), Vec::new()),
             };
+            log_outgoing(
+                "DeviceReadResponse",
+                device_io_request.completion_id,
+                device_io_request.device_id,
+                status,
+            );
             let response = DeviceReadResponse {
                 device_io_reply: DeviceIoResponse::new(device_io_request, status),
                 read_data,
@@ -416,6 +494,12 @@ impl WasmDriveBackend {
         let file_id = req.device_io_request.file_id;
         let device_io_request = req.device_io_request;
         if self.read_only {
+            log_outgoing(
+                "DeviceWriteResponse",
+                device_io_request.completion_id,
+                device_io_request.device_id,
+                NtStatus::ACCESS_DENIED,
+            );
             let response = DeviceWriteResponse {
                 device_io_reply: DeviceIoResponse::new(device_io_request, NtStatus::ACCESS_DENIED),
                 length: 0,
@@ -424,6 +508,12 @@ impl WasmDriveBackend {
         }
 
         let Some(fs_handle) = self.state.borrow().get(file_id).and_then(|entry| entry.fs_handle) else {
+            log_outgoing(
+                "DeviceWriteResponse",
+                device_io_request.completion_id,
+                device_io_request.device_id,
+                NtStatus::INVALID_HANDLE,
+            );
             let response = DeviceWriteResponse {
                 device_io_reply: DeviceIoResponse::new(device_io_request, NtStatus::INVALID_HANDLE),
                 length: 0,
@@ -442,6 +532,12 @@ impl WasmDriveBackend {
                 Ok(written) => (NtStatus::SUCCESS, written),
                 Err(err) => (nt_status_for(&err), 0),
             };
+            log_outgoing(
+                "DeviceWriteResponse",
+                device_io_request.completion_id,
+                device_io_request.device_id,
+                status,
+            );
             let response = DeviceWriteResponse {
                 device_io_reply: DeviceIoResponse::new(device_io_request, status),
                 length,
@@ -459,11 +555,23 @@ impl WasmDriveBackend {
 
     fn dispatch_set_information(&self, req: ServerDriveSetInformationRequest) -> PduResult<Vec<SvcMessage>> {
         if self.read_only {
+            log_outgoing(
+                "ClientDriveSetInformationResponse",
+                req.device_io_request.completion_id,
+                req.device_io_request.device_id,
+                NtStatus::ACCESS_DENIED,
+            );
             return Ok(vec![set_information_message(&req, NtStatus::ACCESS_DENIED)?]);
         }
 
         let file_id = req.device_io_request.file_id;
         let Some(path) = self.state.borrow().get(file_id).map(|entry| entry.path.clone()) else {
+            log_outgoing(
+                "ClientDriveSetInformationResponse",
+                req.device_io_request.completion_id,
+                req.device_io_request.device_id,
+                NtStatus::INVALID_HANDLE,
+            );
             return Ok(vec![set_information_message(&req, NtStatus::INVALID_HANDLE)?]);
         };
 
@@ -477,6 +585,12 @@ impl WasmDriveBackend {
                 // Same rule as `Create`'s path (see `dispatch_create`): a server-supplied path
                 // must clear `normalize_path` before it ever reaches `DriveFs`.
                 if !path_is_valid(&rename.file_name) {
+                    log_outgoing(
+                        "ClientDriveSetInformationResponse",
+                        req.device_io_request.completion_id,
+                        req.device_io_request.device_id,
+                        NtStatus::ACCESS_DENIED,
+                    );
                     return Ok(vec![set_information_message(&req, NtStatus::ACCESS_DENIED)?]);
                 }
 
@@ -496,6 +610,12 @@ impl WasmDriveBackend {
                         }
                         Err(err) => nt_status_for(&err),
                     };
+                    log_outgoing(
+                        "ClientDriveSetInformationResponse",
+                        req.device_io_request.completion_id,
+                        req.device_io_request.device_id,
+                        status,
+                    );
                     let message = set_information_message(&req, status).unwrap_or_else(|error| {
                         warn!(
                             ?error,
@@ -518,6 +638,12 @@ impl WasmDriveBackend {
                         Ok(()) => NtStatus::SUCCESS,
                         Err(err) => nt_status_for(&err),
                     };
+                    log_outgoing(
+                        "ClientDriveSetInformationResponse",
+                        req.device_io_request.completion_id,
+                        req.device_io_request.device_id,
+                        status,
+                    );
                     let message = set_information_message(&req, status).unwrap_or_else(|error| {
                         warn!(
                             ?error,
@@ -533,8 +659,24 @@ impl WasmDriveBackend {
             // `Disposition` with `delete_pending == 0` (clearing a delete request we never
             // actually deferred) is a trivial acknowledgement; every other class has no
             // `DriveFs` primitive.
-            FileInformationClass::Disposition(_) => Ok(vec![set_information_message(&req, NtStatus::SUCCESS)?]),
-            _ => Ok(vec![set_information_message(&req, NtStatus::NOT_SUPPORTED)?]),
+            FileInformationClass::Disposition(_) => {
+                log_outgoing(
+                    "ClientDriveSetInformationResponse",
+                    req.device_io_request.completion_id,
+                    req.device_io_request.device_id,
+                    NtStatus::SUCCESS,
+                );
+                Ok(vec![set_information_message(&req, NtStatus::SUCCESS)?])
+            }
+            _ => {
+                log_outgoing(
+                    "ClientDriveSetInformationResponse",
+                    req.device_io_request.completion_id,
+                    req.device_io_request.device_id,
+                    NtStatus::NOT_SUPPORTED,
+                );
+                Ok(vec![set_information_message(&req, NtStatus::NOT_SUPPORTED)?])
+            }
         }
     }
 }
@@ -596,6 +738,21 @@ impl RdpdrBackend for WasmDriveBackend {
     }
 
     fn handle_drive_io_request(&mut self, req: ServerDriveIoRequest) -> PduResult<Vec<SvcMessage>> {
+        // Diagnostic instrumentation (kept, not removed after debugging) — see this backend's
+        // module doc comment for why: every incoming IRP, logged before dispatch so it's visible
+        // even for a variant this backend never answers (e.g. NotifyChangeDirectory).
+        let (variant, device_id, completion_id, file_id) = drive_request_debug_info(&req);
+        debug!("[rdpdr-drive] IN {variant} device_id={device_id} completion_id={completion_id} file_id={file_id}");
+        if let ServerDriveIoRequest::ServerCreateDriveRequest(create) = &req {
+            debug!(
+                "[rdpdr-drive] IN Create details path={:?} create_disposition={:#x} create_options={:#x} desired_access={:#x}",
+                create.path,
+                u32::from(create.create_disposition),
+                create.create_options.bits(),
+                create.desired_access.bits(),
+            );
+        }
+
         match req {
             ServerDriveIoRequest::ServerCreateDriveRequest(create) => Ok(self.dispatch_create(create)),
             ServerDriveIoRequest::ServerDriveQueryInformationRequest(req) => Ok(self.dispatch_query_information(req)),
@@ -610,7 +767,12 @@ impl RdpdrBackend for WasmDriveBackend {
             // device (or session) tears down. `Ok(Vec::new())` is exactly the trait's own
             // "defer to `poll_deferred_messages`" contract, which this backend never populates
             // for this IRP.
-            ServerDriveIoRequest::ServerDriveNotifyChangeDirectoryRequest(_req) => Ok(Vec::new()),
+            ServerDriveIoRequest::ServerDriveNotifyChangeDirectoryRequest(_req) => {
+                debug!(
+                    "[rdpdr-drive] OUT ServerDriveNotifyChangeDirectoryRequest completion_id={completion_id} device_id={device_id} status=<none, deferred per FreeRDP parity>"
+                );
+                Ok(Vec::new())
+            }
 
             ServerDriveIoRequest::ServerDriveQueryVolumeInformationRequest(req) => {
                 Ok(vec![query_volume_information_response(req)])
@@ -619,6 +781,7 @@ impl RdpdrBackend for WasmDriveBackend {
             // `IRP_MJ_DEVICE_CONTROL`: no filesystem IOCTL this backend implements; ack empty
             // per the crib (matches FreeRDP's own default reply for unhandled control codes).
             ServerDriveIoRequest::DeviceControlRequest(req) => {
+                log_outgoing("DeviceControlResponse", completion_id, device_id, NtStatus::SUCCESS);
                 let response = DeviceControlResponse::new(req, NtStatus::SUCCESS, None);
                 Ok(vec![SvcMessage::from(RdpdrPdu::DeviceControlResponse(response))])
             }
@@ -627,6 +790,12 @@ impl RdpdrBackend for WasmDriveBackend {
             // the server's perspective (there is no separate buffered-write stage to flush), so
             // this is an immediate acknowledgement, no `DriveFs` round-trip needed.
             ServerDriveIoRequest::DeviceFlushBuffersRequest(req) => {
+                log_outgoing(
+                    "DeviceFlushBuffersResponse",
+                    completion_id,
+                    device_id,
+                    NtStatus::SUCCESS,
+                );
                 let response = DeviceFlushBuffersResponse {
                     device_io_response: DeviceIoResponse::new(req.device_io_request, NtStatus::SUCCESS),
                 };
@@ -637,6 +806,12 @@ impl RdpdrBackend for WasmDriveBackend {
             // browser-backed share (byte-range locking has no meaning without a real
             // multi-client filesystem to coordinate).
             ServerDriveIoRequest::ServerDriveLockControlRequest(req) => {
+                log_outgoing(
+                    "ClientDriveLockControlResponse",
+                    completion_id,
+                    device_id,
+                    NtStatus::SUCCESS,
+                );
                 let response = ClientDriveLockControlResponse::new(req.device_io_request, NtStatus::SUCCESS);
                 Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveLockControlResponse(
                     response,
@@ -648,6 +823,12 @@ impl RdpdrBackend for WasmDriveBackend {
             // `false` accordingly, so the channel never advertises the capability — these two
             // stubs only guard against a server asking anyway.
             ServerDriveIoRequest::ServerDriveQuerySecurityRequest(req) => {
+                log_outgoing(
+                    "ClientDriveQuerySecurityResponse",
+                    completion_id,
+                    device_id,
+                    NtStatus::NOT_SUPPORTED,
+                );
                 let response = ClientDriveQuerySecurityResponse {
                     device_io_response: DeviceIoResponse::new(req.device_io_request, NtStatus::NOT_SUPPORTED),
                     security_descriptor: None,
@@ -657,6 +838,12 @@ impl RdpdrBackend for WasmDriveBackend {
                 ))])
             }
             ServerDriveIoRequest::ServerDriveSetSecurityRequest(req) => {
+                log_outgoing(
+                    "ClientDriveSetSecurityResponse",
+                    completion_id,
+                    device_id,
+                    NtStatus::NOT_SUPPORTED,
+                );
                 let response = to_pdu_result(
                     "ClientDriveSetSecurityResponse",
                     ClientDriveSetSecurityResponse::new(&req, NtStatus::NOT_SUPPORTED),
@@ -751,6 +938,7 @@ async fn resolve_create_outcome(
     truncates: bool,
 ) -> Result<(Option<u32>, bool), CreateOutcomeError> {
     if is_directory {
+        debug!("[rdpdr-drive] resolve_create_outcome path={path:?} branch=dir (explicit FILE_DIRECTORY_FILE)");
         return Ok(open_or_create_directory(fs, path, creates_new).await?);
     }
 
@@ -759,24 +947,122 @@ async fn resolve_create_outcome(
             if must_not_be_directory {
                 // The server explicitly asked for a non-directory (`FILE_NON_DIRECTORY_FILE`)
                 // and got one anyway.
+                debug!("[rdpdr-drive] resolve_create_outcome path={path:?} branch=is-a-directory-error");
                 Err(CreateOutcomeError::IsADirectory)
             } else {
+                debug!("[rdpdr-drive] resolve_create_outcome path={path:?} branch=dir (stat-detected)");
                 Ok((None, true))
             }
         }
-        // Exists and isn't a directory, or doesn't exist yet (in which case `open_file` itself
-        // creates it when the disposition allows, and otherwise returns `FsError::NotFound` —
-        // exactly `NO_SUCH_FILE`, the status a `FILE_OPEN` disposition against a missing path
-        // should produce either way).
-        Ok(_) | Err(FsError::NotFound) => Ok(fs
-            .open_file(path, write, creates_new, truncates)
-            .await
-            .map(|handle| (Some(handle), false))?),
-        Err(err) => Err(err.into()),
+        Ok(_) => {
+            debug!("[rdpdr-drive] resolve_create_outcome path={path:?} branch=file");
+            Ok(fs
+                .open_file(path, write, creates_new, truncates)
+                .await
+                .map(|handle| (Some(handle), false))?)
+        }
+        // Doesn't exist yet: `open_file` itself creates it when the disposition allows, and
+        // otherwise returns `FsError::NotFound` — exactly `NO_SUCH_FILE`, the status a
+        // `FILE_OPEN` disposition against a missing path should produce either way.
+        Err(FsError::NotFound) if creates_new => {
+            debug!("[rdpdr-drive] resolve_create_outcome path={path:?} branch=notfound-create");
+            Ok(fs
+                .open_file(path, write, creates_new, truncates)
+                .await
+                .map(|handle| (Some(handle), false))?)
+        }
+        Err(FsError::NotFound) => {
+            debug!("[rdpdr-drive] resolve_create_outcome path={path:?} branch=notfound-nosuchfile");
+            Ok(fs
+                .open_file(path, write, creates_new, truncates)
+                .await
+                .map(|handle| (Some(handle), false))?)
+        }
+        Err(err) => {
+            debug!("[rdpdr-drive] resolve_create_outcome path={path:?} branch=stat-error err={err:?}");
+            Err(err.into())
+        }
     }
 }
 
+/// Diagnostic instrumentation (kept, not removed after debugging): extracts `(variant name,
+/// device_id, completion_id, file_id)` from any [`ServerDriveIoRequest`], for the `[rdpdr-drive]
+/// IN` log line at the top of `handle_drive_io_request`. Named `device_io_request` on every
+/// variant except `DeviceControlRequest`, which names it `header` — see `ironrdp-rdpdr`'s
+/// `efs.rs`.
+fn drive_request_debug_info(req: &ServerDriveIoRequest) -> (&'static str, u32, u32, u32) {
+    fn parts(io: &ironrdp::rdpdr::pdu::efs::DeviceIoRequest) -> (u32, u32, u32) {
+        (io.device_id, io.completion_id, io.file_id)
+    }
+    match req {
+        ServerDriveIoRequest::ServerCreateDriveRequest(r) => {
+            let (d, c, f) = parts(&r.device_io_request);
+            ("ServerCreateDriveRequest", d, c, f)
+        }
+        ServerDriveIoRequest::ServerDriveQueryInformationRequest(r) => {
+            let (d, c, f) = parts(&r.device_io_request);
+            ("ServerDriveQueryInformationRequest", d, c, f)
+        }
+        ServerDriveIoRequest::DeviceCloseRequest(r) => {
+            let (d, c, f) = parts(&r.device_io_request);
+            ("DeviceCloseRequest", d, c, f)
+        }
+        ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(r) => {
+            let (d, c, f) = parts(&r.device_io_request);
+            ("ServerDriveQueryDirectoryRequest", d, c, f)
+        }
+        ServerDriveIoRequest::ServerDriveNotifyChangeDirectoryRequest(r) => {
+            let (d, c, f) = parts(&r.device_io_request);
+            ("ServerDriveNotifyChangeDirectoryRequest", d, c, f)
+        }
+        ServerDriveIoRequest::ServerDriveQueryVolumeInformationRequest(r) => {
+            let (d, c, f) = parts(&r.device_io_request);
+            ("ServerDriveQueryVolumeInformationRequest", d, c, f)
+        }
+        ServerDriveIoRequest::DeviceControlRequest(r) => {
+            let (d, c, f) = parts(&r.header);
+            ("DeviceControlRequest", d, c, f)
+        }
+        ServerDriveIoRequest::DeviceReadRequest(r) => {
+            let (d, c, f) = parts(&r.device_io_request);
+            ("DeviceReadRequest", d, c, f)
+        }
+        ServerDriveIoRequest::DeviceWriteRequest(r) => {
+            let (d, c, f) = parts(&r.device_io_request);
+            ("DeviceWriteRequest", d, c, f)
+        }
+        ServerDriveIoRequest::DeviceFlushBuffersRequest(r) => {
+            let (d, c, f) = parts(&r.device_io_request);
+            ("DeviceFlushBuffersRequest", d, c, f)
+        }
+        ServerDriveIoRequest::ServerDriveSetInformationRequest(r) => {
+            let (d, c, f) = parts(&r.device_io_request);
+            ("ServerDriveSetInformationRequest", d, c, f)
+        }
+        ServerDriveIoRequest::ServerDriveLockControlRequest(r) => {
+            let (d, c, f) = parts(&r.device_io_request);
+            ("ServerDriveLockControlRequest", d, c, f)
+        }
+        ServerDriveIoRequest::ServerDriveQuerySecurityRequest(r) => {
+            let (d, c, f) = parts(&r.device_io_request);
+            ("ServerDriveQuerySecurityRequest", d, c, f)
+        }
+        ServerDriveIoRequest::ServerDriveSetSecurityRequest(r) => {
+            let (d, c, f) = parts(&r.device_io_request);
+            ("ServerDriveSetSecurityRequest", d, c, f)
+        }
+    }
+}
+
+/// Diagnostic instrumentation (kept, not removed after debugging): logs one line per RDPDR
+/// completion this backend sends, at the point each is constructed — variant name, the
+/// `completion_id`/`device_id` it echoes, and the `NtStatus` decided for it.
+fn log_outgoing(variant: &'static str, completion_id: u32, device_id: u32, status: NtStatus) {
+    debug!("[rdpdr-drive] OUT {variant} completion_id={completion_id} device_id={device_id} status={status:?}");
+}
+
 fn send_completion(tx: &mpsc::UnboundedSender<DriveBackendMessage>, messages: Vec<SvcMessage>) {
+    debug!("[rdpdr-drive] send_completion delivering {} message(s)", messages.len());
     if tx.unbounded_send(DriveBackendMessage::IoCompleted(messages)).is_err() {
         warn!("Failed to deliver drive IRP completion; event loop receiver is closed");
     }
@@ -794,6 +1080,10 @@ fn send_completion_if_current(
     messages: Vec<SvcMessage>,
 ) {
     if generation.get() != spawned_generation {
+        debug!(
+            "[rdpdr-drive] send_completion_if_current DROPPED stale-generation completion (spawned_generation={spawned_generation} current_generation={})",
+            generation.get()
+        );
         trace!("Dropping drive IRP completion from an RDPDR sequence superseded by reset()");
         return;
     }
@@ -1058,6 +1348,12 @@ fn query_volume_information_response(req: ServerDriveQueryVolumeInformationReque
     } else {
         NtStatus::NOT_SUPPORTED
     };
+    log_outgoing(
+        "ClientDriveQueryVolumeInformationResponse",
+        req.device_io_request.completion_id,
+        req.device_io_request.device_id,
+        status,
+    );
     let response = ClientDriveQueryVolumeInformationResponse::new(req.device_io_request, status, buffer);
     SvcMessage::from(RdpdrPdu::ClientDriveQueryVolumeInformationResponse(response))
 }
