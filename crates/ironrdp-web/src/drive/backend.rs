@@ -672,7 +672,9 @@ impl RdpdrBackend for WasmDriveBackend {
 /// Factory used by the session builder to construct a [`WasmDriveBackend`] for the wasm event
 /// loop, supplying `wasm_bindgen_futures::spawn_local` as its spawner. `tx` carries this
 /// backend's [`DriveBackendMessage`]s to whatever adapts them into the session's own event type
-/// (`RdpInputEvent::DriveBackend`, wired up by a later task).
+/// (`RdpInputEvent::DriveBackend`, wired up in `crate::session::SessionBuilder::connect`, which
+/// forwards them onto the shared event channel; the backend itself is then handed to
+/// [`super::composite::WasmCompositeBackend`] at that module's attach site in `session.rs`).
 pub(crate) fn wasm_drive_pair(
     tx: mpsc::UnboundedSender<DriveBackendMessage>,
     fs: Rc<dyn DriveFs>,
