@@ -90,6 +90,24 @@ export function printerDriverName(driverName: string): Extension {
     return new Extension('printer_driver_name', driverName);
 }
 
+// Virtual drive (RDPDR) extension
+//
+// Registering `driveShare` activates the browser-side virtual drive device,
+// redirecting `handle` (a directory the user granted via
+// `window.showDirectoryPicker()`) into the session as `shareName`. Mutually
+// exclusive with the virtual printer extensions above for now — if both are
+// configured, the drive share takes precedence.
+
+export interface DriveShareParams {
+    handle: FileSystemDirectoryHandle;
+    shareName: string;
+    readOnly?: boolean;
+}
+
+export function driveShare(params: DriveShareParams): Extension {
+    return new Extension('drive_share', params as unknown);
+}
+
 // Runtime operation extensions (invoked via Session.invokeExtension())
 
 export function requestFileContents(params: {

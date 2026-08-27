@@ -97,5 +97,6 @@ export {
     printerName,
     printerDeviceId,
     printerDriverName,
+    driveShare,
 } from './extensions';
-export type { PrintJobStreamCallbacks } from './extensions';
+export type { PrintJobStreamCallbacks, DriveShareParams } from './extensions';

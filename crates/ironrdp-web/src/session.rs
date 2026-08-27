@@ -38,11 +38,14 @@ use tap::prelude::*;
 use tracing::{debug, error, info, trace, warn};
 use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::spawn_local;
-use web_sys::HtmlCanvasElement;
+use web_sys::{FileSystemDirectoryHandle, HtmlCanvasElement};
 
 use crate::canvas::Canvas;
 use crate::clipboard;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
+use crate::drive::backend::{DriveBackendMessage, WasmDriveBackend, wasm_drive_pair};
+use crate::drive::fs::DriveFs;
+use crate::drive::web_fs::WebFsDrive;
 use crate::error::IronError;
 use crate::image::extract_partial_image;
 use crate::input::InputTransaction;
@@ -51,6 +54,12 @@ use crate::printer::{JsPrinterStreamCallbacks, WasmPrinter, WasmPrinterBackend, 
 
 const DEFAULT_WIDTH: u16 = 1280;
 const DEFAULT_HEIGHT: u16 = 720;
+
+/// Device id used to announce the redirected drive share on the Rdpdr channel.
+/// The printer branch's own `printer_device_id` falls back to `2` specifically
+/// to leave `1` free for drive redirection (see that fallback in
+/// `SessionBuilder::connect`) — this constant is the other half of that plan.
+const DRIVE_DEVICE_ID: u32 = 1;
 
 #[derive(Clone, Default)]
 pub(crate) struct SessionBuilder(Rc<RefCell<SessionBuilderInner>>);
@@ -88,6 +97,10 @@ struct SessionBuilderInner {
     printer_name: Option<String>,
     printer_device_id: Option<u32>,
     printer_driver_name: Option<String>,
+
+    // Setting a valid `driveShare` extension activates drive redirection.
+    invalid_drive_share: bool,
+    drive_share: Option<DriveShareConfig>,
 
     use_display_control: bool,
     enable_credssp: bool,
@@ -130,6 +143,9 @@ impl Default for SessionBuilderInner {
             printer_name: None,
             printer_device_id: None,
             printer_driver_name: None,
+
+            invalid_drive_share: false,
+            drive_share: None,
 
             use_display_control: false,
             enable_credssp: true,
@@ -321,6 +337,20 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                     Some(printer_driver_name)
                 };
             };
+            |drive_share: JsValue| {
+                let mut inner = self.0.borrow_mut();
+                match parse_drive_share(drive_share) {
+                    Ok(config) => {
+                        inner.invalid_drive_share = false;
+                        inner.drive_share = Some(config);
+                    }
+                    Err(error) => {
+                        inner.invalid_drive_share = true;
+                        inner.drive_share = None;
+                        warn!(%error, "Invalid drive_share; drive redirection requires a valid {{ handle, shareName }} object");
+                    }
+                }
+            };
         }
 
         self.clone()
@@ -354,6 +384,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_name,
             printer_device_id,
             printer_driver_name,
+            invalid_drive_share,
+            drive_share,
             outbound_message_size_limit,
         );
 
@@ -394,6 +426,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_name = inner.printer_name.clone();
             printer_device_id = inner.printer_device_id;
             printer_driver_name = inner.printer_driver_name.clone();
+            invalid_drive_share = inner.invalid_drive_share;
+            drive_share = inner.drive_share.clone();
             outbound_message_size_limit = inner.outbound_message_size_limit;
         }
 
@@ -447,6 +481,44 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         let printer_name = printer_name.unwrap_or_else(|| "IronRDP Virtual Printer".to_owned());
         let printer_driver_name = printer_driver_name.unwrap_or_else(default_printer_driver_name);
 
+        if invalid_drive_share {
+            return Err(IronError::from(anyhow::anyhow!(
+                "drive redirection requires a valid driveShare extension ({{ handle, shareName }})"
+            )));
+        }
+
+        // Build the virtual-drive pair when a `driveShare` extension was
+        // registered via extension(). `wasm_drive_pair`'s sender carries
+        // `DriveBackendMessage`, a type deliberately decoupled from
+        // `RdpInputEvent` (see that enum's own doc comment) — this task's job is
+        // exactly this adapter, forwarding each completion onto the session's
+        // shared event channel. The forwarding task ends on its own once
+        // `drive_backend` (moved into the Rdpdr static channel in `connect`
+        // below) is dropped and closes `drive_tx`, so nothing here can leak a
+        // forever-loop past the session's lifetime.
+        let drive = match drive_share {
+            Some(config) => {
+                let fs: Rc<dyn DriveFs> = Rc::new(WebFsDrive::new(config.handle));
+                let (drive_tx, mut drive_rx) = mpsc::unbounded();
+                let drive_backend = wasm_drive_pair(drive_tx, fs, config.read_only);
+
+                let forward_tx = input_events_tx.clone();
+                spawn_local(async move {
+                    while let Some(message) = drive_rx.next().await {
+                        if forward_tx
+                            .unbounded_send(RdpInputEvent::DriveBackend(SyncDriveBackendMessage(message)))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+
+                Some((drive_backend, config.share_name))
+            }
+            None => None,
+        };
+
         let ws = WebSocket::open(&proxy_address).context("couldn't open WebSocket")?;
 
         // NOTE: ideally, when the WebSocket can't be opened, the above call should fail with details on why is that
@@ -486,6 +558,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_device_id,
             printer_name,
             printer_driver_name,
+            drive,
             computer_name: client_name.clone(),
             use_display_control,
         })
@@ -520,6 +593,21 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
 pub(crate) type FastPathInputEvents = smallvec::SmallVec<[FastPathInputEvent; 2]>;
 
+/// Wraps a [`DriveBackendMessage`] so `RdpInputEvent` stays `Sync`, which
+/// `anyhow::Context`'s blanket impl requires at every other `.context(...)`
+/// call site on an `unbounded_send` result in this file (the bound is on the
+/// whole enum, not the particular variant in use). `DriveBackendMessage`
+/// carries `ironrdp_svc::SvcMessage`, which boxes a `dyn SvcEncode` trait
+/// object; `Send` is a supertrait of `SvcEncode` (so it *is* inherited by the
+/// trait object automatically), but `Sync` is not, so `DriveBackendMessage`
+/// itself isn't `Sync`. Safe to assert here for the same reason
+/// `WasmDriveBackend`'s own `unsafe impl Send` is safe (see its doc comment):
+/// this wasm client never shares a value across a real OS thread.
+#[derive(Debug)]
+pub(crate) struct SyncDriveBackendMessage(DriveBackendMessage);
+// SAFETY: see the doc comment above.
+unsafe impl Sync for SyncDriveBackendMessage {}
+
 #[derive(Debug)]
 pub(crate) enum RdpInputEvent {
     Cliprdr(ClipboardMessage),
@@ -527,6 +615,11 @@ pub(crate) enum RdpInputEvent {
     /// Printer backend → event loop: a print job finished and its bytes are
     /// ready for delivery to JS. See [`crate::printer::PrinterBackendMessage`].
     Printer(crate::printer::PrinterBackendMessage),
+    /// Drive backend → event loop (via the forwarding task spawned in
+    /// `SessionBuilder::connect`): an async `DriveFs` operation completed and
+    /// produced RDPDR completion PDU(s) that must be injected on the Rdpdr
+    /// static channel. See [`DriveBackendMessage`].
+    DriveBackend(SyncDriveBackendMessage),
     FastPath(FastPathInputEvents),
     Resize {
         width: u32,
@@ -857,6 +950,28 @@ impl iron_remote_desktop::Session for Session {
                                 warn!("Printer event received, but no printer is configured");
                             }
                             Vec::new()
+                        }
+                        RdpInputEvent::DriveBackend(SyncDriveBackendMessage(DriveBackendMessage::IoCompleted(messages))) => {
+                            // Mirrors the Cliprdr arms above: encode the already-built
+                            // completion PDU(s) onto the Rdpdr static channel and send the
+                            // resulting frame. Unlike Cliprdr's arms, `messages` is not
+                            // produced by calling a method on the processor here — it was
+                            // already built by `WasmDriveBackend` — so there is no
+                            // `get_svc_processor_mut` call needed to obtain it, only to
+                            // confirm the channel is actually attached.
+                            if active_stage.get_svc_processor_mut::<Rdpdr>().is_some() {
+                                match active_stage.process_svc_processor_messages::<Rdpdr>(messages.into()) {
+                                    Ok(frame) if !frame.is_empty() => vec![ActiveStageOutput::ResponseFrame(frame)],
+                                    Ok(_) => Vec::new(),
+                                    Err(e) => {
+                                        error!(error = %e, "Drive IRP completion failed to encode onto the Rdpdr channel");
+                                        Vec::new()
+                                    }
+                                }
+                            } else {
+                                warn!("Drive IRP completion received, but Rdpdr is not available");
+                                Vec::new()
+                            }
                         }
                         RdpInputEvent::TerminateSession => {
                             active_stage.graceful_shutdown()
@@ -1326,6 +1441,40 @@ fn parse_print_job_stream_callbacks(callbacks: JsValue) -> anyhow::Result<JsPrin
     })
 }
 
+/// Parsed `driveShare` extension payload — see [`parse_drive_share`].
+#[derive(Clone)]
+struct DriveShareConfig {
+    handle: FileSystemDirectoryHandle,
+    share_name: String,
+    read_only: bool,
+}
+
+fn parse_drive_share(value: JsValue) -> anyhow::Result<DriveShareConfig> {
+    let obj = value.dyn_into::<js_sys::Object>().map_err(|_| anyhow::anyhow!("expected object"))?;
+
+    let handle = js_sys::Reflect::get(&obj, &JsValue::from_str("handle"))
+        .map_err(|e| anyhow::anyhow!("get property `handle`: {e:?}"))?
+        .dyn_into::<FileSystemDirectoryHandle>()
+        .map_err(|_| anyhow::anyhow!("property `handle` must be a FileSystemDirectoryHandle"))?;
+
+    let share_name = js_sys::Reflect::get(&obj, &JsValue::from_str("shareName"))
+        .ok()
+        .and_then(|value| value.as_string())
+        .filter(|name| !name.is_empty())
+        .context("missing or empty `shareName`")?;
+
+    let read_only = js_sys::Reflect::get(&obj, &JsValue::from_str("readOnly"))
+        .ok()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+
+    Ok(DriveShareConfig {
+        handle,
+        share_name,
+        read_only,
+    })
+}
+
 fn get_required_function(obj: &js_sys::Object, key: &str) -> anyhow::Result<js_sys::Function> {
     get_optional_function(obj, key)?.with_context(|| format!("missing function `{key}`"))
 }
@@ -1540,6 +1689,13 @@ struct ConnectParams {
     printer_device_id: u32,
     printer_name: String,
     printer_driver_name: String,
+    /// `Some((backend, share_name))` when a `driveShare` extension configured
+    /// a redirected drive for this session. Mutually exclusive with
+    /// `printer_backend`: drive wins if both are set (a composite RDPDR
+    /// backend supporting both at once is a later task). See
+    /// [`RdpInputEvent::DriveBackend`] for how this backend's completions
+    /// reach the event loop.
+    drive: Option<(WasmDriveBackend, String)>,
     /// Matches the `client_name` in the connector config; used as the
     /// `computer_name` when constructing the `Rdpdr` processor.
     computer_name: String,
@@ -1590,6 +1746,7 @@ async fn connect(
         printer_device_id,
         printer_name,
         printer_driver_name,
+        drive,
         computer_name,
         use_display_control,
     }: ConnectParams,
@@ -1605,18 +1762,41 @@ async fn connect(
         connector.attach_static_channel(CliprdrClient::new(Box::new(clipboard_backend)));
     }
 
-    if let Some(printer_backend) = printer_backend {
-        // Windows servers only speak on RDPDR when RDPSND is advertised too
-        // (MS-RDPEFS Appendix A<1>). We do not play audio in the web client,
-        // but the no-op RDPSND processor satisfies that channel dependency.
-        connector.attach_static_channel(Rdpsnd::new(Box::new(NoopRdpsndBackend)));
-        connector.attach_static_channel(
-            Rdpdr::new(Box::new(printer_backend), computer_name).with_printer_driver(
-                printer_device_id,
-                printer_name,
-                printer_driver_name,
-            ),
-        );
+    // Drive and printer redirection are mutually exclusive this task — both live on
+    // the same RDPDR channel and `Rdpdr` takes a single backend. A composite backend
+    // dispatching to whichever of the two a given IRP's device id belongs to is a
+    // later task; until then, drive wins if both were configured.
+    match drive {
+        Some((drive_backend, share_name)) => {
+            if printer_backend.is_some() {
+                warn!(
+                    "Both a drive share and printer redirection were configured for this session; \
+                     drive share takes precedence (composite RDPDR backend not yet supported)"
+                );
+            }
+            // Windows servers only speak on RDPDR when RDPSND is advertised too
+            // (MS-RDPEFS Appendix A<1>). We do not play audio in the web client,
+            // but the no-op RDPSND processor satisfies that channel dependency.
+            connector.attach_static_channel(Rdpsnd::new(Box::new(NoopRdpsndBackend)));
+            connector.attach_static_channel(
+                Rdpdr::new(Box::new(drive_backend), computer_name).with_drives(Some(vec![(DRIVE_DEVICE_ID, share_name)])),
+            );
+        }
+        None => {
+            if let Some(printer_backend) = printer_backend {
+                // Windows servers only speak on RDPDR when RDPSND is advertised too
+                // (MS-RDPEFS Appendix A<1>). We do not play audio in the web client,
+                // but the no-op RDPSND processor satisfies that channel dependency.
+                connector.attach_static_channel(Rdpsnd::new(Box::new(NoopRdpsndBackend)));
+                connector.attach_static_channel(
+                    Rdpdr::new(Box::new(printer_backend), computer_name).with_printer_driver(
+                        printer_device_id,
+                        printer_name,
+                        printer_driver_name,
+                    ),
+                );
+            }
+        }
     }
 
     if use_display_control {
