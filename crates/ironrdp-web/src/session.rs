@@ -333,6 +333,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             server_domain,
             password,
             proxy_address,
+            vmconnect,
             kdc_proxy_url,
             client_name,
             desktop_size,
@@ -364,6 +365,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             server_domain = inner.server_domain.clone();
             password = inner.password.clone().context("password missing")?;
             proxy_address = inner.proxy_address.clone().context("proxy_address missing")?;
+            vmconnect = inner.vmconnect.clone();
             kdc_proxy_url = inner.kdc_proxy_url.clone();
             client_name = inner.client_name.clone();
             desktop_size = inner.desktop_size;
@@ -477,6 +479,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             ws,
             config,
             destination,
+            vmconnect,
             kdc_proxy_url,
             clipboard_backend: clipboard.as_ref().map(|clip| clip.backend()),
             printer_backend,
@@ -1527,6 +1530,10 @@ struct ConnectParams {
     ws: WebSocket,
     config: connector::Config,
     destination: String,
+    /// Hyper-V VMConnect PCB payload (e.g. `<vm-guid>;EnhancedMode=1`).
+    /// When set, the connection targets a Hyper-V host console (port 2179)
+    /// using the PCB → TLS → CredSSP → X.224 ordering.
+    vmconnect: Option<String>,
     kdc_proxy_url: Option<String>,
     clipboard_backend: Option<WasmClipboardBackend>,
     printer_backend: Option<WasmPrinterBackend>,
@@ -1576,6 +1583,7 @@ async fn connect(
         ws,
         config,
         destination,
+        vmconnect,
         kdc_proxy_url,
         clipboard_backend,
         printer_backend,
@@ -1617,15 +1625,29 @@ async fn connect(
         );
     }
 
+    let mut network_client = WasmNetworkClient;
+    let server_name = connector::ServerName::from(destination.as_str());
+    let kerberos_config = url::Url::parse(kdc_proxy_url.unwrap_or_default().as_str())
+        .ok()
+        .map(|url| KerberosConfig {
+            kdc_proxy_url: Some(url),
+            hostname: destination,
+        });
+
     // Direct connection mode: X.224 exchange happens directly over WebSocket.
     // A TLS-terminating proxy handles TLS upgrade on the TCP side and sends
     // back the server's DER-encoded public key as a length-prefixed message:
     //   [0x00][len:4 BE][server_public_key_der]
     // The 0x00 tag byte distinguishes this from RDP PDUs (which start with 0x03).
-    let (upgraded, server_public_key) = connect_direct(&mut framed, &mut connector).await?;
-
-    let mut network_client = WasmNetworkClient;
-    let server_name = connector::ServerName::from(destination.as_str());
+    let (upgraded, server_public_key) = connect_direct(
+        &mut framed,
+        &mut connector,
+        vmconnect,
+        &mut network_client,
+        server_name.clone(),
+        kerberos_config.clone(),
+    )
+    .await?;
 
     let connection_result = ironrdp_futures::connect_finalize(
         upgraded,
@@ -1634,12 +1656,7 @@ async fn connect(
         &mut network_client,
         server_name,
         server_public_key,
-        url::Url::parse(kdc_proxy_url.unwrap_or_default().as_str())
-            .ok()
-            .map(|url| KerberosConfig {
-                kdc_proxy_url: Some(url),
-                hostname: destination,
-            }),
+        kerberos_config,
     )
     .await?;
 
@@ -1658,13 +1675,53 @@ async fn connect(
 /// 4. Then relays all subsequent bytes transparently
 ///
 /// The 0x00 tag byte distinguishes the key message from RDP PDUs (which start with 0x03).
+///
+/// When `vmconnect` is set, the target is a Hyper-V host console (port 2179) and the
+/// ordering changes per MS-RDPEPS: the browser sends the Preconnection Blob as the
+/// first frame (relayed pre-TLS by the proxy), the proxy immediately upgrades to TLS
+/// and sends back the server public key, then CredSSP runs *before* X.224 via
+/// [`ironrdp_vmconnect::connect_front`].
 async fn connect_direct<S>(
     framed: &mut ironrdp_futures::Framed<S>,
     connector: &mut ClientConnector,
+    vmconnect: Option<String>,
+    network_client: &mut WasmNetworkClient,
+    server_name: connector::ServerName,
+    kerberos_config: Option<KerberosConfig>,
 ) -> Result<(ironrdp_futures::Upgraded, Vec<u8>), IronError>
 where
     S: ironrdp_futures::FramedRead + FramedWrite,
 {
+    if let Some(pcb_payload) = vmconnect {
+        info!("Begin direct VMConnect connection procedure");
+
+        // Hyper-V ordering: PCB → TLS → CredSSP → X.224. The proxy relays the
+        // PCB bytes to the target pre-TLS, then performs the TLS upgrade.
+        let pcb_bytes = ironrdp_vmconnect::encode_preconnection_blob_payload(pcb_payload)
+            .context("encode preconnection blob")?;
+
+        framed
+            .write_all(&pcb_bytes)
+            .await
+            .context("couldn't write preconnection blob")?;
+
+        let server_public_key = read_server_public_key(framed).await?;
+
+        let upgraded = ironrdp_vmconnect::connect_front(
+            ironrdp_vmconnect::pcb_sent_via_proxy(),
+            framed,
+            connector,
+            network_client,
+            server_name,
+            &server_public_key,
+            kerberos_config,
+        )
+        .await
+        .context("connect Hyper-V front over direct WebSocket")?;
+
+        return Ok((upgraded, server_public_key));
+    }
+
     info!("Begin direct connection procedure");
 
     // Step 1: X.224 connection request/confirm exchange happens directly over the WebSocket.
@@ -1675,8 +1732,21 @@ where
         single_sequence_step(framed, connector, &mut buf).await?;
     }
 
-    // Step 2: The proxy has now upgraded the TCP side to TLS and sends us the
-    // server's public key as [0x00][len:4 BE][spki_der].
+    // Step 2: The proxy has now upgraded the TCP side to TLS and sent us the server's public key.
+    let server_public_key = read_server_public_key(framed).await?;
+
+    // Step 3: Mark TLS upgrade as done (proxy handled it).
+    let should_upgrade = ironrdp_futures::skip_connect_begin(connector);
+    let upgraded = ironrdp_futures::mark_as_upgraded(should_upgrade, connector);
+
+    Ok((upgraded, server_public_key))
+}
+
+/// Reads the proxy's server-public-key message: [0x00][len:4 BE][spki_der_bytes].
+async fn read_server_public_key<S>(framed: &mut ironrdp_futures::Framed<S>) -> Result<Vec<u8>, IronError>
+where
+    S: ironrdp_futures::FramedRead + FramedWrite,
+{
     #[derive(Clone, Copy, Debug)]
     struct ServerKeyHint;
 
@@ -1712,11 +1782,7 @@ where
     let server_public_key = key_msg[5..].to_vec();
     debug!("Received server public key ({} bytes) from proxy", server_public_key.len());
 
-    // Step 3: Mark TLS upgrade as done (proxy handled it).
-    let should_upgrade = ironrdp_futures::skip_connect_begin(connector);
-    let upgraded = ironrdp_futures::mark_as_upgraded(should_upgrade, connector);
-
-    Ok((upgraded, server_public_key))
+    Ok(server_public_key)
 }
 
 #[expect(clippy::as_conversions, clippy::cast_sign_loss, clippy::cast_possible_truncation)]

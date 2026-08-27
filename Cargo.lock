@@ -3536,6 +3536,7 @@ dependencies = [
  "ironrdp-propertyset",
  "ironrdp-rdpfile",
  "ironrdp-svc",
+ "ironrdp-vmconnect",
  "js-sys",
  "png",
  "resize",
