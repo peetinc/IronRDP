@@ -21,6 +21,7 @@
     import { PublicAPI } from './services/PublicAPI';
     import { ScreenScale } from './enums/ScreenScale';
     import type { RemoteDesktopModule } from './interfaces/RemoteDesktopModule';
+    import type { UserInteraction } from './interfaces/UserInteraction';
     import { isComponentDestroyed } from './lib/stores/componentLifecycleStore';
     import { runWhenFocusedQueue } from './lib/stores/runWhenFocusedStore';
     import { ClipboardService } from './services/clipboard.service';
@@ -306,8 +307,21 @@
 
         initListeners();
 
-        let result = { irgUserInteraction: publicAPI.getExposedFunctions() };
+        return { irgUserInteraction: publicAPI.getExposedFunctions() };
+    }
 
+    // Dispatch `ready` only once clipboard init has run to completion (success
+    // or definitive failure). `ready` is the signal consumers use to drive
+    // connect() programmatically (LithiumBridge does exactly this); connect()
+    // reads the clipboard callbacks registered by initClipboard() at
+    // session-build time, so firing `ready` any earlier lets a fast, non-human
+    // caller build a session with clipboard callbacks still null -> CLIPRDR
+    // never attaches, clipboard is silently dead for the whole session.
+    //
+    // Clipboard init failing (permissions denied, non-secure context, etc.)
+    // must not block `ready` forever: a clipboard-less session is still
+    // usable, so catch/log and dispatch anyway.
+    function dispatchReady(result: { irgUserInteraction: UserInteraction }) {
         loggingService.info('Component ready');
         loggingService.info('Dispatching ready event');
 
@@ -343,8 +357,18 @@
         isComponentDestroyed.set(false);
         loggingService.verbose = verbose === 'true';
         loggingService.info('Dom ready');
-        await initcanvas();
-        await clipboardService.initClipboard();
+        const result = await initcanvas();
+
+        try {
+            await clipboardService.initClipboard();
+        } catch (err) {
+            // Clipboard support is best-effort: a session without it is still
+            // fully usable, so log and keep going rather than leaving `ready`
+            // (and every programmatic consumer waiting on it) stuck forever.
+            loggingService.info(`Clipboard initialization failed, continuing without it: ${err}`);
+        }
+
+        dispatchReady(result);
     });
 
     onDestroy(() => {
