@@ -11,6 +11,7 @@
     let autoResize = true;
     let screenEl: HTMLElement | null = null;
     let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+    let lastRequestedSize = '';
 
     userInteractionService.subscribe((uis) => {
         if (uis != null) {
@@ -33,7 +34,9 @@
             const rect = screenEl.getBoundingClientRect();
             const width = Math.floor(rect.width);
             const height = Math.floor(rect.height);
-            if (width > 0 && height > 0) {
+            const size = `${width}x${height}`;
+            if (width > 0 && height > 0 && size !== lastRequestedSize) {
+                lastRequestedSize = size;
                 uiService.resize(width, height);
             }
         }, 200);
