@@ -1173,11 +1173,16 @@ impl DeviceAnnounceHeader {
         Self {
             device_type: DeviceType::Filesystem,
             device_id,
-            // With DRIVE_CAPABILITY_VERSION_02, DeviceData contains the complete
-            // null-terminated Unicode name. The field remains mandatory even
-            // though the server ignores it when DeviceDataLength is nonzero.
+            // [2.2.1.3] DEVICE_ANNOUNCE: for RDPDR_DTYP_FILESYSTEM, DeviceData is the drive's
+            // full name as a null-terminated string of ASCII characters — NOT UTF-16LE (unlike
+            // e.g. the printer PnPName/DriverName/PrintName fields in MS-RDPEPC 2.2.2.3, which
+            // genuinely are UTF-16LE). FreeRDP's `drive_main.c` writes this field as ASCII too.
+            // Getting this wrong is silently destructive rather than a decode error: Windows
+            // reads DeviceData as a null-terminated ASCII string, so a UTF-16LE encoding's every
+            // other byte being `0x00` truncates the displayed name at its first character (a
+            // drive named "IRONSHARE" would show as just "I").
             preferred_dos_name: PreferredDosName::for_drive(&name),
-            device_data: utf16le_with_nul(&name),
+            device_data: ascii_with_nul(&name),
         }
     }
 
@@ -1353,6 +1358,25 @@ fn utf16le_with_nul(s: &str) -> Vec<u8> {
         out.extend_from_slice(&unit.to_le_bytes());
     }
     out.extend_from_slice(&[0, 0] /* UTF-16 NUL terminator */);
+    out
+}
+
+/// Encodes `s` as a null-terminated string of ASCII characters, lossily replacing any
+/// non-ASCII character with `_`. Used for [`DeviceAnnounceHeader::new_drive`]'s `DeviceData`,
+/// which per MS-RDPEFS 2.2.1.3 is ASCII (unlike the UTF-16LE fields [`utf16le_with_nul`]
+/// produces elsewhere in this file).
+fn ascii_with_nul(s: &str) -> Vec<u8> {
+    let mut out: Vec<u8> = s
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii() {
+                u8::try_from(u32::from(ch)).unwrap_or(b'_')
+            } else {
+                b'_'
+            }
+        })
+        .collect();
+    out.push(0 /* ASCII NUL terminator */);
     out
 }
 
@@ -5935,5 +5959,37 @@ mod tests {
             u32::try_from(stream_information.len()).expect("test buffer fits in u32")
         );
         assert_eq!(&encoded[16..], stream_information.as_slice());
+    }
+
+    #[test]
+    fn drive_announce_device_data_is_ascii_not_utf16() {
+        // Regression test: DeviceData for RDPDR_DTYP_FILESYSTEM is a null-terminated ASCII
+        // string per MS-RDPEFS 2.2.1.3. A prior UTF-16LE encoding made Windows (which parses
+        // this field as null-terminated ASCII) stop at the first `0x00` byte, so "Shared" was
+        // displayed as just "S".
+        let announce = DeviceAnnounceHeader::new_drive(7, "Shared".to_owned());
+        assert_eq!(announce.device_data(), b"Shared\0");
+    }
+
+    #[test]
+    fn drive_announce_device_data_replaces_non_ascii_with_underscore() {
+        let announce = DeviceAnnounceHeader::new_drive(7, "caf\u{e9}".to_owned());
+        assert_eq!(announce.device_data(), b"caf_\0");
+    }
+
+    #[test]
+    fn drive_announce_preferred_dos_name_is_ascii_padded_to_eight_bytes_with_nul() {
+        let announce = DeviceAnnounceHeader::new_drive(7, "Shared".to_owned());
+        let mut encoded = vec![0u8; announce.size()];
+        announce
+            .encode(&mut WriteCursor::new(&mut encoded))
+            .expect("encode drive announce");
+
+        // DeviceType(4) + DeviceId(4) = 8, then the 8-byte PreferredDosName field.
+        assert_eq!(
+            &encoded[8..16],
+            b"Shared\0\0",
+            "PreferredDosName must be plain ASCII, NUL-padded to 8 bytes"
+        );
     }
 }
