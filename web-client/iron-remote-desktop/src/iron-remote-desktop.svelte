@@ -399,6 +399,7 @@
         window.removeEventListener('focus', focusEventHandler);
         window.removeEventListener('blur', blurEventHandler);
         document.removeEventListener('visibilitychange', visibilityChangeHandler);
+        clipboardService.markDestroyed();
         isComponentDestroyed.set(true);
         destroyed = true;
     });
