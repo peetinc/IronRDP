@@ -72,6 +72,15 @@ web-sys = { version = "0.3", features = [
 ] }
 js-sys = "0.3"
 gloo-net = { version = "0.7", default-features = false, features = ["websocket", "http", "io-util"] }
+
+# TLS, terminated in the browser (see `crate::tls`). `ring` rather than rustls'
+# default `aws-lc-rs`, which does not build for `wasm32-unknown-unknown`.
+futures-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pki-types = { version = "1.15", features = ["web"] }
+# `ring`'s `SystemRandom` has no implementation on `wasm32-unknown-unknown` unless this
+# feature routes it through `getrandom`'s JS backend (`crypto.getRandomValues`).
+ring = { version = "0.17.14", features = ["wasm32_unknown_unknown_js"] }
+x509-cert = { version = "0.3", default-features = false, features = ["std"] }
 gloo-timers = { version = "0.4", default-features = false, features = ["futures"] }
 
 # Rendering
