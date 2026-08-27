@@ -90,5 +90,11 @@ semver = "1"
 url = "2.5"
 base64 = "0.22"
 
+[dev-dependencies]
+# Native-only test executor for `drive::backend`'s injected-spawner tests
+# (`futures::executor::LocalPool` + `futures::task::LocalSpawnExt`); the wasm build itself only
+# ever uses `wasm_bindgen_futures::spawn_local`.
+futures = { version = "0.3", default-features = false, features = ["executor"] }
+
 [lints]
 workspace = true
