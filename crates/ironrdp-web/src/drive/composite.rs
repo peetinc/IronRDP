@@ -52,7 +52,7 @@ use ironrdp::rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
 use ironrdp_core::impl_as_any;
 use ironrdp_pdu::PduResult;
 use ironrdp_svc::SvcMessage;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::backend::WasmDriveBackend;
 use crate::printer::WasmPrinterBackend;
@@ -159,8 +159,14 @@ impl RdpdrBackend for WasmCompositeBackend {
     /// never configured for this session" case, not a routing ambiguity.
     fn handle_drive_io_request(&mut self, req: ServerDriveIoRequest) -> PduResult<Vec<SvcMessage>> {
         match &mut self.drive {
-            Some(drive) => drive.handle_drive_io_request(req),
-            None => Ok(drive_not_configured_response(req)),
+            Some(drive) => {
+                debug!("[rdpdr-drive] composite: routing drive IRP to the configured drive member");
+                drive.handle_drive_io_request(req)
+            }
+            None => {
+                debug!("[rdpdr-drive] composite: no drive member configured; using not-configured fallback");
+                Ok(drive_not_configured_response(req))
+            }
         }
     }
 
@@ -169,8 +175,14 @@ impl RdpdrBackend for WasmCompositeBackend {
     /// case, not a routing ambiguity.
     fn handle_printer_io_request(&mut self, req: PrinterIoRequest) -> PduResult<Vec<SvcMessage>> {
         match &mut self.printer {
-            Some(printer) => printer.handle_printer_io_request(req),
-            None => Ok(printer_not_configured_response(req)),
+            Some(printer) => {
+                debug!("[rdpdr-printer] composite: routing printer IRP to the configured printer member");
+                printer.handle_printer_io_request(req)
+            }
+            None => {
+                debug!("[rdpdr-printer] composite: no printer member configured; using not-configured fallback");
+                Ok(printer_not_configured_response(req))
+            }
         }
     }
 }
