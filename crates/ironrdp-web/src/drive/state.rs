@@ -29,7 +29,7 @@ pub(crate) struct OpenEntry {
 
 /// Maps RDPDR `file_id` -> [`OpenEntry`] for the lifetime of a drive
 /// redirection session, and allocates new `file_id`s.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct DriveState {
     entries: HashMap<u32, OpenEntry>,
     /// Monotonic file id counter, same scheme as
@@ -40,6 +40,17 @@ pub(crate) struct DriveState {
     /// reusing a just-closed number needlessly risks a stale in-flight IRP
     /// racing a fresh open of the same id.
     next_file_id: u32,
+}
+
+// Hand-written rather than `#[derive(Default)]`: a derived impl would zero
+// `next_file_id`, handing out file_id 0 on the first `open()` — contradicting
+// both the doc comment above and the brief's "allocates monotonically from
+// 1". Delegate to `new()` so there is exactly one place that decides the
+// starting id.
+impl Default for DriveState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DriveState {
@@ -178,6 +189,14 @@ mod tests {
             second, 2,
             "closing file_id 1 must not make it available for reallocation"
         );
+    }
+
+    #[test]
+    fn default_constructed_state_still_allocates_first_file_id_as_one() {
+        // Guards against a derived `Default` (which would zero `next_file_id`
+        // and hand out file_id 0 here) creeping back in.
+        let mut state = DriveState::default();
+        assert_eq!(state.open("\\a.txt", Some(1), false), 1);
     }
 
     #[test]
