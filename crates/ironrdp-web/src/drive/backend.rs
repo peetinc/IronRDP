@@ -152,6 +152,7 @@ impl WasmDriveBackend {
         }
 
         let is_directory = create.create_options.contains(CreateOptions::FILE_DIRECTORY_FILE);
+        let must_not_be_directory = create.create_options.contains(CreateOptions::FILE_NON_DIRECTORY_FILE);
         let creates_new = !matches!(create.create_disposition, CreateDisposition::FILE_OPEN);
         let truncates = matches!(
             create.create_disposition,
@@ -176,20 +177,23 @@ impl WasmDriveBackend {
         let path = create.path;
 
         let future: LocalBoxFuture<'static, ()> = Box::pin(async move {
-            let outcome = if is_directory {
-                open_or_create_directory(fs.as_ref(), &path, creates_new).await
-            } else {
-                fs.open_file(&path, write, creates_new, truncates)
-                    .await
-                    .map(|handle| (Some(handle), false))
-            };
+            let outcome = resolve_create_outcome(
+                fs.as_ref(),
+                &path,
+                is_directory,
+                must_not_be_directory,
+                write,
+                creates_new,
+                truncates,
+            )
+            .await;
 
             let (status, file_id, information) = match outcome {
                 Ok((fs_handle, is_dir)) => {
                     let file_id = state.borrow_mut().open(path, fs_handle, is_dir);
                     (NtStatus::SUCCESS, file_id, create_information)
                 }
-                Err(err) => (nt_status_for(&err), 0, Information::empty()),
+                Err(err) => (create_status_for(&err), 0, Information::empty()),
             };
 
             let response = DeviceCreateResponse {
@@ -701,6 +705,74 @@ async fn open_or_create_directory(
             Ok((None, true))
         }
         Err(err) => Err(err),
+    }
+}
+
+/// A `dispatch_create` failure that isn't a plain [`FsError`] — specifically, "the caller
+/// explicitly asked for a non-directory and the target is one," which has no `FsError` variant
+/// of its own since it isn't a filesystem-layer failure at all.
+enum CreateOutcomeError {
+    Fs(FsError),
+    IsADirectory,
+}
+
+impl From<FsError> for CreateOutcomeError {
+    fn from(err: FsError) -> Self {
+        Self::Fs(err)
+    }
+}
+
+fn create_status_for(err: &CreateOutcomeError) -> NtStatus {
+    match err {
+        CreateOutcomeError::Fs(err) => nt_status_for(err),
+        CreateOutcomeError::IsADirectory => NtStatus::FILE_IS_A_DIRECTORY,
+    }
+}
+
+/// Resolves a `Create` IRP into either a directory open/create or a file open/create,
+/// independent of whether the server explicitly said which one it wanted.
+///
+/// `CreateOptions::FILE_DIRECTORY_FILE` is the only flag `DeviceCreateRequest` carries that
+/// unambiguously means "this is a directory" — real Windows redirector traffic routinely opens
+/// a path with NEITHER `FILE_DIRECTORY_FILE` nor `FILE_NON_DIRECTORY_FILE` set (observed live:
+/// double-clicking a file on the share opens its *parent directory* this way as part of the
+/// lookup), so treating "flag not set" as "must be a file" and unconditionally calling
+/// `DriveFs::open_file` breaks against a real `DriveFs` implementation the moment the target
+/// turns out to be a directory (the browser File System Access API throws `TypeMismatchError`
+/// calling `getFileHandle` on a directory). So whenever the server hasn't explicitly committed
+/// to "directory," this `stat`s first and decides from the real answer.
+async fn resolve_create_outcome(
+    fs: &dyn DriveFs,
+    path: &str,
+    is_directory: bool,
+    must_not_be_directory: bool,
+    write: bool,
+    creates_new: bool,
+    truncates: bool,
+) -> Result<(Option<u32>, bool), CreateOutcomeError> {
+    if is_directory {
+        return Ok(open_or_create_directory(fs, path, creates_new).await?);
+    }
+
+    match fs.stat(path).await {
+        Ok(entry) if entry.is_dir => {
+            if must_not_be_directory {
+                // The server explicitly asked for a non-directory (`FILE_NON_DIRECTORY_FILE`)
+                // and got one anyway.
+                Err(CreateOutcomeError::IsADirectory)
+            } else {
+                Ok((None, true))
+            }
+        }
+        // Exists and isn't a directory, or doesn't exist yet (in which case `open_file` itself
+        // creates it when the disposition allows, and otherwise returns `FsError::NotFound` —
+        // exactly `NO_SUCH_FILE`, the status a `FILE_OPEN` disposition against a missing path
+        // should produce either way).
+        Ok(_) | Err(FsError::NotFound) => Ok(fs
+            .open_file(path, write, creates_new, truncates)
+            .await
+            .map(|handle| (Some(handle), false))?),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -1491,6 +1563,65 @@ mod tests {
             ))),
         );
         assert_eq!(status_of(&response), NtStatus::NO_SUCH_FILE);
+    }
+
+    #[test]
+    fn create_on_existing_directory_with_no_type_flags_succeeds_as_directory() {
+        // Windows' redirector routinely opens a directory with NEITHER FILE_DIRECTORY_FILE nor
+        // FILE_NON_DIRECTORY_FILE set (observed live: double-clicking a file on the share opens
+        // its parent directory this way). The backend must not blindly assume "file" and call
+        // `DriveFs::open_file` on a directory path.
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\dir\\a.txt", b"a");
+        let mut harness = Harness::new(fs, false);
+
+        let create = open_request("\\dir", 1);
+        assert!(
+            create.create_options.is_empty(),
+            "test fixture must exercise the no-flags case"
+        );
+        let created = only(harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(create)));
+        assert_eq!(status_of(&created), NtStatus::SUCCESS);
+        let file_id = read_u32_at(&encoded(&created), 16);
+
+        // `MockFs::list` re-derives the target by path, not by the handle's recorded type, so it
+        // would "accidentally" succeed below even if the handle were mis-tracked as a file —
+        // assert directly on `DriveState`'s bookkeeping (accessible here: `tests` is a
+        // descendant module of `backend`, where `WasmDriveBackend::state` is defined) to
+        // actually pin down the bug: a directory opened without type flags must never carry a
+        // `DriveFs` file handle, or the real (browser) `DriveFs` would have already rejected
+        // `open_file` against it with a `TypeMismatchError` before we got this far.
+        {
+            let state = harness.backend.state.borrow();
+            let entry = state.get(file_id).expect("file_id must be open");
+            assert!(
+                entry.is_dir,
+                "directory opened without type flags must be tracked as a directory"
+            );
+            assert!(
+                entry.fs_handle.is_none(),
+                "a directory entry must never carry a DriveFs file handle"
+            );
+        }
+
+        // And functionally: QueryDirectory only works against a directory entry.
+        let listing = only(harness.dispatch(ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(
+            query_directory_request(file_id, 2, 1, "\\dir\\*"),
+        )));
+        assert_eq!(status_of(&listing), NtStatus::SUCCESS);
+        assert_eq!(dir_entry_name(&listing), "a.txt");
+    }
+
+    #[test]
+    fn create_with_non_directory_flag_on_a_directory_is_file_is_a_directory() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_dir("\\dir");
+        let mut harness = Harness::new(fs, false);
+
+        let mut create = open_request("\\dir", 1);
+        create.create_options = CreateOptions::FILE_NON_DIRECTORY_FILE;
+        let response = only(harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(create)));
+        assert_eq!(status_of(&response), NtStatus::FILE_IS_A_DIRECTORY);
     }
 
     fn open_dir(harness: &mut Harness, path: &str, completion_id: u32) -> u32 {
