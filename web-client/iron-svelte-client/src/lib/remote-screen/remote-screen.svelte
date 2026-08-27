@@ -11,7 +11,9 @@
     let autoResize = true;
     let screenEl: HTMLElement | null = null;
     let resizeTimer: ReturnType<typeof setTimeout> | undefined;
-    let lastRequestedSize = '';
+    let verifyTimer: ReturnType<typeof setTimeout> | undefined;
+    let lastRequested: { width: number; height: number } | null = null;
+    let retriesLeft = 0;
 
     userInteractionService.subscribe((uis) => {
         if (uis != null) {
@@ -22,24 +24,59 @@
     // Ask the server (via the Display Control DVC) to match the desktop size
     // to the space available for the canvas. Debounced: RDPEDISP resizes are
     // expensive server-side, so wait for the drag to settle.
+    //
+    // Measure the AVAILABLE space from the parent container, not the
+    // iron-remote-desktop element: the component pins its viewer to a fixed
+    // pixel size after each dynamic resize, so the element itself stops
+    // tracking window resizes.
     function scheduleResize() {
         if (!autoResize) {
             return;
         }
         clearTimeout(resizeTimer);
         resizeTimer = setTimeout(() => {
-            if (uiService == null || screenEl == null) {
+            if (uiService == null || screenEl == null || screenEl.parentElement == null) {
                 return;
             }
-            const rect = screenEl.getBoundingClientRect();
-            const width = Math.floor(rect.width);
-            const height = Math.floor(rect.height);
-            const size = `${width}x${height}`;
-            if (width > 0 && height > 0 && size !== lastRequestedSize) {
-                lastRequestedSize = size;
-                uiService.resize(width, height);
+            const parentRect = screenEl.parentElement.getBoundingClientRect();
+            const top = screenEl.getBoundingClientRect().top;
+            const width = Math.floor(parentRect.width);
+            const height = Math.floor(parentRect.bottom - top);
+            if (width > 0 && height > 0 && (lastRequested?.width !== width || lastRequested?.height !== height)) {
+                lastRequested = { width, height };
+                retriesLeft = 5;
+                requestResize();
             }
-        }, 200);
+        }, 500);
+    }
+
+    function requestResize() {
+        if (uiService == null || lastRequested == null) {
+            return;
+        }
+        uiService.resize(lastRequested.width, lastRequested.height);
+        // The request is dropped client-side if the Display Control channel
+        // is not ready yet (e.g. right after connect), and there is no
+        // feedback either way. Verify the canvas picked up the new size and
+        // retry a few times if it did not.
+        clearTimeout(verifyTimer);
+        verifyTimer = setTimeout(() => {
+            if (screenEl == null || lastRequested == null || retriesLeft <= 0) {
+                return;
+            }
+            const canvas = (screenEl.shadowRoot ?? screenEl).querySelector('canvas');
+            if (canvas == null) {
+                return;
+            }
+            // The client rounds odd widths down; accept a small delta.
+            const applied =
+                Math.abs(canvas.width - lastRequested.width) <= 2 &&
+                Math.abs(canvas.height - lastRequested.height) <= 2;
+            if (!applied) {
+                retriesLeft -= 1;
+                requestResize();
+            }
+        }, 1000);
     }
 
     // Fire once when the session becomes visible so the desktop immediately
@@ -85,7 +122,11 @@
         });
 
         screenEl = el as HTMLElement;
-        new ResizeObserver(() => scheduleResize()).observe(screenEl);
+        // Observe the flex container: it follows the window; the pinned
+        // iron-remote-desktop element does not (see scheduleResize).
+        const observer = new ResizeObserver(() => scheduleResize());
+        observer.observe(screenEl.parentElement ?? screenEl);
+        window.addEventListener('resize', () => scheduleResize());
     });
 </script>
 
