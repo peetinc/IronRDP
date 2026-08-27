@@ -57,6 +57,17 @@
     let clipboardService = new ClipboardService(remoteDesktopService, module);
     let publicAPI = new PublicAPI(remoteDesktopService, clipboardService);
 
+    // Instance-scoped teardown flag. `dispatchReady` now runs after an await
+    // (clipboardService.initClipboard()), so a consumer that unmounts this
+    // component during that await (e.g. closing a tab) must not still get a
+    // `ready` event bubbling out of a detached `inner` afterward — that would
+    // let a stale `ready` handler call connect() with no owning UI left.
+    // Deliberately local, NOT the module-scope `isComponentDestroyed` store
+    // (see import below) — that store is shared across every
+    // <iron-remote-desktop> instance on the page and using it here would
+    // reintroduce the exact cross-instance suppression bug d68dfa16 fixed.
+    let destroyed = false;
+
     let currentScreenScale = ScreenScale.Fit;
 
     function captureKeys(evt: KeyboardEvent) {
@@ -322,6 +333,15 @@
     // must not block `ready` forever: a clipboard-less session is still
     // usable, so catch/log and dispatch anyway.
     function dispatchReady(result: { irgUserInteraction: UserInteraction }) {
+        if (destroyed) {
+            // Component was torn down while we were awaiting clipboard init.
+            // `inner` may still be a live object (nothing nulls it out on
+            // destroy), so dispatching would still bubble the event to
+            // whatever listener the now-gone consumer left attached. Don't.
+            loggingService.info('Skipping ready dispatch: component was destroyed during clipboard init');
+            return;
+        }
+
         loggingService.info('Component ready');
         loggingService.info('Dispatching ready event');
 
@@ -354,6 +374,7 @@
     }
 
     onMount(async () => {
+        destroyed = false;
         isComponentDestroyed.set(false);
         loggingService.verbose = verbose === 'true';
         loggingService.info('Dom ready');
@@ -379,6 +400,7 @@
         window.removeEventListener('blur', blurEventHandler);
         document.removeEventListener('visibilitychange', visibilityChangeHandler);
         isComponentDestroyed.set(true);
+        destroyed = true;
     });
 </script>
 
