@@ -13,8 +13,16 @@
  *    [0x00][len:4 BE][spki_der_bytes]
  * 8. All subsequent bytes are relayed transparently
  *
+ * Hyper-V VMConnect mode (browser connects with ?vmconnect=1):
+ * 1. Browser sends the Preconnection Blob (MS-RDPEPS) as its first frame
+ * 2. Proxy relays it to the target over TCP, then immediately upgrades to TLS
+ *    (VMConnect ordering is PCB → TLS → CredSSP → X.224; the server sends
+ *    nothing in plaintext, so there is no X.224 phase to watch)
+ * 3. Proxy sends the server public key message, then relays transparently
+ *
  * Usage: node ws-rdp-proxy.mjs [listen-port] [rdp-target-host:port]
  * Example: node ws-rdp-proxy.mjs 8765 192.168.1.100:3389
+ * Example (VMConnect): node ws-rdp-proxy.mjs 8765 hyperv-host.example.com:2179
  */
 
 import { WebSocketServer } from 'ws';
@@ -31,19 +39,26 @@ const wss = new WebSocketServer({ port: listenPort });
 console.log(`[proxy] Listening on ws://localhost:${listenPort}`);
 console.log(`[proxy] Target: ${targetHost}:${targetPort}`);
 
-wss.on('connection', (ws) => {
-  console.log('[proxy] Browser connected');
+wss.on('connection', (ws, req) => {
+  // VMConnect mode: PCB → TLS ordering instead of X.224 → TLS.
+  const query = new URL(req?.url || '/', 'http://localhost').searchParams;
+  const vmMode = query.get('vmconnect') === '1';
+
+  console.log(`[proxy] Browser connected${vmMode ? ' (VMConnect mode)' : ''}`);
 
   let tcpSocket = null;
   let tlsSocket = null;
   let activeSocket = null;
   let tlsUpgraded = false;
-  let x224Phase = true; // true until we see X.224 confirm and need TLS upgrade
+  let x224Phase = !vmMode; // true until we see X.224 confirm and need TLS upgrade
   let tcpReady = false;
   let pendingMessages = []; // buffer messages until TCP is connected
 
   // Track how many X.224 PDUs we've relayed
   let x224RequestSent = false;
+
+  // VMConnect: set once the browser's Preconnection Blob has been received
+  let pcbSent = false;
 
   // Connect to RDP target
   tcpSocket = net.createConnection({ host: targetHost, port: targetPort }, () => {
@@ -55,6 +70,10 @@ wss.on('connection', (ws) => {
       activeSocket.write(msg);
     }
     pendingMessages = [];
+    // VMConnect: the PCB is on the wire; upgrade to TLS immediately
+    if (vmMode && pcbSent && !tlsUpgraded) {
+      performTlsUpgrade();
+    }
   });
 
   tcpSocket.on('error', (err) => {
@@ -73,6 +92,12 @@ wss.on('connection', (ws) => {
   tcpSocket.on('data', (data) => {
     if (tlsUpgraded) {
       // Should not get data on raw tcp after TLS upgrade
+      return;
+    }
+
+    if (vmMode) {
+      // VMConnect servers send nothing in plaintext (PCB → TLS directly)
+      console.warn(`[proxy] Unexpected plaintext data from VMConnect target (${data.length} bytes), ignoring`);
       return;
     }
 
@@ -162,6 +187,19 @@ wss.on('connection', (ws) => {
   // Browser -> RDP target
   ws.on('message', (data) => {
     const buf = Buffer.from(data);
+
+    if (vmMode && !pcbSent) {
+      // First frame in VMConnect mode is the Preconnection Blob
+      console.log(`[proxy] Got Preconnection Blob from browser (${buf.length} bytes)`);
+      pcbSent = true;
+      if (tcpReady) {
+        tcpSocket.write(buf);
+        performTlsUpgrade();
+      } else {
+        pendingMessages.push(buf);
+      }
+      return;
+    }
 
     if (x224Phase && !x224RequestSent) {
       // First message from browser should be X.224 Connection Request

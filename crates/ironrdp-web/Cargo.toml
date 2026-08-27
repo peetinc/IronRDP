@@ -45,6 +45,7 @@ ironrdp-pdu.path = "../ironrdp-pdu"
 ironrdp-propertyset.path = "../ironrdp-propertyset"
 ironrdp-rdpfile.path = "../ironrdp-rdpfile"
 ironrdp-svc.path = "../ironrdp-svc"
+ironrdp-vmconnect.path = "../ironrdp-vmconnect"
 iron-remote-desktop.path = "../iron-remote-desktop"
 
 # WASM
