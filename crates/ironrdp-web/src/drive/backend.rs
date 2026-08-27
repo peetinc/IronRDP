@@ -16,7 +16,7 @@
 //! case, `!Send` — see [`super::fs`]'s module doc for why that tension exists and is resolved
 //! with `unsafe impl Send` below.
 
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::fmt;
 use std::rc::Rc;
 
@@ -31,21 +31,21 @@ use ironrdp::rdpdr::pdu::efs::{
     DeviceCloseRequest, DeviceCloseResponse, DeviceControlResponse, DeviceCreateRequest, DeviceCreateResponse,
     DeviceFlushBuffersResponse, DeviceIoResponse, DeviceReadRequest, DeviceReadResponse, DeviceWriteRequest,
     DeviceWriteResponse, FileAttributes, FileBasicInformation, FileBothDirectoryInformation, FileDirectoryInformation,
-    FileFsAttributeInformation, FileFsDeviceInformation, FileFsFullSizeInformation, FileFsSizeInformation,
-    FileFsVolumeInformation, FileFullDirectoryInformation, FileInformationClass, FileInformationClassLevel,
-    FileNamesInformation, FileStandardInformation, FileSystemAttributes, FileSystemInformationClass,
-    FileSystemInformationClassLevel, Information, NtStatus, PrinterIoRequest, ServerDeviceAnnounceResponse,
-    ServerDriveIoRequest, ServerDriveQueryDirectoryRequest, ServerDriveQueryInformationRequest,
-    ServerDriveQueryVolumeInformationRequest, ServerDriveSetInformationRequest,
+    FileDispositionInformation, FileFsAttributeInformation, FileFsDeviceInformation, FileFsFullSizeInformation,
+    FileFsSizeInformation, FileFsVolumeInformation, FileFullDirectoryInformation, FileInformationClass,
+    FileInformationClassLevel, FileNamesInformation, FileStandardInformation, FileSystemAttributes,
+    FileSystemInformationClass, FileSystemInformationClassLevel, Information, NtStatus, PrinterIoRequest,
+    ServerDeviceAnnounceResponse, ServerDriveIoRequest, ServerDriveQueryDirectoryRequest,
+    ServerDriveQueryInformationRequest, ServerDriveQueryVolumeInformationRequest, ServerDriveSetInformationRequest,
 };
 use ironrdp::rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
 use ironrdp_core::{EncodeResult, impl_as_any};
 use ironrdp_pdu::{PduError, PduErrorExt as _, PduResult, pdu_other_err};
 use ironrdp_svc::SvcMessage;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use super::fs::{DriveFs, FsEntry, FsError};
-use super::state::DriveState;
+use super::state::{DriveState, normalize_path};
 
 /// Message sent from [`WasmDriveBackend`] each time an async `DriveFs` operation completes and
 /// produces RDPDR completion PDU(s) to send back to the server.
@@ -70,6 +70,12 @@ pub(crate) struct WasmDriveBackend {
     read_only: bool,
     tx: mpsc::UnboundedSender<DriveBackendMessage>,
     spawn: DriveFsSpawner,
+    /// Bumped by [`Self::reset`] (called on every RDPDR Server Announce Request — see
+    /// [`ironrdp::rdpdr::backend::RdpdrBackend::reset`]'s own doc comment). A future spawned
+    /// before a `reset` captures the generation it was spawned in; if that no longer matches
+    /// this counter by the time the future resolves, its completion is dropped instead of being
+    /// delivered into the new sequence stamped with a now-stale `device_id`/`completion_id`.
+    generation: Rc<Cell<u64>>,
 }
 
 // SAFETY: `RdpdrBackend: Send` is a supertrait bound the SVC processor's generic
@@ -87,6 +93,7 @@ impl fmt::Debug for WasmDriveBackend {
         f.debug_struct("WasmDriveBackend")
             .field("read_only", &self.read_only)
             .field("state", &self.state)
+            .field("generation", &self.generation.get())
             .finish_non_exhaustive()
     }
 }
@@ -109,11 +116,33 @@ impl WasmDriveBackend {
             read_only,
             tx,
             spawn,
+            generation: Rc::new(Cell::new(0)),
         }
+    }
+
+    /// Snapshots the current generation before spawning a future, so the future can check —
+    /// once it resolves — whether a `reset` superseded it in the meantime.
+    fn spawn_generation(&self) -> (Rc<Cell<u64>>, u64) {
+        let generation = Rc::clone(&self.generation);
+        let spawned_generation = generation.get();
+        (generation, spawned_generation)
     }
 
     fn dispatch_create(&self, create: DeviceCreateRequest) -> Vec<SvcMessage> {
         if self.read_only && is_write_intent(&create) {
+            let response = DeviceCreateResponse {
+                device_io_reply: DeviceIoResponse::new(create.device_io_request, NtStatus::ACCESS_DENIED),
+                file_id: 0,
+                information: Information::empty(),
+            };
+            return vec![SvcMessage::from(RdpdrPdu::DeviceCreateResponse(response))];
+        }
+
+        // `state.rs`'s own docs promise every drive-IRP path reaches `DriveFs` only after
+        // `normalize_path` validation (rejecting `..` traversal); this backend is `DriveFs`'s
+        // one caller, so it enforces that here rather than leaving it to whatever a given
+        // `DriveFs` implementation happens to check internally.
+        if !path_is_valid(&create.path) {
             let response = DeviceCreateResponse {
                 device_io_reply: DeviceIoResponse::new(create.device_io_request, NtStatus::ACCESS_DENIED),
                 file_id: 0,
@@ -140,6 +169,7 @@ impl WasmDriveBackend {
         let fs = Rc::clone(&self.fs);
         let state = Rc::clone(&self.state);
         let tx = self.tx.clone();
+        let (generation, spawned_generation) = self.spawn_generation();
         // `create` is not used again after this point, so its two fields the future needs are
         // moved out directly rather than cloned.
         let device_io_request = create.device_io_request;
@@ -167,7 +197,12 @@ impl WasmDriveBackend {
                 file_id,
                 information,
             };
-            send_completion(&tx, vec![SvcMessage::from(RdpdrPdu::DeviceCreateResponse(response))]);
+            send_completion_if_current(
+                &tx,
+                &generation,
+                spawned_generation,
+                vec![SvcMessage::from(RdpdrPdu::DeviceCreateResponse(response))],
+            );
         });
         (self.spawn)(future);
         Vec::new()
@@ -187,6 +222,7 @@ impl WasmDriveBackend {
 
         let fs = Rc::clone(&self.fs);
         let tx = self.tx.clone();
+        let (generation, spawned_generation) = self.spawn_generation();
         // `req` is not used again after this point (the `let-else` above already returned in
         // the only branch that still needed it), so its fields are moved rather than cloned.
         let class_lvl = req.file_info_class_lvl;
@@ -204,8 +240,10 @@ impl WasmDriveBackend {
                 device_io_response: DeviceIoResponse::new(device_io_request, status),
                 buffer,
             };
-            send_completion(
+            send_completion_if_current(
                 &tx,
+                &generation,
+                spawned_generation,
                 vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryInformationResponse(
                     response,
                 ))],
@@ -235,6 +273,7 @@ impl WasmDriveBackend {
 
         let fs = Rc::clone(&self.fs);
         let tx = self.tx.clone();
+        let (generation, spawned_generation) = self.spawn_generation();
         let device_io_request = req.device_io_request;
         let future: LocalBoxFuture<'static, ()> = Box::pin(async move {
             let status = match fs.close(fs_handle).await {
@@ -244,7 +283,12 @@ impl WasmDriveBackend {
             let response = DeviceCloseResponse {
                 device_io_response: DeviceIoResponse::new(device_io_request, status),
             };
-            send_completion(&tx, vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(response))]);
+            send_completion_if_current(
+                &tx,
+                &generation,
+                spawned_generation,
+                vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(response))],
+            );
         });
         (self.spawn)(future);
         Vec::new()
@@ -272,9 +316,9 @@ impl WasmDriveBackend {
             return vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryDirectoryResponse(response))];
         }
 
-        // Initial query: re-list the directory this `file_id` was opened against (the search
-        // pattern in `req.path`, if any, is not applied — `DriveFs::list` has no filtering
-        // primitive, so every initial query lists the whole directory).
+        // Initial query: re-list the directory this `file_id` was opened against and apply
+        // whatever search pattern `req.path` carries (e.g. `\dir\*.txt` or an exact filename
+        // for an existence check) against each entry's name before caching.
         let Some(path) = self.state.borrow().get(file_id).map(|entry| entry.path.clone()) else {
             let response = ClientDriveQueryDirectoryResponse {
                 device_io_reply: DeviceIoResponse::new(device_io_request, NtStatus::INVALID_HANDLE),
@@ -286,15 +330,28 @@ impl WasmDriveBackend {
         let fs = Rc::clone(&self.fs);
         let state = Rc::clone(&self.state);
         let tx = self.tx.clone();
+        let (generation, spawned_generation) = self.spawn_generation();
         let class_lvl = req.file_info_class_lvl;
+        let search_pattern = dir_search_pattern(&req.path);
 
         let future: LocalBoxFuture<'static, ()> = Box::pin(async move {
             let (status, buffer) = match fs.list(&path).await {
                 Ok(listing) => {
-                    state.borrow_mut().set_dir_listing(file_id, listing);
+                    let filtered = match &search_pattern {
+                        Some(pattern) => listing
+                            .into_iter()
+                            .filter(|entry| dos_wildcard_match(pattern, &entry.name))
+                            .collect(),
+                        None => listing,
+                    };
+                    state.borrow_mut().set_dir_listing(file_id, filtered);
                     match state.borrow_mut().next_dir_entry(file_id) {
                         Some(entry) => (NtStatus::SUCCESS, Some(build_dir_info(&class_lvl, &entry))),
-                        None => (NtStatus::NO_MORE_FILES, None),
+                        // Zero matches on the INITIAL query (as opposed to an exhausted
+                        // continuation, handled above) is `NO_SUCH_FILE`, matching
+                        // FreeRDP/Windows drive-redirection semantics — `NO_MORE_FILES` means
+                        // "there were some, you've seen them all."
+                        None => (NtStatus::NO_SUCH_FILE, None),
                     }
                 }
                 Err(err) => (nt_status_for(&err), None),
@@ -303,8 +360,10 @@ impl WasmDriveBackend {
                 device_io_reply: DeviceIoResponse::new(device_io_request, status),
                 buffer,
             };
-            send_completion(
+            send_completion_if_current(
                 &tx,
+                &generation,
+                spawned_generation,
                 vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryDirectoryResponse(response))],
             );
         });
@@ -325,6 +384,7 @@ impl WasmDriveBackend {
 
         let fs = Rc::clone(&self.fs);
         let tx = self.tx.clone();
+        let (generation, spawned_generation) = self.spawn_generation();
         let offset = req.offset;
         let length = req.length;
 
@@ -337,7 +397,12 @@ impl WasmDriveBackend {
                 device_io_reply: DeviceIoResponse::new(device_io_request, status),
                 read_data,
             };
-            send_completion(&tx, vec![SvcMessage::from(RdpdrPdu::DeviceReadResponse(response))]);
+            send_completion_if_current(
+                &tx,
+                &generation,
+                spawned_generation,
+                vec![SvcMessage::from(RdpdrPdu::DeviceReadResponse(response))],
+            );
         });
         (self.spawn)(future);
         Vec::new()
@@ -364,6 +429,7 @@ impl WasmDriveBackend {
 
         let fs = Rc::clone(&self.fs);
         let tx = self.tx.clone();
+        let (generation, spawned_generation) = self.spawn_generation();
         let offset = req.offset;
         let data = req.write_data;
 
@@ -376,7 +442,12 @@ impl WasmDriveBackend {
                 device_io_reply: DeviceIoResponse::new(device_io_request, status),
                 length,
             };
-            send_completion(&tx, vec![SvcMessage::from(RdpdrPdu::DeviceWriteResponse(response))]);
+            send_completion_if_current(
+                &tx,
+                &generation,
+                spawned_generation,
+                vec![SvcMessage::from(RdpdrPdu::DeviceWriteResponse(response))],
+            );
         });
         (self.spawn)(future);
         Vec::new()
@@ -399,9 +470,16 @@ impl WasmDriveBackend {
         // apply.
         match req.set_buffer.clone() {
             FileInformationClass::Rename(rename) => {
+                // Same rule as `Create`'s path (see `dispatch_create`): a server-supplied path
+                // must clear `normalize_path` before it ever reaches `DriveFs`.
+                if !path_is_valid(&rename.file_name) {
+                    return Ok(vec![set_information_message(&req, NtStatus::ACCESS_DENIED)?]);
+                }
+
                 let fs = Rc::clone(&self.fs);
                 let state = Rc::clone(&self.state);
                 let tx = self.tx.clone();
+                let (generation, spawned_generation) = self.spawn_generation();
                 let from = path;
                 let to = rename.file_name;
                 let future: LocalBoxFuture<'static, ()> = Box::pin(async move {
@@ -414,10 +492,14 @@ impl WasmDriveBackend {
                         }
                         Err(err) => nt_status_for(&err),
                     };
-                    match set_information_message(&req, status) {
-                        Ok(message) => send_completion(&tx, vec![message]),
-                        Err(error) => warn!(?error, "Failed to encode ClientDriveSetInformationResponse"),
-                    }
+                    let message = set_information_message(&req, status).unwrap_or_else(|error| {
+                        warn!(
+                            ?error,
+                            "Failed to encode ClientDriveSetInformationResponse; sending UNSUCCESSFUL fallback"
+                        );
+                        set_information_fallback_message(&req, NtStatus::UNSUCCESSFUL)
+                    });
+                    send_completion_if_current(&tx, &generation, spawned_generation, vec![message]);
                 });
                 (self.spawn)(future);
                 Ok(Vec::new())
@@ -425,16 +507,21 @@ impl WasmDriveBackend {
             FileInformationClass::Disposition(disposition) if disposition.delete_pending != 0 => {
                 let fs = Rc::clone(&self.fs);
                 let tx = self.tx.clone();
+                let (generation, spawned_generation) = self.spawn_generation();
                 let target = path;
                 let future: LocalBoxFuture<'static, ()> = Box::pin(async move {
                     let status = match fs.delete(&target).await {
                         Ok(()) => NtStatus::SUCCESS,
                         Err(err) => nt_status_for(&err),
                     };
-                    match set_information_message(&req, status) {
-                        Ok(message) => send_completion(&tx, vec![message]),
-                        Err(error) => warn!(?error, "Failed to encode ClientDriveSetInformationResponse"),
-                    }
+                    let message = set_information_message(&req, status).unwrap_or_else(|error| {
+                        warn!(
+                            ?error,
+                            "Failed to encode ClientDriveSetInformationResponse; sending UNSUCCESSFUL fallback"
+                        );
+                        set_information_fallback_message(&req, NtStatus::UNSUCCESSFUL)
+                    });
+                    send_completion_if_current(&tx, &generation, spawned_generation, vec![message]);
                 });
                 (self.spawn)(future);
                 Ok(Vec::new())
@@ -449,6 +536,37 @@ impl WasmDriveBackend {
 }
 
 impl RdpdrBackend for WasmDriveBackend {
+    /// Called by `Rdpdr` on every Server Announce Request (a new RDPDR init sequence) — see
+    /// this method's own doc comment on the trait: stateful backends MUST override it to
+    /// discard deferred operations before devices are re-announced. Without this override, a
+    /// re-init would keep every stale `file_id` and its `DriveFs` handle alive forever (leaked
+    /// browser handles/writables), and any future still in flight from the previous sequence
+    /// would eventually deliver a completion stamped with a `device_id`/`completion_id` that no
+    /// longer means anything in the new one.
+    fn reset(&mut self) -> PduResult<()> {
+        // Any future spawned before this point now belongs to a superseded generation; its
+        // completion (if any) will be dropped by `send_completion_if_current` instead of
+        // reaching the new sequence.
+        self.generation.set(self.generation.get().wrapping_add(1));
+
+        let stale_handles = self.state.borrow().open_fs_handles();
+        self.state = Rc::new(RefCell::new(DriveState::new()));
+
+        if !stale_handles.is_empty() {
+            let fs = Rc::clone(&self.fs);
+            let future: LocalBoxFuture<'static, ()> = Box::pin(async move {
+                for handle in stale_handles {
+                    // Best-effort: the RDPDR sequence that opened these is already gone, so
+                    // there is nobody left to report a close failure to.
+                    let _ = fs.close(handle).await;
+                }
+            });
+            (self.spawn)(future);
+        }
+
+        Ok(())
+    }
+
     fn handle_server_device_announce_response(&mut self, pdu: ServerDeviceAnnounceResponse) -> PduResult<()> {
         // Surface server-side rejection at `warn!` so a redirected share that silently never
         // appears in the session is visible at the default tracing level (same rationale as
@@ -590,6 +708,32 @@ fn send_completion(tx: &mpsc::UnboundedSender<DriveBackendMessage>, messages: Ve
     }
 }
 
+/// Same as [`send_completion`], but first checks that `generation` (the backend's live
+/// generation counter) still matches `spawned_generation` (the value captured when the future
+/// now calling this was spawned). A mismatch means [`WasmDriveBackend::reset`] ran in the
+/// meantime — the RDPDR sequence that IRP belonged to is gone, so its completion is dropped
+/// rather than delivered with a `device_id`/`completion_id` that no longer means anything.
+fn send_completion_if_current(
+    tx: &mpsc::UnboundedSender<DriveBackendMessage>,
+    generation: &Cell<u64>,
+    spawned_generation: u64,
+    messages: Vec<SvcMessage>,
+) {
+    if generation.get() != spawned_generation {
+        trace!("Dropping drive IRP completion from an RDPDR sequence superseded by reset()");
+        return;
+    }
+    send_completion(tx, messages);
+}
+
+/// `state.rs`'s own docs promise every drive-IRP path reaches `DriveFs` only after
+/// `normalize_path` validation; this is the one call site that promise is upheld from, since
+/// `DriveFs` implementations are only required to *interpret* an already-validated path, not
+/// necessarily re-validate it themselves (`MockFs` happens to, but that's not a contract).
+fn path_is_valid(path: &str) -> bool {
+    normalize_path(path).is_ok()
+}
+
 fn nt_status_for(err: &FsError) -> NtStatus {
     match err {
         FsError::NotFound => NtStatus::NO_SUCH_FILE,
@@ -671,6 +815,53 @@ fn build_query_info(class_lvl: &FileInformationClassLevel, entry: &FsEntry) -> O
     } else {
         None
     }
+}
+
+/// Extracts the search pattern from a `QueryDirectory` initial-query path, e.g. `\dir\*.txt` ->
+/// `Some("*.txt")`, `\dir\report.pdf` -> `Some("report.pdf")` (an exact-name existence check —
+/// Windows issues these for Save-As overwrite prompts and rename-collision checks).
+/// `None` means "no filter" (bare `*`, or an empty path — both mean "list everything").
+fn dir_search_pattern(path: &str) -> Option<String> {
+    let pattern = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    if pattern.is_empty() || pattern == "*" {
+        None
+    } else {
+        Some(pattern.to_owned())
+    }
+}
+
+/// DOS/Windows wildcard match (`*` = any run of characters including none, `?` = exactly one
+/// character), case-insensitive — the classic greedy two-pointer algorithm (iterative, so an
+/// adversarial pattern can't blow the stack the way a naive recursive matcher could).
+fn dos_wildcard_match(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let name: Vec<char> = name.chars().map(|c| c.to_ascii_lowercase()).collect();
+
+    let mut p = 0usize;
+    let mut n = 0usize;
+    let mut star_p: Option<usize> = None;
+    let mut star_n = 0usize;
+
+    while n < name.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == name[n]) {
+            p += 1;
+            n += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star_p = Some(p);
+            star_n = n;
+            p += 1;
+        } else if let Some(sp) = star_p {
+            p = sp + 1;
+            star_n += 1;
+            n = star_n;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 /// Builds a directory-listing entry in whichever of the four levels
@@ -805,6 +996,22 @@ fn set_information_message(req: &ServerDriveSetInformationRequest, status: NtSta
     Ok(SvcMessage::from(RdpdrPdu::ClientDriveSetInformationResponse(response)))
 }
 
+/// Fallback used when [`set_information_message`] itself fails to encode — its `Length` field
+/// is computed from `req.set_buffer.size()` via `cast_length!`, so a failure there means that
+/// exact computation can't be retried with the same `set_buffer`. Substitutes a
+/// `FileDispositionInformation` (a fixed 1-byte payload, so `cast_length!` always succeeds)
+/// while still echoing the real `device_io_request` — an IRP is always answered, never dropped,
+/// even when the "real" response can't be built.
+fn set_information_fallback_message(req: &ServerDriveSetInformationRequest, status: NtStatus) -> SvcMessage {
+    let fallback = ServerDriveSetInformationRequest {
+        device_io_request: req.device_io_request.clone(),
+        set_buffer: FileInformationClass::Disposition(FileDispositionInformation { delete_pending: 0 }),
+    };
+    let response = ClientDriveSetInformationResponse::new(&fallback, status)
+        .expect("FileDispositionInformation's fixed 1-byte size always fits a u32 length field");
+    SvcMessage::from(RdpdrPdu::ClientDriveSetInformationResponse(response))
+}
+
 /// Converts a fallible PDU-construction result (`cast_length!`'s `EncodeError`, e.g. a
 /// file name too long to fit a `u32`-length-prefixed wire field) into this backend's
 /// `PduResult`. In practice this only ever fires for pathologically large inputs.
@@ -817,7 +1024,7 @@ mod tests {
     use futures::executor::LocalPool;
     use futures::task::LocalSpawnExt;
     use ironrdp::rdpdr::pdu::efs::{
-        DeviceIoRequest, FileDispositionInformation, FileRenameInformation, MajorFunction, MinorFunction, SharedAccess,
+        DeviceIoRequest, FileRenameInformation, MajorFunction, MinorFunction, SharedAccess,
     };
 
     use super::*;
@@ -922,6 +1129,21 @@ mod tests {
     fn only(mut messages: Vec<SvcMessage>) -> SvcMessage {
         assert_eq!(messages.len(), 1, "expected exactly one completion PDU");
         messages.remove(0)
+    }
+
+    /// Decodes the `FileName` out of a `ClientDriveQueryDirectoryResponse` built from
+    /// `FileNamesInformation` (as every `QueryDirectory` test here requests): 16-byte
+    /// `SharedHeader` + `DeviceIoResponse` prefix, then `Length`(4) +
+    /// `NextEntryOffset`(4) + `FileIndex`(4) + `FileNameLength`(4) + `FileName` (UTF-16LE, no
+    /// null terminator) — see `FileNamesInformation::encode`.
+    fn dir_entry_name(message: &SvcMessage) -> String {
+        let bytes = encoded(message);
+        let file_name_length = read_u32_at(&bytes, 28) as usize;
+        let utf16: Vec<u16> = bytes[32..32 + file_name_length]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        String::from_utf16_lossy(&utf16)
     }
 
     /// `MockFs`'s futures never actually suspend (no wasm I/O involved), so a single poll always
@@ -1267,5 +1489,189 @@ mod tests {
             ))),
         );
         assert_eq!(status_of(&response), NtStatus::NO_SUCH_FILE);
+    }
+
+    fn open_dir(harness: &mut Harness, path: &str, completion_id: u32) -> u32 {
+        let mut create = open_request(path, completion_id);
+        create.create_options = CreateOptions::FILE_DIRECTORY_FILE;
+        let created = only(harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(create)));
+        assert_eq!(status_of(&created), NtStatus::SUCCESS);
+        read_u32_at(&encoded(&created), 16)
+    }
+
+    fn query_directory_request(
+        file_id: u32,
+        completion_id: u32,
+        initial_query: u8,
+        path: &str,
+    ) -> ServerDriveQueryDirectoryRequest {
+        ServerDriveQueryDirectoryRequest {
+            device_io_request: dev_io_req(file_id, completion_id, MajorFunction::DirectoryControl),
+            file_info_class_lvl: FileInformationClassLevel::FILE_NAMES_INFORMATION,
+            initial_query,
+            path: path.to_string(),
+        }
+    }
+
+    #[test]
+    fn query_directory_exact_name_pattern_returns_only_that_entry() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\dir\\a.txt", b"a");
+        fs.seed_file("\\dir\\b.txt", b"bb");
+        let mut harness = Harness::new(fs, false);
+        let file_id = open_dir(&mut harness, "\\dir", 1);
+
+        let initial = only(harness.dispatch(ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(
+            query_directory_request(file_id, 2, 1, "\\dir\\a.txt"),
+        )));
+        assert_eq!(status_of(&initial), NtStatus::SUCCESS);
+        assert_eq!(dir_entry_name(&initial), "a.txt");
+
+        // Only one entry matched the exact-name pattern, so a continuation must be exhausted.
+        let second = only(harness.dispatch(ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(
+            query_directory_request(file_id, 3, 0, ""),
+        )));
+        assert_eq!(status_of(&second), NtStatus::NO_MORE_FILES);
+    }
+
+    #[test]
+    fn query_directory_exact_name_pattern_for_missing_file_is_no_such_file() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\dir\\a.txt", b"a");
+        let mut harness = Harness::new(fs, false);
+        let file_id = open_dir(&mut harness, "\\dir", 1);
+
+        let response = only(harness.dispatch(ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(
+            query_directory_request(file_id, 2, 1, "\\dir\\missing.txt"),
+        )));
+        assert_eq!(status_of(&response), NtStatus::NO_SUCH_FILE);
+    }
+
+    #[test]
+    fn query_directory_wildcard_pattern_filters_by_extension() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\dir\\a.txt", b"a");
+        fs.seed_file("\\dir\\b.log", b"bb");
+        let mut harness = Harness::new(fs, false);
+        let file_id = open_dir(&mut harness, "\\dir", 1);
+
+        let initial = only(harness.dispatch(ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(
+            query_directory_request(file_id, 2, 1, "\\dir\\*.txt"),
+        )));
+        assert_eq!(status_of(&initial), NtStatus::SUCCESS);
+        assert_eq!(dir_entry_name(&initial), "a.txt");
+
+        // `b.log` never matched `*.txt`, so only one entry was ever cached.
+        let second = only(harness.dispatch(ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(
+            query_directory_request(file_id, 3, 0, ""),
+        )));
+        assert_eq!(status_of(&second), NtStatus::NO_MORE_FILES);
+    }
+
+    #[test]
+    fn create_with_parent_traversal_path_is_access_denied_without_touching_fs() {
+        let fs = Rc::new(MockFs::new());
+        let mut harness = Harness::new(fs, false);
+
+        let response = only(
+            harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(open_request(
+                "\\..\\x", 1,
+            ))),
+        );
+        assert_eq!(status_of(&response), NtStatus::ACCESS_DENIED);
+        harness.assert_no_completion();
+    }
+
+    #[test]
+    fn set_information_rename_with_parent_traversal_target_is_access_denied() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\old.txt", b"payload");
+        let mut harness = Harness::new(Rc::clone(&fs), false);
+
+        let created = only(
+            harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(open_request(
+                "\\old.txt",
+                1,
+            ))),
+        );
+        let file_id = read_u32_at(&encoded(&created), 16);
+
+        let response = only(harness.dispatch(ServerDriveIoRequest::ServerDriveSetInformationRequest(
+            ServerDriveSetInformationRequest {
+                device_io_request: dev_io_req(file_id, 2, MajorFunction::SetInformation),
+                set_buffer: FileInformationClass::Rename(FileRenameInformation {
+                    replace_if_exists: Boolean::False,
+                    file_name: "\\..\\escaped.txt".to_string(),
+                }),
+            },
+        )));
+        assert_eq!(status_of(&response), NtStatus::ACCESS_DENIED);
+        harness.assert_no_completion();
+
+        // The original file must be untouched.
+        assert_eq!(read_all_via_fs(&fs, "\\old.txt"), b"payload");
+    }
+
+    #[test]
+    fn reset_frees_open_drivefs_handles_and_drops_stale_generation_completions() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\a.txt", b"data");
+        let mut harness = Harness::new(Rc::clone(&fs), false);
+
+        let created = only(
+            harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(open_request(
+                "\\a.txt", 1,
+            ))),
+        );
+        assert_eq!(status_of(&created), NtStatus::SUCCESS);
+        let file_id = read_u32_at(&encoded(&created), 16);
+        let fs_handle = harness
+            .backend
+            .state
+            .borrow()
+            .get(file_id)
+            .and_then(|entry| entry.fs_handle)
+            .expect("Create must have allocated a DriveFs handle");
+
+        // A second IRP against the still-open handle, deliberately dispatched WITHOUT pumping
+        // the pool first — its future is queued but has not run yet, so it belongs to the
+        // pre-reset generation.
+        let messages = harness
+            .backend
+            .handle_drive_io_request(ServerDriveIoRequest::DeviceReadRequest(DeviceReadRequest {
+                device_io_request: dev_io_req(file_id, 2, MajorFunction::Read),
+                length: 16,
+                offset: 0,
+            }))
+            .expect("dispatch must not error");
+        assert!(messages.is_empty(), "Read is always answered asynchronously");
+
+        // A Server Announce Request re-init happens mid-flight — `Rdpdr::handle_server_announce`
+        // calls `reset()` on every announce (crates/ironrdp-rdpdr/src/lib.rs).
+        harness.backend.reset().expect("reset must not error");
+        harness.pool.run_until_stalled();
+
+        assert!(
+            harness.rx.try_recv().is_err(),
+            "the Read queued before reset must never deliver a completion into the new sequence"
+        );
+        assert_eq!(
+            block_on(fs.close(fs_handle)),
+            Err(FsError::NotFound),
+            "reset must already have closed the stale DriveFs handle (a double-close is NotFound)"
+        );
+
+        // A fresh Create after reset must allocate from a clean, empty DriveState.
+        let recreated = only(
+            harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(open_request(
+                "\\a.txt", 3,
+            ))),
+        );
+        assert_eq!(status_of(&recreated), NtStatus::SUCCESS);
+        assert_eq!(
+            read_u32_at(&encoded(&recreated), 16),
+            1,
+            "file_id counter must restart at 1 in the fresh DriveState"
+        );
     }
 }
