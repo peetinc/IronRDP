@@ -2,10 +2,24 @@
     import { currentSession, setCurrentSessionActive, userInteractionService } from '../../services/session.service';
     import type { IronError, UserInteraction } from '../../../static/iron-remote-desktop';
     import type { Session } from '../../models/session';
-    import { displayControl, kdcProxyUrl, init } from '../../../static/iron-remote-desktop-rdp';
+    import type { PrintJobEntry } from '../../models/print-job';
+    import {
+        displayControl,
+        kdcProxyUrl,
+        init,
+        driveShare,
+        printerName,
+        printerDriverName,
+        printJobStreamCallbacks,
+    } from '../../../static/iron-remote-desktop-rdp';
     import { toast } from '$lib/messages/message-store';
     import { showLogin } from '$lib/login/login-store';
     import { onMount } from 'svelte';
+
+    // e2e test-rig hook: reports RDPDR printer job progress up to the
+    // session page, which owns the visible job list (Login unmounts on
+    // connect, so it cannot render it itself).
+    export let onPrintJobUpdate: (fileId: number, patch: Partial<PrintJobEntry>) => void = () => {};
 
     let username = 'Administrator';
     let password = '';
@@ -16,6 +30,34 @@
     let desktopSize = { width: 1280, height: 720 };
     let pop_up = false;
     let enable_clipboard = true;
+
+    // e2e test-rig hook: RDPDR folder share. Populated via
+    // window.showDirectoryPicker(); kept component-scoped (no module-level
+    // store) so it never leaks between sessions.
+    let folderHandle: FileSystemDirectoryHandle | null = null;
+    let folderName = '';
+    let folderReadOnly = false;
+
+    async function pickFolder() {
+        try {
+            // `showDirectoryPicker` is not in the default lib.dom typings used
+            // here; guarded by the `'showDirectoryPicker' in window` check below.
+            const handle = await (window as unknown as { showDirectoryPicker: (opts: { mode: string }) => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker({
+                mode: 'readwrite',
+            });
+            folderHandle = handle;
+            folderName = handle.name;
+        } catch (err) {
+            // User cancelled the picker or denied permission — nothing to report.
+            console.warn('Folder share picker dismissed:', err);
+        }
+    }
+
+    function clearFolder() {
+        folderHandle = null;
+        folderName = '';
+        folderReadOnly = false;
+    }
 
     let userInteraction: UserInteraction;
 
@@ -75,6 +117,50 @@
             configBuilder.withExtension(kdcProxyUrl(kdc_proxy_url));
         }
 
+        if (folderHandle != null) {
+            configBuilder.withExtension(
+                driveShare({ handle: folderHandle, shareName: folderName, readOnly: folderReadOnly }),
+            );
+        }
+
+        // e2e test-rig: always wire up the virtual printer so a print from
+        // inside the session can be captured and surfaced as a downloadable
+        // PDF. Note: driveShare and the printer extensions are mutually
+        // exclusive in the RDPDR backend today (drive share wins if both are
+        // configured) — see iron-remote-desktop-rdp/src/extensions.ts.
+        const printJobChunks = new Map<number, Uint8Array[]>();
+
+        configBuilder
+            .withExtension(printerName('LithiumBridge Printer'))
+            .withExtension(printerDriverName('Microsoft Print to PDF'))
+            .withExtension(
+                printJobStreamCallbacks({
+                    onJobStart: (fileId) => {
+                        printJobChunks.set(fileId, []);
+                        onPrintJobUpdate(fileId, { status: 'printing' });
+                    },
+                    onJobData: (fileId, chunk) => {
+                        const chunks = printJobChunks.get(fileId);
+                        if (chunks != null) {
+                            chunks.push(chunk);
+                        } else {
+                            printJobChunks.set(fileId, [chunk]);
+                        }
+                    },
+                    onJobComplete: (fileId) => {
+                        const chunks = printJobChunks.get(fileId) ?? [];
+                        printJobChunks.delete(fileId);
+                        const blob = new Blob(chunks, { type: 'application/pdf' });
+                        const url = URL.createObjectURL(blob);
+                        onPrintJobUpdate(fileId, { status: 'ready', url });
+                    },
+                    onJobError: (fileId) => {
+                        printJobChunks.delete(fileId);
+                        onPrintJobUpdate(fileId, { status: 'error', error: 'Print job failed' });
+                    },
+                }),
+            );
+
         const config = configBuilder.build();
 
         try {
@@ -123,7 +209,7 @@
     };
 
     onMount(async () => {
-        await init('INFO');
+        await init('DEBUG');
     });
 </script>
 
@@ -168,6 +254,29 @@
                             <input id="kdc_proxy_url" type="text" bind:value={kdc_proxy_url} />
                             <label for="kdc_proxy_url">KDC Proxy URL</label>
                         </div>
+                        {#if 'showDirectoryPicker' in window}
+                            <div class="folder-share-row">
+                                {#if folderName === ''}
+                                    <button type="button" on:click={pickFolder}>Share Folder</button>
+                                {:else}
+                                    <span class="folder-share-chip">
+                                        📁 {folderName}
+                                        <label class="folder-share-readonly">
+                                            <input type="checkbox" bind:checked={folderReadOnly} />
+                                            Read-only
+                                        </label>
+                                        <button
+                                            type="button"
+                                            class="folder-share-clear"
+                                            on:click={clearFolder}
+                                            aria-label="Clear folder share"
+                                        >
+                                            ×
+                                        </button>
+                                    </span>
+                                {/if}
+                            </div>
+                        {/if}
                         <div class="field label border checkbox-container">
                             <div class="checkbox-wrapper">
                                 <input

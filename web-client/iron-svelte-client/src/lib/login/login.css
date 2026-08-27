@@ -30,3 +30,32 @@
     align-items: center;
     font-size: 1.5em;
 }
+
+.folder-share-row {
+    margin-bottom: 1rem;
+}
+
+.folder-share-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.4rem 0.75rem;
+    border: 1px solid currentColor;
+    border-radius: 999px;
+}
+
+.folder-share-readonly {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-size: 0.9em;
+}
+
+.folder-share-clear {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 1.1em;
+    line-height: 1;
+    padding: 0 0.25rem;
+}
