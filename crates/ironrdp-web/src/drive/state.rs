@@ -115,6 +115,14 @@ impl DriveState {
         Some(item)
     }
 
+    /// Every `DriveFs` handle currently open across all entries. Directories never carry an
+    /// `fs_handle` (see [`OpenEntry::fs_handle`]'s doc comment) so they're skipped. Used by
+    /// `WasmDriveBackend::reset` to release every browser handle a torn-down RDPDR sequence
+    /// would otherwise leak.
+    pub(crate) fn open_fs_handles(&self) -> Vec<u32> {
+        self.entries.values().filter_map(|entry| entry.fs_handle).collect()
+    }
+
     fn allocate_file_id(&mut self) -> u32 {
         let id = self.next_file_id;
         self.next_file_id = self.next_file_id.wrapping_add(1);
@@ -203,6 +211,18 @@ mod tests {
     fn close_of_unknown_file_id_returns_none() {
         let mut state = DriveState::new();
         assert!(state.close(42).is_none());
+    }
+
+    #[test]
+    fn open_fs_handles_returns_only_file_handles_not_directories() {
+        let mut state = DriveState::new();
+        state.open("\\a.txt", Some(1), false);
+        state.open("\\dir", None, true);
+        state.open("\\b.txt", Some(2), false);
+
+        let mut handles = state.open_fs_handles();
+        handles.sort_unstable();
+        assert_eq!(handles, vec![1, 2]);
     }
 
     #[test]
