@@ -3574,6 +3574,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
+ "futures",
  "futures-channel",
  "futures-util",
  "getrandom 0.2.17",
