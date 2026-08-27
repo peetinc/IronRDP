@@ -8,12 +8,42 @@
     let uiService: UserInteraction;
     let cursorOverrideActive = false;
     let showDebugPanel = false;
+    let autoResize = true;
+    let screenEl: HTMLElement | null = null;
+    let resizeTimer: ReturnType<typeof setTimeout> | undefined;
 
     userInteractionService.subscribe((uis) => {
         if (uis != null) {
             uiService = uis;
         }
     });
+
+    // Ask the server (via the Display Control DVC) to match the desktop size
+    // to the space available for the canvas. Debounced: RDPEDISP resizes are
+    // expensive server-side, so wait for the drag to settle.
+    function scheduleResize() {
+        if (!autoResize) {
+            return;
+        }
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(() => {
+            if (uiService == null || screenEl == null) {
+                return;
+            }
+            const rect = screenEl.getBoundingClientRect();
+            const width = Math.floor(rect.width);
+            const height = Math.floor(rect.height);
+            if (width > 0 && height > 0) {
+                uiService.resize(width, height);
+            }
+        }, 200);
+    }
+
+    // Fire once when the session becomes visible so the desktop immediately
+    // matches the canvas instead of the size requested at connect time.
+    $: if (!$showLogin) {
+        scheduleResize();
+    }
 
     function onUnicodeModeChange(e: MouseEvent) {
         if (e.target == null) {
@@ -50,6 +80,9 @@
             const event = e as CustomEvent;
             userInteractionService.set(event.detail.irgUserInteraction);
         });
+
+        screenEl = el as HTMLElement;
+        new ResizeObserver(() => scheduleResize()).observe(screenEl);
     });
 </script>
 
@@ -76,6 +109,10 @@
             <label style="color: white;">
                 <input on:click={(e) => onUnicodeModeChange(e)} type="checkbox" />
                 Unicode keyboard mode
+            </label>
+            <label style="color: white;">
+                <input type="checkbox" bind:checked={autoResize} on:change={() => scheduleResize()} />
+                Auto resize
             </label>
         </div>
 
