@@ -4,6 +4,12 @@
     import { showLogin } from '$lib/login/login-store';
     import type { UserInteraction } from '../../../static/iron-remote-desktop';
     import { Backend } from '../../../static/iron-remote-desktop-rdp';
+    import type { PrintJobEntry } from '../../models/print-job';
+
+    // e2e test-rig hook: RDPDR print job list, owned by the session page
+    // (../../routes/session/+page.svelte) since it survives Login unmounting
+    // on connect. Read-only here — this component only renders it.
+    export let printJobs: PrintJobEntry[] = [];
 
     let uiService: UserInteraction;
     let cursorOverrideActive = false;
@@ -175,10 +181,63 @@
         {/if}
     </div>
     <iron-remote-desktop verbose="true" scale="fit" flexcenter="true" module={Backend} />
+
+    {#if printJobs.length > 0}
+        <div id="print-job-overlay">
+            <div class="print-job-overlay-title">Print jobs</div>
+            <ul>
+                {#each printJobs as job, i (job.id)}
+                    <li>
+                        {#if job.status === 'ready' && job.url}
+                            <a href={job.url} target="_blank" rel="noopener noreferrer" download="print-job-{job.id}.pdf">
+                                Print job {i + 1} ready — open PDF
+                            </a>
+                        {:else if job.status === 'error'}
+                            <span class="print-job-error">Print job {i + 1} failed{job.error ? `: ${job.error}` : ''}</span>
+                        {:else}
+                            <span>Print job {i + 1} printing…</span>
+                        {/if}
+                    </li>
+                {/each}
+            </ul>
+        </div>
+    {/if}
 </div>
 
 <style>
     .hideall {
         display: none !important;
+    }
+
+    #print-job-overlay {
+        position: fixed;
+        top: 10px;
+        right: 10px;
+        z-index: 1000;
+        background: rgba(0, 0, 0, 0.8);
+        color: white;
+        padding: 10px 14px;
+        border-radius: 6px;
+        font-size: 0.85em;
+        max-width: 280px;
+    }
+
+    .print-job-overlay-title {
+        font-weight: bold;
+        margin-bottom: 4px;
+    }
+
+    #print-job-overlay ul {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+    }
+
+    #print-job-overlay a {
+        color: #7ec8ff;
+    }
+
+    .print-job-error {
+        color: #ff8080;
     }
 </style>
