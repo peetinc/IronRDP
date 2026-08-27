@@ -21,11 +21,11 @@
     // connect, so it cannot render it itself).
     export let onPrintJobUpdate: (fileId: number, patch: Partial<PrintJobEntry>) => void = () => {};
 
-    let username = 'Administrator';
+    let username = 'artichoke';
     let password = '';
-    let gatewayAddress = 'ws://localhost:8765';
-    let hostname = 'localhost:3389';
-    let domain = '';
+    let gatewayAddress = 'ws://localhost:9091';
+    let hostname = '10.10.100.78';
+    let domain = 'peetinc';
     let kdc_proxy_url = '';
     let desktopSize = { width: 1280, height: 720 };
     let pop_up = false;
