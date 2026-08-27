@@ -96,6 +96,14 @@ export declare interface DownloadHandle {
     completion: Promise<Blob>;
 }
 
+export declare function driveShare(params: DriveShareParams): Extension;
+
+export declare interface DriveShareParams {
+    handle: FileSystemDirectoryHandle;
+    shareName: string;
+    readOnly?: boolean;
+}
+
 /**
  * A file extracted from a drag-and-drop event, with optional path metadata
  * from directory traversal via the File and Directory Entries API.
