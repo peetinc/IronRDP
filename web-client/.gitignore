@@ -11,6 +11,12 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+# LithiumBridge fork: ship built client artifacts so consumers can pin the
+# submodule without a Rust/wasm toolchain. Rebuild + recommit on client changes.
+!/iron-remote-desktop/dist/
+!/iron-remote-desktop/dist/**
+!/iron-remote-desktop-rdp/dist/
+!/iron-remote-desktop-rdp/dist/**
 *.local
 build
 
