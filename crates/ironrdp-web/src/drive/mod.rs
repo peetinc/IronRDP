@@ -11,8 +11,9 @@
 //!   path-normalization logic that turns a raw RDPDR path into share-root
 //!   relative components.
 //! * [`backend::WasmDriveBackend`] answers server drive IRPs by driving `DriveFs`
-//!   asynchronously, bookkeeping open handles via `DriveState`. Not yet wired into a live
-//!   session — `backend::wasm_drive_pair`'s caller (the session builder) is a later task.
+//!   asynchronously, bookkeeping open handles via `DriveState`. Wired into a live session by
+//!   `crate::session` — see [`backend::wasm_drive_pair`]'s doc comment and the `driveShare`
+//!   extension parsed in `crate::session::SessionBuilder::extension`.
 //!
 //! `fs` and `state` are pure Rust with no wasm dependency and are exercised natively
 //! (`cargo test -p ironrdp-web --lib drive::`); `backend` itself is also fully testable
@@ -22,7 +23,6 @@
 //! (`cargo check --target wasm32-unknown-unknown`) is its gate; it happens to also compile
 //! natively (wasm-bindgen's non-wasm32 stubs type-check even though they'd panic if invoked),
 //! which is why it isn't `#[cfg(target_arch = "wasm32")]`-gated.
-#![allow(dead_code)] // Groundwork: `wasm_drive_pair` and `WebFsDrive` not wired into a live session yet (later task).
 
 pub(crate) mod backend;
 pub(crate) mod fs;
