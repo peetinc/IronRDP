@@ -18,6 +18,19 @@
 //!   is how [`stat`](DriveFs::stat) and [`rename`](DriveFs::rename) distinguish "doesn't exist"
 //!   from "exists, but as the other kind of entry" without a separate directory probe on every
 //!   call.
+//! * **Concurrent writes to one handle must be serialized.** `WasmDriveBackend` spawns each
+//!   `DeviceWriteRequest` as an independent future with no per-handle ordering of its own —
+//!   MS-RDPEFS permits pipelined outstanding I/O, and a large-file copy into the share does
+//!   exactly that. A [`web_sys::FileSystemWritableFileStream`] has one shared seek cursor, and
+//!   `seek`/`write` are two separately enqueued stream operations: without serialization, two
+//!   concurrent writes could interleave as seek(A) / seek(B) / write(A) / write(B), landing A's
+//!   bytes at B's offset. [`WritableSlot::lock`] is held across *both* the `seek` and `write`
+//!   awaits as one critical section for exactly this reason; [`DriveFs::close`] takes the same
+//!   lock so it waits for any write already in flight on that handle before actually closing the
+//!   stream. Reads never touch the writable's cursor, so [`DriveFs::read`] stays unlocked, and a
+//!   fresh [`DriveFs::open_file`] call always gets its own handle and its own writable — nothing
+//!   here is shared across handles even when they name the same path — so a per-handle lock is
+//!   sufficient without a path-keyed one.
 //!
 //! Sizes and timestamps cross the `f64` boundary the File API represents them with (see
 //! [`file_size_to_u64`] and [`offset_to_f64`] for the precision caveat, which is theoretical, not
@@ -25,8 +38,10 @@
 
 use core::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use futures_util::future::LocalBoxFuture;
+use futures_util::lock::Mutex;
 use js_sys::{Array, IteratorNext, Reflect, Uint8Array};
 use tracing::warn;
 use wasm_bindgen::{JsCast as _, JsValue};
@@ -39,12 +54,21 @@ use web_sys::{
 use super::fs::{DriveFs, FsEntry, FsError};
 use super::state::normalize_path;
 
+/// A write-opened file's writable stream plus the async lock serializing operations against it —
+/// see this module's doc comment on why that serialization is required.
+struct WritableSlot {
+    stream: FileSystemWritableFileStream,
+    lock: Mutex<()>,
+}
+
 /// One outstanding [`WebFsDrive::open_file`] handle: the resolved file handle, plus — for a
-/// write-opened file — the writable stream held open across `write`/`close` calls (see this
+/// write-opened file — the [`WritableSlot`] held open across `write`/`close` calls (see this
 /// module's doc comment on why reads through `file_handle` won't observe unclosed writes).
+/// `Rc`-wrapped so `write`/`close` can clone it out of the `handles` map and drop the `RefCell`
+/// borrow before awaiting the lock and the FSAA calls it guards.
 struct OpenWebFile {
     file_handle: FileSystemFileHandle,
-    writable: Option<FileSystemWritableFileStream>,
+    writable: Option<Rc<WritableSlot>>,
     /// The normalized path this handle was opened against. Not read back today; kept for parity
     /// with `state::OpenEntry::path` and because a `tracing` breadcrumb on an FSAA error is far
     /// more useful with the path attached than a bare numeric handle.
@@ -204,7 +228,10 @@ impl DriveFs for WebFsDrive {
                         return Err(err);
                     }
                 }
-                Some(writable)
+                Some(Rc::new(WritableSlot {
+                    stream: writable,
+                    lock: Mutex::new(()),
+                }))
             } else {
                 None
             };
@@ -248,18 +275,23 @@ impl DriveFs for WebFsDrive {
 
     fn write(&self, handle: u32, offset: u64, data: Vec<u8>) -> LocalBoxFuture<'_, Result<u32, FsError>> {
         Box::pin(async move {
-            let writable = {
+            let slot = {
                 let handles = self.handles.borrow();
                 let entry = handles.get(&handle).ok_or(FsError::NotFound)?;
-                entry.writable.clone().ok_or(FsError::AccessDenied)?
+                entry.writable.as_ref().map(Rc::clone).ok_or(FsError::AccessDenied)?
             };
 
-            let seek_promise = writable
+            // Held across BOTH the seek and the write, as one critical section — see this
+            // module's doc comment on why `WasmDriveBackend`'s pipelined writes require this.
+            let _guard = slot.lock.lock().await;
+
+            let seek_promise = slot
+                .stream
                 .seek_with_f64(offset_to_f64(offset))
                 .map_err(fs_error_from_js)?;
             JsFuture::from(seek_promise).await.map_err(fs_error_from_js)?;
 
-            let write_promise = writable.write_with_u8_array(&data).map_err(fs_error_from_js)?;
+            let write_promise = slot.stream.write_with_u8_array(&data).map_err(fs_error_from_js)?;
             JsFuture::from(write_promise).await.map_err(fs_error_from_js)?;
 
             u32::try_from(data.len()).map_err(|_| FsError::Other("write too large".to_owned()))
@@ -269,10 +301,14 @@ impl DriveFs for WebFsDrive {
     fn close(&self, handle: u32) -> LocalBoxFuture<'_, Result<(), FsError>> {
         Box::pin(async move {
             let entry = self.handles.borrow_mut().remove(&handle).ok_or(FsError::NotFound)?;
-            if let Some(writable) = entry.writable {
+            if let Some(slot) = entry.writable {
+                // Wait for any write already in flight on this handle before closing — same lock
+                // `write` holds across its seek+write critical section (see this module's doc
+                // comment).
+                let _guard = slot.lock.lock().await;
                 // This is what commits a write-opened file's content — see this module's doc
                 // comment on `FileSystemWritableFileStream`'s swap-file semantics.
-                JsFuture::from(writable.close()).await.map_err(fs_error_from_js)?;
+                JsFuture::from(slot.stream.close()).await.map_err(fs_error_from_js)?;
             }
             Ok(())
         })
@@ -297,7 +333,10 @@ impl DriveFs for WebFsDrive {
 
                     // Copy to the destination first, delete the source only once that succeeds —
                     // a failure partway through then leaves the original intact rather than
-                    // losing data.
+                    // losing data. Note the asymmetry: if the copy succeeds but this final
+                    // `remove_entry` fails, the caller sees an error yet both the original and
+                    // the new copy now exist — preferred over the alternative (delete-then-copy,
+                    // which risks losing data on failure instead of merely duplicating it).
                     let to_parent = self.resolve_dir(to_parent_components).await?;
                     let get_options = FileSystemGetFileOptions::new();
                     get_options.set_create(true);
@@ -365,6 +404,11 @@ impl DriveFs for WebFsDrive {
             let (name, parent_components) = components.split_last().ok_or(FsError::AccessDenied)?;
             let parent = self.resolve_dir(parent_components).await?;
 
+            // Deliberately idempotent, unlike `MockFs::mkdir` (which errors on an existing
+            // directory): `getDirectoryHandleWithOptions({create: true})` succeeds whether or not
+            // `name` already exists as a directory. `WasmDriveBackend::open_or_create_directory`
+            // only ever calls this after a `stat` that already came back `NotFound`, so the
+            // divergence is unobservable through the one call site that reaches it today.
             let options = FileSystemGetDirectoryOptions::new();
             options.set_create(true);
             JsFuture::from(parent.get_directory_handle_with_options(name, &options))
