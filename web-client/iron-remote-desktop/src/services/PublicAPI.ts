@@ -44,6 +44,14 @@ export class PublicAPI {
         this.remoteDesktopService.sendSpecialCombination(SpecialCombination.CTRL_V);
     }
 
+    private sendKey(scancode: number, pressed: boolean) {
+        this.remoteDesktopService.sendKey(scancode, pressed);
+    }
+
+    private typeText(text: string) {
+        this.remoteDesktopService.typeText(text);
+    }
+
     private setVisibility(state: boolean) {
         loggingService.info(`Change component visibility to: ${state}`);
         this.remoteDesktopService.setVisibility(state);
@@ -125,6 +133,8 @@ export class PublicAPI {
             metaKey: this.metaKey.bind(this),
             ctrlC: this.ctrlC.bind(this),
             ctrlV: this.ctrlV.bind(this),
+            sendKey: this.sendKey.bind(this),
+            typeText: this.typeText.bind(this),
             shutdown: this.shutdown.bind(this),
             setKeyboardUnicodeMode: this.setKeyboardUnicodeMode.bind(this),
             setCursorStyleOverride: this.setCursorStyleOverride.bind(this),

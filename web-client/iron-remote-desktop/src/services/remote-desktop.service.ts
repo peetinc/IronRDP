@@ -256,6 +256,33 @@ export class RemoteDesktopService {
         }
     }
 
+    /**
+     * Raw scan code press/release. `scancode` is the PS/2 Set 1 form taken by
+     * `DeviceEvent.keyPressed` / `keyReleased` (see `UserInteraction.sendKey` for the
+     * exact bit layout). Caller manages press/release pairing.
+     */
+    sendKey(scancode: number, pressed: boolean): void {
+        const event = pressed
+            ? this.module.DeviceEvent.keyPressed(scancode)
+            : this.module.DeviceEvent.keyReleased(scancode);
+        this.doTransactionFromDeviceEvents([event]);
+    }
+
+    /**
+     * Type `text` as Unicode key press/release pairs, one pair per Unicode code point.
+     * Iterates by code point (`for...of` over a string), not UTF-16 code unit, so
+     * surrogate-pair characters are sent whole. See `UserInteraction.typeText` for why
+     * this path is used instead of scan codes.
+     */
+    typeText(text: string): void {
+        for (const ch of text) {
+            this.doTransactionFromDeviceEvents([
+                this.module.DeviceEvent.unicodePressed(ch),
+                this.module.DeviceEvent.unicodeReleased(ch),
+            ]);
+        }
+    }
+
     rotation_unit_from_wheel_event(event: WheelEvent): RotationUnit {
         switch (event.deltaMode) {
             case event.DOM_DELTA_PIXEL:
