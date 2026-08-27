@@ -8,7 +8,8 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
-dist
+# dist committed in this fork: LithiumBridge consumes built artifacts via submodule
+# dist
 dist-ssr
 *.local
 
