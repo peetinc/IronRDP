@@ -44,6 +44,7 @@ use crate::canvas::Canvas;
 use crate::clipboard;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
 use crate::drive::backend::{DriveBackendMessage, WasmDriveBackend, wasm_drive_pair};
+use crate::drive::composite::{WasmCompositeBackend, resolve_drive_device_id};
 use crate::drive::fs::DriveFs;
 use crate::drive::web_fs::WebFsDrive;
 use crate::error::IronError;
@@ -55,10 +56,13 @@ use crate::printer::{JsPrinterStreamCallbacks, WasmPrinter, WasmPrinterBackend, 
 const DEFAULT_WIDTH: u16 = 1280;
 const DEFAULT_HEIGHT: u16 = 720;
 
-/// Device id used to announce the redirected drive share on the Rdpdr channel.
+/// Default device id used to announce the redirected drive share on the Rdpdr channel.
 /// The printer branch's own `printer_device_id` falls back to `2` specifically
 /// to leave `1` free for drive redirection (see that fallback in
 /// `SessionBuilder::connect`) — this constant is the other half of that plan.
+/// `printerDeviceId()` is caller-settable, though, so a session that explicitly configures
+/// `printer_device_id == DRIVE_DEVICE_ID` is still possible; `connect` resolves that collision
+/// via [`resolve_drive_device_id`] before announcing either device.
 const DRIVE_DEVICE_ID: u32 = 1;
 
 #[derive(Clone, Default)]
@@ -1690,9 +1694,9 @@ struct ConnectParams {
     printer_name: String,
     printer_driver_name: String,
     /// `Some((backend, share_name))` when a `driveShare` extension configured
-    /// a redirected drive for this session. Mutually exclusive with
-    /// `printer_backend`: drive wins if both are set (a composite RDPDR
-    /// backend supporting both at once is a later task). See
+    /// a redirected drive for this session. Coexists with `printer_backend` —
+    /// both are announced on the same RDPDR channel via
+    /// [`WasmCompositeBackend`] when both are configured. See
     /// [`RdpInputEvent::DriveBackend`] for how this backend's completions
     /// reach the event loop.
     drive: Option<(WasmDriveBackend, String)>,
@@ -1762,41 +1766,43 @@ async fn connect(
         connector.attach_static_channel(CliprdrClient::new(Box::new(clipboard_backend)));
     }
 
-    // Drive and printer redirection are mutually exclusive this task — both live on
-    // the same RDPDR channel and `Rdpdr` takes a single backend. A composite backend
-    // dispatching to whichever of the two a given IRP's device id belongs to is a
-    // later task; until then, drive wins if both were configured.
-    match drive {
-        Some((drive_backend, share_name)) => {
-            if printer_backend.is_some() {
-                warn!(
-                    "Both a drive share and printer redirection were configured for this session; \
-                     drive share takes precedence (composite RDPDR backend not yet supported)"
-                );
+    // Drive and printer redirection coexist on the one RDPDR channel `Rdpdr` accepts a single
+    // backend for, via `WasmCompositeBackend` — see `drive::composite`'s module doc comment for
+    // how it routes each IRP-handling method to whichever member is configured. Both device
+    // classes are announced together in one `Rdpdr` when both are configured.
+    if printer_backend.is_some() || drive.is_some() {
+        // Windows servers only speak on RDPDR when RDPSND is advertised too
+        // (MS-RDPEFS Appendix A<1>). We do not play audio in the web client,
+        // but the no-op RDPSND processor satisfies that channel dependency.
+        connector.attach_static_channel(Rdpsnd::new(Box::new(NoopRdpsndBackend)));
+
+        // `DRIVE_DEVICE_ID` is a fixed constant but `printer_device_id` is caller-settable via
+        // the `printerDeviceId()` extension — resolve a collision deterministically before
+        // either device is announced (see `resolve_drive_device_id`'s doc comment). Mandatory
+        // per review: `Rdpdr` has no deduplication of its own, so two devices sharing an id would
+        // otherwise both get announced under the same identifier.
+        let (drive_backend, drive_share_name, drive_device_id) = match drive {
+            Some((backend, share_name)) => {
+                let device_id = resolve_drive_device_id(DRIVE_DEVICE_ID, printer_device_id);
+                (Some(backend), Some(share_name), Some(device_id))
             }
-            // Windows servers only speak on RDPDR when RDPSND is advertised too
-            // (MS-RDPEFS Appendix A<1>). We do not play audio in the web client,
-            // but the no-op RDPSND processor satisfies that channel dependency.
-            connector.attach_static_channel(Rdpsnd::new(Box::new(NoopRdpsndBackend)));
-            connector.attach_static_channel(
-                Rdpdr::new(Box::new(drive_backend), computer_name).with_drives(Some(vec![(DRIVE_DEVICE_ID, share_name)])),
-            );
+            None => (None, None, None),
+        };
+
+        let printer_configured = printer_backend.is_some();
+        let printer_member = printer_backend.map(|backend| (backend, printer_device_id));
+        let drive_member = drive_backend.zip(drive_device_id);
+
+        let composite = WasmCompositeBackend::new(printer_member, drive_member);
+
+        let mut rdpdr = Rdpdr::new(Box::new(composite), computer_name);
+        if printer_configured {
+            rdpdr = rdpdr.with_printer_driver(printer_device_id, printer_name, printer_driver_name);
         }
-        None => {
-            if let Some(printer_backend) = printer_backend {
-                // Windows servers only speak on RDPDR when RDPSND is advertised too
-                // (MS-RDPEFS Appendix A<1>). We do not play audio in the web client,
-                // but the no-op RDPSND processor satisfies that channel dependency.
-                connector.attach_static_channel(Rdpsnd::new(Box::new(NoopRdpsndBackend)));
-                connector.attach_static_channel(
-                    Rdpdr::new(Box::new(printer_backend), computer_name).with_printer_driver(
-                        printer_device_id,
-                        printer_name,
-                        printer_driver_name,
-                    ),
-                );
-            }
+        if let (Some(share_name), Some(device_id)) = (drive_share_name, drive_device_id) {
+            rdpdr = rdpdr.with_drives(Some(vec![(device_id, share_name)]));
         }
+        connector.attach_static_channel(rdpdr);
     }
 
     if use_display_control {

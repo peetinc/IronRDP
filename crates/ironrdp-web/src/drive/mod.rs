@@ -14,9 +14,12 @@
 //!   asynchronously, bookkeeping open handles via `DriveState`. Wired into a live session by
 //!   `crate::session` — see [`backend::wasm_drive_pair`]'s doc comment and the `driveShare`
 //!   extension parsed in `crate::session::SessionBuilder::extension`.
+//! * [`composite::WasmCompositeBackend`] lets [`backend::WasmDriveBackend`] and
+//!   [`crate::printer::WasmPrinterBackend`] coexist on the single backend slot `Rdpdr` accepts —
+//!   wired in at `crate::session`'s attach site whenever either is configured for a session.
 //!
-//! `fs` and `state` are pure Rust with no wasm dependency and are exercised natively
-//! (`cargo test -p ironrdp-web --lib drive::`); `backend` itself is also fully testable
+//! `fs`, `state`, and `composite` are pure Rust with no wasm dependency and are exercised
+//! natively (`cargo test -p ironrdp-web --lib drive::`); `backend` itself is also fully testable
 //! natively via its injected-spawner constructor, even though its public `wasm_drive_pair`
 //! factory calls into `wasm_bindgen_futures`. `web_fs` calls real browser APIs it has no
 //! way to exercise outside one, so it has no unit tests of its own — compiling clean
@@ -25,6 +28,7 @@
 //! which is why it isn't `#[cfg(target_arch = "wasm32")]`-gated.
 
 pub(crate) mod backend;
+pub(crate) mod composite;
 pub(crate) mod fs;
 pub(crate) mod state;
 pub(crate) mod web_fs;
