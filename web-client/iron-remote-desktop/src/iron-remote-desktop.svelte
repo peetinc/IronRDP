@@ -56,6 +56,17 @@
     let clipboardService = new ClipboardService(remoteDesktopService, module);
     let publicAPI = new PublicAPI(remoteDesktopService, clipboardService);
 
+    // Instance-scoped teardown flag. `dispatchReady` now runs after an await
+    // (clipboardService.initClipboard()), so a consumer that unmounts this
+    // component during that await (e.g. closing a tab) must not still get a
+    // `ready` event bubbling out of a detached `inner` afterward — that would
+    // let a stale `ready` handler call connect() with no owning UI left.
+    // Deliberately local, NOT the module-scope `isComponentDestroyed` store
+    // (see import below) — that store is shared across every
+    // <iron-remote-desktop> instance on the page and using it here would
+    // reintroduce the exact cross-instance suppression bug d68dfa16 fixed.
+    let destroyed = false;
+
     let currentScreenScale = ScreenScale.Fit;
 
     function captureKeys(evt: KeyboardEvent) {
@@ -310,6 +321,15 @@
     // Tells the host the component can connect. Only after the clipboard is set up too: connect() only opens the
     // clipboard channel when the clipboard callbacks are registered by then.
     function dispatchReady() {
+        if (destroyed) {
+            // Component was torn down while we were awaiting clipboard init.
+            // `inner` may still be a live object (nothing nulls it out on
+            // destroy), so dispatching would still bubble the event to
+            // whatever listener the now-gone consumer left attached. Don't.
+            loggingService.info('Skipping ready dispatch: component was destroyed during clipboard init');
+            return;
+        }
+
         let result = { irgUserInteraction: publicAPI.getExposedFunctions() };
 
         loggingService.info('Component ready');
@@ -344,6 +364,7 @@
     }
 
     onMount(async () => {
+        destroyed = false;
         isComponentDestroyed.set(false);
         loggingService.verbose = verbose === 'true';
         loggingService.info('Dom ready');
@@ -364,6 +385,7 @@
         window.removeEventListener('blur', blurEventHandler);
         document.removeEventListener('visibilitychange', visibilityChangeHandler);
         isComponentDestroyed.set(true);
+        destroyed = true;
     });
 </script>
 
