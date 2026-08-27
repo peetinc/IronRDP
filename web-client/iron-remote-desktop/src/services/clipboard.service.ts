@@ -1,6 +1,4 @@
 import type { RemoteDesktopService } from './remote-desktop.service';
-import { isComponentDestroyed } from '../lib/stores/componentLifecycleStore';
-import { get } from 'svelte/store';
 import type { ClipboardData } from '../interfaces/ClipboardData';
 import type { RemoteDesktopModule } from '../interfaces/RemoteDesktopModule';
 import { runWhenFocusedQueue } from '../lib/stores/runWhenFocusedStore';
@@ -32,10 +30,21 @@ export class ClipboardService {
     // Used to prevent the monitoring loop from clobbering an active file upload's
     // FormatList with a text/image clipboard update.
     private monitoringSuppressed: boolean = false;
+    // Per-instance teardown flag. This was a module-scope Svelte store, which
+    // every <iron-remote-desktop> element on the page shared: one element
+    // unmounting stopped the clipboard monitor loop of every OTHER live
+    // element, silently killing their clipboard sync mid-session.
+    private destroyed: boolean = false;
 
     constructor(remoteDesktopService: RemoteDesktopService, module: RemoteDesktopModule) {
         this.remoteDesktopService = remoteDesktopService;
         this.module = module;
+    }
+
+    /** Stop this instance's clipboard monitoring loop. Call from the owning
+     *  component's teardown; affects only this instance. */
+    markDestroyed() {
+        this.destroyed = true;
     }
 
     /**
@@ -405,7 +414,7 @@ export class ClipboardService {
                 this.lastClipboardMonitorLoopError = err;
             }
         } finally {
-            if (!stopped && !get(isComponentDestroyed)) {
+            if (!stopped && !this.destroyed) {
                 this.scheduleOnMonitorClipboardUpdate();
             }
         }
