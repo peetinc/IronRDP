@@ -48,6 +48,28 @@ use tracing::{debug, info, trace, warn};
 use super::fs::{DriveFs, FsEntry, FsError};
 use super::state::{DriveState, normalize_path};
 
+/// Current size of the wasm linear memory, in bytes.
+///
+/// Diagnostic only: the browser tab has been observed dying outright (renderer crash, not a JS
+/// exception) shortly after drive activity, including after a single 33-byte read. A renderer
+/// death like that is an allocation failure rather than a protocol error, so the read path logs
+/// this to show whether the heap is growing without bound.
+#[cfg(target_arch = "wasm32")]
+fn wasm_heap_bytes() -> u32 {
+    use wasm_bindgen::JsCast as _;
+
+    wasm_bindgen::memory()
+        .dyn_into::<js_sys::WebAssembly::Memory>()
+        .ok()
+        .and_then(|memory| memory.buffer().dyn_into::<js_sys::ArrayBuffer>().ok())
+        .map_or(0, |buffer| buffer.byte_length())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn wasm_heap_bytes() -> u32 {
+    0
+}
+
 /// Maximum bytes this backend will honor from a single `DeviceReadRequest`, regardless of what
 /// the server actually asked for (`dispatch_read` clamps with `.min(MAX_DRIVE_READ_BYTES)`).
 ///
@@ -496,8 +518,9 @@ impl WasmDriveBackend {
             // for every IRP floods the browser console badly enough to kill the
             // tab. Reads alone are low-volume.
             info!(
-                "[rdpdr-drive] dispatch_read offset={offset} requested_len={requested_len} clamped_len={clamped_len} returned_len={} status={status:?}",
-                read_data.len()
+                "[rdpdr-drive] dispatch_read offset={offset} requested_len={requested_len} clamped_len={clamped_len} returned_len={} status={status:?} heap={}",
+                read_data.len(),
+                wasm_heap_bytes()
             );
             log_outgoing(
                 "DeviceReadResponse",
