@@ -1,7 +1,7 @@
 <script lang="ts">
     import { onMount } from 'svelte';
     import { userInteractionService } from '../../services/session.service';
-    import { showLogin } from '$lib/login/login-store';
+    import { autoResizeEnabled, showLogin } from '$lib/login/login-store';
     import type { UserInteraction } from '../../../static/iron-remote-desktop';
     import { Backend } from '../../../static/iron-remote-desktop-rdp';
     import type { PrintJobEntry } from '../../models/print-job';
@@ -14,7 +14,9 @@
     let uiService: UserInteraction;
     let cursorOverrideActive = false;
     let showDebugPanel = false;
-    let autoResize = true;
+    // Auto-resize state lives in `autoResizeEnabled` (login-store) rather than
+    // here, so it can be set on the login form before connecting. The toolbar
+    // checkbox below binds the same store, so both stay in sync.
     let screenEl: HTMLElement | null = null;
     let resizeTimer: ReturnType<typeof setTimeout> | undefined;
     let verifyTimer: ReturnType<typeof setTimeout> | undefined;
@@ -36,7 +38,7 @@
     // pixel size after each dynamic resize, so the element itself stops
     // tracking window resizes.
     function scheduleResize() {
-        if (!autoResize) {
+        if (!$autoResizeEnabled) {
             return;
         }
         clearTimeout(resizeTimer);
@@ -161,7 +163,7 @@
                 Unicode keyboard mode
             </label>
             <label style="color: white;">
-                <input type="checkbox" bind:checked={autoResize} on:change={() => scheduleResize()} />
+                <input type="checkbox" bind:checked={$autoResizeEnabled} on:change={() => scheduleResize()} />
                 Auto resize
             </label>
         </div>
