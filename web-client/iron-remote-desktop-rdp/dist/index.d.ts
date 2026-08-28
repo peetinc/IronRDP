@@ -136,6 +136,18 @@ export declare interface DroppedFile {
     isDirectory?: boolean;
 }
 
+/**
+ * Toggle the EGFX graphics pipeline (progressive RemoteFX / ClearCodec).
+ *
+ * Enabled by default — EGFX is negotiated, so a host that does not offer it
+ * never opens the channel and the legacy bitmap path is used untouched. Pass
+ * `false` as a kill-switch if rendering regresses.
+ *
+ * No H.264 is involved: the pipeline is built without a decoder, so every AVC
+ * capability set is filtered out at advertisement time.
+ */
+export declare function egfx(enable: boolean): Extension;
+
 export declare function enableCredssp(enable: boolean): Extension;
 
 declare type EventHandler<T extends unknown[]> = (...args: T) => void;
