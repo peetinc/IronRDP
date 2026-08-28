@@ -32,6 +32,7 @@ use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_core::WriteBuf;
+use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp_futures::{FramedWrite as _, single_sequence_step, single_sequence_step_read};
 use rgb::AsPixels as _;
 use tap::prelude::*;
@@ -119,6 +120,11 @@ struct SessionBuilderInner {
     drive_share: Option<DriveShareConfig>,
 
     use_display_control: bool,
+    /// Whether to attach the EGFX graphics pipeline. Defaults to `true`: EGFX is
+    /// negotiated, so a host that does not support it simply never opens the
+    /// channel and the legacy bitmap path continues untouched. The `egfx`
+    /// extension can set this to `false` as a kill-switch.
+    use_egfx: bool,
     enable_credssp: bool,
     enable_standard_rdp_security: bool,
     enable_server_pointer: bool,
@@ -167,6 +173,7 @@ impl Default for SessionBuilderInner {
             drive_share: None,
 
             use_display_control: false,
+            use_egfx: true,
             enable_credssp: true,
             enable_standard_rdp_security: false,
             enable_server_pointer: true,
@@ -592,6 +599,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         }
 
         let use_display_control = self.0.borrow().use_display_control;
+        let use_egfx = self.0.borrow().use_egfx;
 
         let (connection_result, stream, rdp_leftover) = connect(ConnectParams {
             ws,
@@ -608,6 +616,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             drive_slot: Rc::clone(&drive_slot),
             computer_name: client_name.clone(),
             use_display_control,
+            use_egfx,
         })
         .await?;
 
@@ -1856,6 +1865,10 @@ struct ConnectParams {
     /// `computer_name` when constructing the `Rdpdr` processor.
     computer_name: String,
     use_display_control: bool,
+    /// Attach the EGFX graphics pipeline. Both this and `use_display_control`
+    /// ride the same DRDYNVC static channel, so either one alone is enough to
+    /// warrant attaching it.
+    use_egfx: bool,
 }
 
 fn default_printer_driver_name() -> String {
@@ -1906,6 +1919,7 @@ async fn connect(
         drive_slot,
         computer_name,
         use_display_control,
+        use_egfx,
     }: ConnectParams,
 ) -> Result<(connector::ConnectionResult, RdpStream, bytes::BytesMut), IronError> {
     let framed = ironrdp_futures::LocalFuturesFramed::new(ws);
@@ -1985,10 +1999,31 @@ async fn connect(
         connector.attach_static_channel(rdpdr);
     }
 
-    if use_display_control {
-        connector.attach_static_channel(
-            DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new()))),
-        );
+    // DisplayControl and the graphics pipeline are both dynamic channels riding
+    // the one DRDYNVC static channel, so it is attached when either is wanted —
+    // EGFX must not be nested under the DisplayControl gate.
+    if use_display_control || use_egfx {
+        let mut drdynvc = DrdynvcClient::new();
+
+        if use_display_control {
+            drdynvc = drdynvc.with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
+        }
+
+        if use_egfx {
+            // The client-side compositor (ironrdp-egfx) holds the surface pixel
+            // state and the session drains it into the framebuffer, so the
+            // pipeline's per-command notification callbacks are unused — the same
+            // empty handler the native client uses (`ironrdp-client`'s
+            // `EgfxHandler`). Passing no H.264 decoder makes `start()` drop every
+            // AVC capability set, leaving only codecs decodable in wasm.
+            struct WebEgfxHandler;
+            impl GraphicsPipelineHandler for WebEgfxHandler {}
+
+            debug!("Attaching EGFX graphics pipeline (no H.264 decoder)");
+            drdynvc = drdynvc.with_dynamic_channel(GraphicsPipelineClient::new(Box::new(WebEgfxHandler), None));
+        }
+
+        connector.attach_static_channel(drdynvc);
     }
 
     let mut network_client = WasmNetworkClient;
