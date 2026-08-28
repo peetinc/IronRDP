@@ -33,6 +33,7 @@ use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_core::WriteBuf;
 use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
+use ironrdp_egfx::pdu::CapabilitySet;
 use ironrdp_futures::{FramedWrite as _, single_sequence_step, single_sequence_step_read};
 use rgb::AsPixels as _;
 use tap::prelude::*;
@@ -1837,16 +1838,45 @@ async fn connect(
 
         if use_egfx {
             // The client-side compositor (ironrdp-egfx) holds the surface pixel
-            // state and the session drains it into the framebuffer, so the
-            // pipeline's per-command notification callbacks are unused — the same
-            // empty handler the native client uses (`ironrdp-client`'s
-            // `EgfxHandler`). Passing no H.264 decoder makes `start()` drop every
-            // AVC capability set, leaving only codecs decodable in wasm.
-            struct WebEgfxHandler;
-            impl GraphicsPipelineHandler for WebEgfxHandler {}
+            // state and the shared `ActiveStage::process` drains it into the
+            // framebuffer, so the pipeline's notification callbacks carry no
+            // rendering duty — the native client's `EgfxHandler` implements none
+            // of them. The three overridden here are pure breadcrumbs: whether a
+            // session actually renders via EGFX or silently fell back to legacy
+            // bitmaps is otherwise invisible from the outside.
+            //
+            // Passing no H.264 decoder makes `start()` drop every AVC capability
+            // set, leaving only codecs decodable in wasm.
+            #[derive(Default)]
+            struct WebEgfxHandler {
+                logged_first_frame: bool,
+            }
+
+            impl GraphicsPipelineHandler for WebEgfxHandler {
+                fn on_capabilities_confirmed(&mut self, caps: &CapabilitySet) {
+                    // The definitive "EGFX is live" signal, and it names the
+                    // version the server settled on.
+                    info!(?caps, "EGFX capabilities confirmed — rendering via graphics pipeline");
+                }
+
+                fn on_reset_graphics(&mut self, width: u32, height: u32) {
+                    // Proves a resize took the ResetGraphics path rather than a
+                    // deactivate-reactivate round trip.
+                    info!(width, height, "EGFX ResetGraphics");
+                }
+
+                fn on_frame_complete(&mut self, frame_id: u32) {
+                    // First frame only: this fires for every frame in the session.
+                    if !self.logged_first_frame {
+                        self.logged_first_frame = true;
+                        info!(frame_id, "EGFX first frame complete — pixels flowing");
+                    }
+                }
+            }
 
             debug!("Attaching EGFX graphics pipeline (no H.264 decoder)");
-            drdynvc = drdynvc.with_dynamic_channel(GraphicsPipelineClient::new(Box::new(WebEgfxHandler), None));
+            drdynvc = drdynvc
+                .with_dynamic_channel(GraphicsPipelineClient::new(Box::new(WebEgfxHandler::default()), None));
         }
 
         connector.attach_static_channel(drdynvc);
