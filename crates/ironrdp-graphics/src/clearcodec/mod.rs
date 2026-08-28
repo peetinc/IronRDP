@@ -197,8 +197,10 @@ impl ClearCodecDecoder {
                     let full_vbar =
                         self.resolve_vbar(vbar, band_height, band.blue_bkg, band.green_bkg, band.red_bkg)?;
 
-                    // Blit the full V-bar column into the output
-                    let pixel_rows = full_vbar.pixels.len() / 3;
+                    // Blit the full V-bar column into the output, clamped to the band:
+                    // a cached V-bar from a taller band must not paint past this
+                    // band's bottom edge (FreeRDP resizes the entry to vBarHeight).
+                    let pixel_rows = (full_vbar.pixels.len() / 3).min(usize::from(band_height));
                     for row in 0..pixel_rows {
                         let y = usize::from(band.y_start) + row;
                         let dst_offset = (y * w + x) * 4;
@@ -235,24 +237,35 @@ impl ClearCodecDecoder {
     ) -> DecodeResult<FullVBar> {
         match vbar {
             VBar::CacheHit { index } => {
-                let cached = self
-                    .vbar_cache
-                    .get_vbar(*index)
-                    .ok_or_else(|| invalid_field_err!("vbarIndex", "V-bar cache miss on hit"))?;
-                Ok(cached.clone())
+                // A hit on an empty slot is real-world behavior after a cache
+                // reset, not a protocol violation: FreeRDP warns and fills the
+                // entry with dummy data (`clear.c`: "Empty cache index, filling
+                // dummy data"). Failing the whole message here left permanent
+                // holes wherever the band would have painted.
+                match self.vbar_cache.get_vbar(*index) {
+                    Some(cached) => Ok(cached.clone()),
+                    None => {
+                        // (This crate carries no logging dependency; the substitution
+                        // itself is the observable effect.)
+                        let mut pixels = Vec::with_capacity(usize::from(band_height) * 3);
+                        for _ in 0..band_height {
+                            pixels.push(bg_blue);
+                            pixels.push(bg_green);
+                            pixels.push(bg_red);
+                        }
+                        Ok(FullVBar { pixels })
+                    }
+                }
             }
             VBar::ShortCacheHit { index, y_on } => {
                 let cached_short = self
                     .vbar_cache
                     .get_short_vbar(*index)
                     .ok_or_else(|| invalid_field_err!("shortVbarIndex", "short V-bar cache miss on hit"))?;
-                if usize::from(*y_on) + usize::from(cached_short.pixel_count) > usize::from(band_height) {
-                    return Err(invalid_field_err!(
-                        "shortVBarYOn",
-                        "y_on + pixel_count exceeds band height"
-                    ));
-                }
-                // Create a modified short vbar with the y_on from this reference
+                // `y_on + pixel_count` may exceed this band's height when the short
+                // V-bar was cached from a taller band; `reconstruct_full_vbar`
+                // clamps, matching FreeRDP. This was an error here once, and it
+                // rejected 72 valid messages in one captured Windows session.
                 let modified = ShortVBar {
                     y_on: *y_on,
                     pixel_count: cached_short.pixel_count,

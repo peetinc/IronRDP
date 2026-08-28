@@ -111,18 +111,26 @@ impl VBarCache {
         let height = usize::from(band_height);
         let mut pixels = Vec::with_capacity(height * 3);
 
-        // Background above y_on
-        for _ in 0..usize::from(short_vbar.y_on) {
+        // Background above y_on, clamped to the band: a short V-bar cached from a
+        // taller band is legitimately replayed into a shorter one, so `y_on` (and
+        // `y_on + pixel_count` below) may exceed this band's height. FreeRDP clamps
+        // the copy and background-fills the remainder (`clear.c`, the
+        // `(y + count) > vBarPixelCount` adjustments); erroring here instead broke
+        // whole ClearCodec messages on real Windows output — 72 of them in one
+        // captured session.
+        for _ in 0..usize::from(short_vbar.y_on).min(height) {
             pixels.push(bg_blue);
             pixels.push(bg_green);
             pixels.push(bg_red);
         }
 
-        // Pixel data from short V-bar
-        pixels.extend_from_slice(&short_vbar.pixels);
+        // Pixel data from the short V-bar, truncated to what still fits.
+        let remaining_rows = height - pixels.len() / 3;
+        let copy_bytes = short_vbar.pixels.len().min(remaining_rows * 3);
+        pixels.extend_from_slice(&short_vbar.pixels[..copy_bytes]);
 
         // Background below y_on + pixel_count
-        let bottom_start = usize::from(short_vbar.y_on) + usize::from(short_vbar.pixel_count);
+        let bottom_start = pixels.len() / 3;
         for _ in bottom_start..height {
             pixels.push(bg_blue);
             pixels.push(bg_green);
