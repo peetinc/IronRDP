@@ -52,18 +52,29 @@ pub struct SrlDecoder<'a> {
 }
 
 impl<'a> SrlDecoder<'a> {
-    /// Create a decoder for an SRL stream, excluding its required trailing zero byte.
+    /// Create a decoder over an SRL stream.
+    ///
+    /// The whole buffer is the stream. MS-RDPEGFX bounds it with the tile
+    /// header's `srlLen` and defines no terminator, so nothing is stripped here
+    /// and no trailing byte is required.
+    ///
+    /// This previously took the final byte to be a mandatory `0x00` terminator
+    /// and rejected any stream without one. That framing is IronRDP's own
+    /// invention — [`SrlEncoder::finish`] appends the byte, so encoder and
+    /// decoder agreed with each other and with nobody else. Windows sends no
+    /// such terminator, so every TILE_UPGRADE from a real host failed with
+    /// `MissingTerminator`, which tore down the EGFX channel one frame into the
+    /// session. The round-trip tests could not catch it: they only ever fed this
+    /// decoder output from that same encoder.
+    ///
+    /// FreeRDP attaches the entire buffer the same way
+    /// (`BitStream_Attach(state.srl, srlData, srlLen)`) and merely *tolerates* a
+    /// trailing byte once decoding is done, skipping it if exactly 8 bits remain
+    /// (`progressive_rfx_upgrade_state_finish`). Decoding stops after the
+    /// requested value count, so any such tail is simply never read.
     pub fn new(data: &'a [u8]) -> Result<Self, SrlError> {
-        let Some((&terminator, payload)) = data.split_last() else {
-            return Err(SrlError::MissingTerminator);
-        };
-
-        if terminator != 0 {
-            return Err(SrlError::MissingTerminator);
-        }
-
         Ok(Self {
-            reader: BitReader::new(payload),
+            reader: BitReader::new(data),
             kp: INITIAL_KP,
             zero_run_remaining: 0,
             nonzero_pending: false,
@@ -74,6 +85,19 @@ impl<'a> SrlDecoder<'a> {
     ///
     /// The adaptive state and a partially consumed zero run are retained for the
     /// next call, as required when SRL entries span bands.
+    ///
+    /// Zero-run semantics follow FreeRDP's `progressive_rfx_srl_read`, which is
+    /// what Microsoft's encoder actually produces: each `'0'` bit is a
+    /// SELF-CONTAINED chunk of `1 << k` zeros, and only a `'1'` bit (with its
+    /// k-bit tail count) announces that a nonzero value follows. A band tail
+    /// that is all zeros is therefore just `'0'` bits — no closing `'1'` ever
+    /// arrives. The previous implementation looped until it saw the `'1'`
+    /// terminator, treating the run as one aggregated count, so a pure-zeros
+    /// stream consumed every bit and failed with [`SrlError::Truncated`] on
+    /// the first Windows TILE_UPGRADE (captured fixture: 3 800 zero-DAS values
+    /// in a 4-byte SRL stream, which is a perfectly normal encoding). Our own
+    /// encoder always closes runs, which is why round-trip tests never caught
+    /// it.
     pub fn decode(&mut self, num_values: usize, num_bits: u8) -> Result<Vec<i16>, SrlError> {
         let mut output = Vec::with_capacity(num_values);
 
@@ -90,35 +114,21 @@ impl<'a> SrlDecoder<'a> {
                 continue;
             }
 
-            self.zero_run_remaining = self.decode_zero_run()?;
-            self.nonzero_pending = true;
+            let k = self.kp / 8;
+            if self.reader.read_bit()? {
+                // '1': a nonzero follows after `tail` more zeros.
+                let tail = usize::try_from(self.reader.read_bits(k)?).map_err(|_| SrlError::ZeroRunTooLong)?;
+                self.kp = self.kp.saturating_sub(6);
+                self.zero_run_remaining = tail;
+                self.nonzero_pending = true;
+            } else {
+                // '0': a chunk of `1 << k` zeros, complete in itself.
+                self.zero_run_remaining = 1usize << k;
+                self.kp = self.kp.saturating_add(4).min(MAX_KP);
+            }
         }
 
         Ok(output)
-    }
-
-    fn decode_zero_run(&mut self) -> Result<usize, SrlError> {
-        let mut zeros = 0usize;
-
-        loop {
-            let k = self.kp / 8;
-
-            if self.reader.read_bit()? {
-                let tail = usize::try_from(self.reader.read_bits(k)?).map_err(|_| SrlError::ZeroRunTooLong)?;
-                self.kp = self.kp.saturating_sub(6);
-
-                let zeros = zeros.checked_add(tail).ok_or(SrlError::ZeroRunTooLong)?;
-                return (zeros <= MAX_ZERO_RUN).then_some(zeros).ok_or(SrlError::ZeroRunTooLong);
-            }
-
-            let chunk = 1usize << k;
-            zeros = zeros.checked_add(chunk).ok_or(SrlError::ZeroRunTooLong)?;
-            if zeros > MAX_ZERO_RUN {
-                return Err(SrlError::ZeroRunTooLong);
-            }
-
-            self.kp = self.kp.saturating_add(4).min(MAX_KP);
-        }
     }
 
     fn decode_nonzero(&mut self, num_bits: u8) -> Result<i16, SrlError> {
@@ -373,8 +383,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_terminator() {
-        assert_eq!(decode_srl(&[0x84], 1, 4), Err(SrlError::MissingTerminator));
+    fn decodes_a_stream_with_no_trailing_zero_byte() {
+        // Windows never sends a terminator. `[0x84]` is a complete one-value
+        // stream on its own, and the decoder used to reject it outright because
+        // it read the final byte as framing rather than as data.
+        assert_eq!(decode_srl(&[0x84], 1, 4), Ok(vec![3]));
+    }
+
+    #[test]
+    fn tolerates_a_trailing_zero_byte() {
+        // IronRDP's own encoder appends one, and FreeRDP skips a spare trailing
+        // byte after decoding, so both spellings must decode identically.
+        assert_eq!(decode_srl(&[0x84, 0x00], 1, 4), Ok(vec![3]));
     }
 
     #[test]
