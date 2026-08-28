@@ -660,7 +660,12 @@ impl WasmDriveBackend {
         }
 
         let file_id = req.device_io_request.file_id;
-        let Some(path) = self.state.borrow().get(file_id).map(|entry| entry.path.clone()) else {
+        let Some((path, fs_handle)) = self
+            .state
+            .borrow()
+            .get(file_id)
+            .map(|entry| (entry.path.clone(), entry.fs_handle))
+        else {
             log_outgoing(
                 "ClientDriveSetInformationResponse",
                 req.device_io_request.completion_id,
@@ -670,11 +675,13 @@ impl WasmDriveBackend {
             return Ok(vec![set_information_message(&req, NtStatus::INVALID_HANDLE)?]);
         };
 
-        // Only rename and delete-disposition map onto a `DriveFs` primitive. The remaining
-        // classes `ServerDriveSetInformationRequest::decode` accepts — Basic/EndOfFile/
-        // Allocation — have no corresponding `DriveFs` operation (no chmod/resize primitive in
-        // Task 1's scope), so they complete immediately as unsupported rather than pretending to
-        // apply.
+        // Every class `ServerDriveSetInformationRequest::decode` accepts must complete with a
+        // non-error status when possible: Windows' copy engine treats a failed auxiliary
+        // SetInformation (size preallocation, timestamp stamping) as fatal to the WHOLE copy,
+        // so a NOT_SUPPORTED here doesn't degrade gracefully — it aborts the transfer.
+        // FreeRDP's `drive_file_set_information` implements all of Rename, Disposition, Basic,
+        // EndOfFile and Allocation; this backend matches it, with one divergence documented on
+        // the `Basic` arm.
         match req.set_buffer.clone() {
             FileInformationClass::Rename(rename) => {
                 // Same rule as `Create`'s path (see `dispatch_create`): a server-supplied path
@@ -752,9 +759,30 @@ impl WasmDriveBackend {
                 Ok(Vec::new())
             }
             // `Disposition` with `delete_pending == 0` (clearing a delete request we never
-            // actually deferred) is a trivial acknowledgement; every other class has no
-            // `DriveFs` primitive.
+            // actually deferred) is a trivial acknowledgement.
             FileInformationClass::Disposition(_) => {
+                log_outgoing(
+                    "ClientDriveSetInformationResponse",
+                    req.device_io_request.completion_id,
+                    req.device_io_request.device_id,
+                    NtStatus::SUCCESS,
+                );
+                Ok(vec![set_information_message(&req, NtStatus::SUCCESS)?])
+            }
+            // FreeRDP treats EndOfFile and Allocation identically (`drive_file.c`: both fall
+            // into the same `SetFilePointerEx` + `SetEndOfFile` truncate). The copy engine sets
+            // the destination's size up front, before writing any data — rejecting this is why
+            // large copies TO the share died at 0 bytes while small editor writes (which skip
+            // preallocation) succeeded.
+            FileInformationClass::EndOfFile(info) => self.dispatch_set_len(req, fs_handle, info.end_of_file),
+            FileInformationClass::Allocation(info) => self.dispatch_set_len(req, fs_handle, info.allocation_size),
+            // Timestamp/attribute stamping at the end of a copy. FreeRDP applies it via
+            // `SetFileTime`/`SetFileAttributesW`; the File System Access API has no way to set
+            // either, so the DIVERGENCE here is deliberate: acknowledge with SUCCESS and drop
+            // the metadata. Failing instead (FreeRDP errors if its Win32 calls fail) would
+            // abort every copy for the sake of an mtime the browser cannot set anyway.
+            FileInformationClass::Basic(_) => {
+                debug!(file_id, "FileBasicInformation accepted as a no-op (FSA cannot set timestamps/attributes)");
                 log_outgoing(
                     "ClientDriveSetInformationResponse",
                     req.device_io_request.completion_id,
@@ -773,6 +801,62 @@ impl WasmDriveBackend {
                 Ok(vec![set_information_message(&req, NtStatus::NOT_SUPPORTED)?])
             }
         }
+    }
+
+    /// `FileEndOfFileInformation` / `FileAllocationInformation`: truncate or zero-extend the
+    /// file behind this IRP's handle to exactly `size` bytes via [`DriveFs::set_len`].
+    fn dispatch_set_len(
+        &self,
+        req: ServerDriveSetInformationRequest,
+        fs_handle: Option<u32>,
+        size: i64,
+    ) -> PduResult<Vec<SvcMessage>> {
+        let Ok(size) = u64::try_from(size) else {
+            log_outgoing(
+                "ClientDriveSetInformationResponse",
+                req.device_io_request.completion_id,
+                req.device_io_request.device_id,
+                NtStatus::INVALID_PARAMETER,
+            );
+            return Ok(vec![set_information_message(&req, NtStatus::INVALID_PARAMETER)?]);
+        };
+        // No fs handle means a directory open (or a handle-less entry): a resize is meaningless
+        // there, and FreeRDP likewise errors when its `file_handle` is invalid.
+        let Some(handle) = fs_handle else {
+            log_outgoing(
+                "ClientDriveSetInformationResponse",
+                req.device_io_request.completion_id,
+                req.device_io_request.device_id,
+                NtStatus::ACCESS_DENIED,
+            );
+            return Ok(vec![set_information_message(&req, NtStatus::ACCESS_DENIED)?]);
+        };
+
+        let fs = Rc::clone(&self.fs);
+        let tx = self.tx.clone();
+        let (generation, spawned_generation) = self.spawn_generation();
+        let future: LocalBoxFuture<'static, ()> = Box::pin(async move {
+            let status = match fs.set_len(handle, size).await {
+                Ok(()) => NtStatus::SUCCESS,
+                Err(err) => nt_status_for(&err),
+            };
+            log_outgoing(
+                "ClientDriveSetInformationResponse",
+                req.device_io_request.completion_id,
+                req.device_io_request.device_id,
+                status,
+            );
+            let message = set_information_message(&req, status).unwrap_or_else(|error| {
+                warn!(
+                    ?error,
+                    "Failed to encode ClientDriveSetInformationResponse; sending UNSUCCESSFUL fallback"
+                );
+                set_information_fallback_message(&req, NtStatus::UNSUCCESSFUL)
+            });
+            send_completion_if_current(&tx, &generation, spawned_generation, vec![message]);
+        });
+        self.enqueue(future);
+        Ok(Vec::new())
     }
 }
 
@@ -1502,7 +1586,8 @@ mod tests {
     use futures::executor::LocalPool;
     use futures::task::LocalSpawnExt;
     use ironrdp::rdpdr::pdu::efs::{
-        DeviceIoRequest, FileRenameInformation, MajorFunction, MinorFunction, SharedAccess,
+        DeviceIoRequest, FileAllocationInformation, FileEndOfFileInformation, FileRenameInformation, MajorFunction,
+        MinorFunction, SharedAccess,
     };
 
     use super::*;
@@ -1861,6 +1946,146 @@ mod tests {
             )),
         );
         assert_eq!(status_of(&query), NtStatus::SUCCESS);
+    }
+
+    #[test]
+    fn set_information_end_of_file_truncates_then_extends() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\sized.txt", b"12345678");
+        let mut harness = Harness::new(Rc::clone(&fs), false);
+
+        let created = only(harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(
+            create_request(
+                "\\sized.txt",
+                1,
+                DesiredAccess::FILE_WRITE_DATA_OR_FILE_ADD_FILE,
+                CreateDisposition::FILE_OPEN,
+            ),
+        )));
+        let file_id = read_u32_at(&encoded(&created), 16);
+
+        let truncated = only(harness.dispatch(ServerDriveIoRequest::ServerDriveSetInformationRequest(
+            ServerDriveSetInformationRequest {
+                device_io_request: dev_io_req(file_id, 2, MajorFunction::SetInformation),
+                set_buffer: FileInformationClass::EndOfFile(FileEndOfFileInformation { end_of_file: 3 }),
+            },
+        )));
+        assert_eq!(status_of(&truncated), NtStatus::SUCCESS);
+        assert_eq!(read_all_via_fs(&fs, "\\sized.txt"), b"123");
+
+        // Extending must zero-fill, mirroring `SetEndOfFile` on a grown file.
+        let extended = only(harness.dispatch(ServerDriveIoRequest::ServerDriveSetInformationRequest(
+            ServerDriveSetInformationRequest {
+                device_io_request: dev_io_req(file_id, 3, MajorFunction::SetInformation),
+                set_buffer: FileInformationClass::EndOfFile(FileEndOfFileInformation { end_of_file: 5 }),
+            },
+        )));
+        assert_eq!(status_of(&extended), NtStatus::SUCCESS);
+        assert_eq!(read_all_via_fs(&fs, "\\sized.txt"), b"123\0\0");
+    }
+
+    #[test]
+    fn set_information_allocation_resizes_like_end_of_file() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\alloc.bin", b"abcdef");
+        let mut harness = Harness::new(Rc::clone(&fs), false);
+
+        let created = only(harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(
+            create_request(
+                "\\alloc.bin",
+                1,
+                DesiredAccess::FILE_WRITE_DATA_OR_FILE_ADD_FILE,
+                CreateDisposition::FILE_OPEN,
+            ),
+        )));
+        let file_id = read_u32_at(&encoded(&created), 16);
+
+        let response = only(harness.dispatch(ServerDriveIoRequest::ServerDriveSetInformationRequest(
+            ServerDriveSetInformationRequest {
+                device_io_request: dev_io_req(file_id, 2, MajorFunction::SetInformation),
+                set_buffer: FileInformationClass::Allocation(FileAllocationInformation { allocation_size: 2 }),
+            },
+        )));
+        assert_eq!(status_of(&response), NtStatus::SUCCESS);
+        assert_eq!(read_all_via_fs(&fs, "\\alloc.bin"), b"ab");
+    }
+
+    #[test]
+    fn set_information_end_of_file_negative_is_invalid_parameter() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\neg.txt", b"data");
+        let mut harness = Harness::new(fs, false);
+
+        let created = only(harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(
+            create_request(
+                "\\neg.txt",
+                1,
+                DesiredAccess::FILE_WRITE_DATA_OR_FILE_ADD_FILE,
+                CreateDisposition::FILE_OPEN,
+            ),
+        )));
+        let file_id = read_u32_at(&encoded(&created), 16);
+
+        let response = only(harness.dispatch(ServerDriveIoRequest::ServerDriveSetInformationRequest(
+            ServerDriveSetInformationRequest {
+                device_io_request: dev_io_req(file_id, 2, MajorFunction::SetInformation),
+                set_buffer: FileInformationClass::EndOfFile(FileEndOfFileInformation { end_of_file: -1 }),
+            },
+        )));
+        assert_eq!(status_of(&response), NtStatus::INVALID_PARAMETER);
+        harness.assert_no_completion();
+    }
+
+    #[test]
+    fn set_information_end_of_file_on_directory_is_access_denied() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_dir("\\dir");
+        let mut harness = Harness::new(fs, false);
+
+        let created = only(
+            harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(open_request("\\dir", 1))),
+        );
+        let file_id = read_u32_at(&encoded(&created), 16);
+
+        let response = only(harness.dispatch(ServerDriveIoRequest::ServerDriveSetInformationRequest(
+            ServerDriveSetInformationRequest {
+                device_io_request: dev_io_req(file_id, 2, MajorFunction::SetInformation),
+                set_buffer: FileInformationClass::EndOfFile(FileEndOfFileInformation { end_of_file: 0 }),
+            },
+        )));
+        assert_eq!(status_of(&response), NtStatus::ACCESS_DENIED);
+        harness.assert_no_completion();
+    }
+
+    #[test]
+    fn set_information_basic_is_success_noop() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\stamped.txt", b"content");
+        let mut harness = Harness::new(Rc::clone(&fs), false);
+
+        let created = only(
+            harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(open_request(
+                "\\stamped.txt",
+                1,
+            ))),
+        );
+        let file_id = read_u32_at(&encoded(&created), 16);
+
+        let response = only(harness.dispatch(ServerDriveIoRequest::ServerDriveSetInformationRequest(
+            ServerDriveSetInformationRequest {
+                device_io_request: dev_io_req(file_id, 2, MajorFunction::SetInformation),
+                set_buffer: FileInformationClass::Basic(FileBasicInformation {
+                    creation_time: 1,
+                    last_access_time: 2,
+                    last_write_time: 3,
+                    change_time: 4,
+                    file_attributes: FileAttributes::FILE_ATTRIBUTE_NORMAL,
+                }),
+            },
+        )));
+        assert_eq!(status_of(&response), NtStatus::SUCCESS);
+        harness.assert_no_completion();
+        assert_eq!(read_all_via_fs(&fs, "\\stamped.txt"), b"content");
     }
 
     #[test]

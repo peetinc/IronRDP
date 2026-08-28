@@ -49,6 +49,11 @@ pub(crate) trait DriveFs {
     fn read(&self, handle: u32, offset: u64, len: u32) -> LocalBoxFuture<'_, Result<Vec<u8>, FsError>>;
     fn write(&self, handle: u32, offset: u64, data: Vec<u8>) -> LocalBoxFuture<'_, Result<u32, FsError>>;
     fn close(&self, handle: u32) -> LocalBoxFuture<'_, Result<(), FsError>>;
+    /// Truncates or zero-extends the file behind a write-opened `handle` to exactly `size`
+    /// bytes. Backs `FileEndOfFileInformation`/`FileAllocationInformation` SetInformation IRPs —
+    /// Windows' copy engine sets the destination's size up front before writing any data, and
+    /// treats a failure here as fatal to the whole copy.
+    fn set_len(&self, handle: u32, size: u64) -> LocalBoxFuture<'_, Result<(), FsError>>;
     fn rename(&self, from: &str, to: &str) -> LocalBoxFuture<'_, Result<(), FsError>>;
     fn delete(&self, path: &str) -> LocalBoxFuture<'_, Result<(), FsError>>;
     fn mkdir(&self, path: &str) -> LocalBoxFuture<'_, Result<(), FsError>>;
@@ -315,6 +320,25 @@ mod mock {
             Box::pin(async move {
                 let mut inner = self.inner.borrow_mut();
                 inner.handles.remove(&handle).map(|_| ()).ok_or(FsError::NotFound)
+            })
+        }
+
+        fn set_len(&self, handle: u32, size: u64) -> LocalBoxFuture<'_, Result<(), FsError>> {
+            Box::pin(async move {
+                let mut inner = self.inner.borrow_mut();
+                let open = inner.handles.get(&handle).ok_or(FsError::NotFound)?;
+                if !open.write {
+                    return Err(FsError::AccessDenied);
+                }
+                let components = open.components.clone();
+
+                let node = Self::make_path_mut(&mut inner.root, &components);
+                let Node::File(existing) = node else {
+                    return Err(FsError::Other("handle refers to a directory".to_string()));
+                };
+                let size = usize::try_from(size).map_err(|_| FsError::Other("size overflow".to_string()))?;
+                existing.resize(size, 0);
+                Ok(())
             })
         }
 

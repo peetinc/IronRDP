@@ -357,6 +357,28 @@ impl DriveFs for WebFsDrive {
         })
     }
 
+    fn set_len(&self, handle: u32, size: u64) -> LocalBoxFuture<'_, Result<(), FsError>> {
+        Box::pin(async move {
+            let slot = {
+                let handles = self.handles.borrow();
+                let entry = handles.get(&handle).ok_or(FsError::NotFound)?;
+                entry.writable.as_ref().map(Rc::clone).ok_or(FsError::AccessDenied)?
+            };
+
+            // Same critical section as `write`: `truncate()` moves the stream cursor when it is
+            // past the new size, so it must not interleave with a concurrent seek+write pair.
+            let _guard = slot.lock.lock().await;
+
+            let truncate_promise = slot
+                .stream
+                .truncate_with_f64(offset_to_f64(size))
+                .map_err(fs_error_from_js)?;
+            JsFuture::from(truncate_promise).await.map_err(fs_error_from_js)?;
+
+            Ok(())
+        })
+    }
+
     fn close(&self, handle: u32) -> LocalBoxFuture<'_, Result<(), FsError>> {
         Box::pin(async move {
             let entry = self.handles.borrow_mut().remove(&handle).ok_or(FsError::NotFound)?;
