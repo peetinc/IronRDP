@@ -167,6 +167,12 @@ impl Compositor {
         self.allocated_bytes = 0;
     }
 
+    /// Graphics output dimensions from the most recent `ResetGraphics`, or
+    /// `None` before the first one.
+    pub(crate) fn output_size(&self) -> Option<(u16, u16)> {
+        (self.output_width != 0 && self.output_height != 0).then_some((self.output_width, self.output_height))
+    }
+
     /// Reserve `len` pixel bytes, or refuse if that would exceed the budget.
     ///
     /// Refusing rather than erroring keeps the existing contract for allocations

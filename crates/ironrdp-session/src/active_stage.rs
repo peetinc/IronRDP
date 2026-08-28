@@ -222,10 +222,30 @@ impl ActiveStage {
                 // data only ever arrives over a DVC, which is X224-carried, so this stays
                 // out of the Action::FastPath arm rather than running on every fast-path
                 // frame (the highest-frequency path in a session).
-                let graphics_updates = self
+                let (graphics_output_size, graphics_updates) = self
                     .get_dvc_mut::<GraphicsPipelineClient>()
-                    .map(|mut gfx| gfx.processor_mut().drain_output())
+                    .map(|mut gfx| {
+                        let processor = gfx.processor_mut();
+                        (processor.output_size(), processor.drain_output())
+                    })
                     .unwrap_or_default();
+
+                // With EGFX active a dynamic resize arrives as ResetGraphics — there is
+                // no Deactivation-Reactivation Sequence — so the framebuffer must follow
+                // the pipeline's output size here. Before this, the image kept its
+                // connection-time dimensions forever and every delta beyond them was
+                // dropped: after any resize the desktop turned into a patchwork of stale
+                // and never-painted regions. The resize must happen BEFORE compositing so
+                // the deltas drained in the same batch as the ResetGraphics (servers
+                // routinely coalesce it with the first frames at the new size) land on
+                // the resized image instead of being lost.
+                if let Some((width, height)) = graphics_output_size {
+                    if width != image.width() || height != image.height() {
+                        *image = DecodedImage::new(image.pixel_format(), width, height);
+                        stage_outputs.push(ActiveStageOutput::DesktopResized { width, height });
+                    }
+                }
+
                 if let Some(region) =
                     composite_graphics_updates(image, graphics_updates.into_iter().map(|u| (u.region, u.data)))?
                 {
@@ -628,6 +648,14 @@ impl ActiveStage {
 pub enum ActiveStageOutput {
     ResponseFrame(Vec<u8>),
     GraphicsUpdate(InclusiveRectangle),
+    /// The desktop changed size via EGFX ResetGraphics and the framebuffer has
+    /// already been recreated at the new dimensions (its contents are blank
+    /// until the following graphics updates land). Consumers must resize their
+    /// presentation surface, and a pending resize request driven by the
+    /// Deactivation-Reactivation Sequence should treat this as its completion —
+    /// with EGFX active the server resizes through ResetGraphics INSTEAD of
+    /// deactivating, so waiting on reactivation times out.
+    DesktopResized { width: u16, height: u16 },
     PointerDefault,
     PointerHidden,
     PointerPosition {

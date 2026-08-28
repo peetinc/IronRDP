@@ -3090,6 +3090,35 @@ async fn active_session(
                         ));
                     }
                 }
+                ActiveStageOutput::DesktopResized { width, height } => {
+                    // EGFX ResetGraphics resized the desktop; the framebuffer was already
+                    // recreated by the active stage. This IS the completion of a pending
+                    // display-control resize — with the graphics pipeline active the server
+                    // resizes through ResetGraphics instead of the Deactivation-Reactivation
+                    // Sequence, so leaving the request in flight makes its deadline expire
+                    // and forces a needless reconnect (ReactivationTimedOut).
+                    debug!(width, height, "Desktop resized via EGFX ResetGraphics");
+                    resize_queue.completed();
+
+                    let buffer = vec![0u32; usize::from(width) * usize::from(height)];
+                    if !send_active_output_event(
+                        output_event_sender,
+                        RdpOutputEvent::Image {
+                            buffer,
+                            width: NonZeroU16::new(width)
+                                .ok_or_else(|| ironrdp_session::general_err!("width is zero"))?,
+                            height: NonZeroU16::new(height)
+                                .ok_or_else(|| ironrdp_session::general_err!("height is zero"))?,
+                        },
+                        close_receiver,
+                    )
+                    .await?
+                    {
+                        return Ok(RdpControlFlow::TerminatedGracefully(
+                            GracefulDisconnectReason::UserInitiated,
+                        ));
+                    }
+                }
                 ActiveStageOutput::PointerDefault => {
                     if !send_active_output_event(output_event_sender, RdpOutputEvent::PointerDefault, close_receiver)
                         .await?

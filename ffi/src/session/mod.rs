@@ -314,6 +314,9 @@ pub mod ffi {
         WindowingOrders = 12,
         AutoReconnectFailed = 13,
         MonitorLayout = 14,
+        /// The desktop changed size via EGFX ResetGraphics; the framebuffer was
+        /// recreated at the new dimensions.
+        DesktopResized = 15,
     }
 
     impl ActiveStageOutput {
@@ -338,6 +341,7 @@ pub mod ffi {
                 }
                 ironrdp::session::ActiveStageOutput::AutoReconnectFailed => ActiveStageOutputType::AutoReconnectFailed,
                 ironrdp::session::ActiveStageOutput::MonitorLayout(_) => ActiveStageOutputType::MonitorLayout,
+                ironrdp::session::ActiveStageOutput::DesktopResized { .. } => ActiveStageOutputType::DesktopResized,
             }
         }
 

@@ -1050,6 +1050,20 @@ impl iron_remote_desktop::Session for Session {
                             .context("draw updated region")?;
                         draw_buffer.clear();
                     }
+                    ActiveStageOutput::DesktopResized { width, height } => {
+                        // EGFX ResetGraphics resized the desktop and the active stage
+                        // already recreated `image` at the new dimensions — the canvas
+                        // must follow or every subsequent delta paints at the wrong
+                        // scale/offset. This also completes any resize requested via
+                        // Display Control: with the graphics pipeline active the server
+                        // resizes through ResetGraphics, not deactivate-reactivate.
+                        debug!(width, height, "Desktop resized via EGFX ResetGraphics");
+                        gui.resize(
+                            NonZeroU32::new(u32::from(width)).context("desktop width is zero")?,
+                            NonZeroU32::new(u32::from(height)).context("desktop height is zero")?,
+                        );
+                        requested_resize = None;
+                    }
                     ActiveStageOutput::PointerDefault => {
                         self.set_cursor_style(CursorStyle::Default)?;
                     }
