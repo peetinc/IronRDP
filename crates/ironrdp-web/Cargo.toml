@@ -39,6 +39,7 @@ ironrdp = { path = "../ironrdp", features = [
     "pdu",
 ] }
 ironrdp-core.path = "../ironrdp-core"
+bytes = "1"
 ironrdp-cliprdr-format.path = "../ironrdp-cliprdr-format"
 # No `openh264*` feature: the graphics pipeline is constructed without an H.264
 # decoder, so `start()` filters out every AVC capability set and only the
