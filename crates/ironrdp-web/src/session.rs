@@ -1121,6 +1121,25 @@ impl iron_remote_desktop::Session for Session {
                             .context("Send frame to writer task")?;
                     }
                     ActiveStageOutput::GraphicsUpdate(region) => {
+                        // With EGFX active the server resizes through ResetGraphics, not the
+                        // Deactivation-Reactivation Sequence. The active stage has already reset
+                        // `image` to the new extent and widened this update to the whole frame,
+                        // so the canvas only has to follow. This also completes any resize
+                        // requested via Display Control.
+                        let image_size = (u32::from(image.width()), u32::from(image.height()));
+                        if gui.size() != image_size {
+                            debug!(
+                                width = image_size.0,
+                                height = image_size.1,
+                                "Framebuffer size changed, resizing canvas"
+                            );
+                            gui.resize(
+                                NonZeroU32::new(image_size.0).context("desktop width is zero")?,
+                                NonZeroU32::new(image_size.1).context("desktop height is zero")?,
+                            );
+                            requested_resize = None;
+                        }
+
                         let region = extract_partial_image(&image, region, &mut draw_buffer);
                         gui.draw(draw_buffer.filled_mut(), region)
                             .context("draw updated region")?;

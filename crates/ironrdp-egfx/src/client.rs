@@ -1293,6 +1293,24 @@ impl DvcProcessor for GraphicsPipelineClient {
     }
 
     fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+        // Diagnostic capture: `IRONRDP_DUMP_EGFX=<dir>` writes every raw
+        // (still ZGFX-compressed) server-to-client EGFX message to
+        // `<dir>/egfx-<seq>.bin`. ZGFX compressor state is sequential, so
+        // feeding the files in order through a fresh `GraphicsPipelineClient`
+        // replays the session with full fidelity — caps, surface management,
+        // caches, fills, every codec — and rendering bugs iterate against
+        // saved bytes instead of live sessions. See the `egfx_replay` example.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Ok(dir) = std::env::var("IRONRDP_DUMP_EGFX") {
+            use core::sync::atomic::{AtomicU32, Ordering};
+            static SEQ: AtomicU32 = AtomicU32::new(0);
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::path::Path::new(&dir).join(format!("egfx-{seq:05}.bin"));
+            if let Err(error) = std::fs::write(&path, payload) {
+                warn!(?error, path = %path.display(), "failed to dump EGFX message");
+            }
+        }
+
         // ZGFX decompress
         self.decompressed_buffer.clear();
         self.decompressed_buffer.shrink_to(MAX_DECOMPRESSED_BUFFER_CAPACITY);
