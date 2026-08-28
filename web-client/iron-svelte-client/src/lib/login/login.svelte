@@ -14,7 +14,7 @@
         printJobStreamCallbacks,
     } from '../../../static/iron-remote-desktop-rdp';
     import { toast } from '$lib/messages/message-store';
-    import { showLogin } from '$lib/login/login-store';
+    import { autoResizeEnabled, showLogin } from '$lib/login/login-store';
     import { onMount } from 'svelte';
 
     // e2e test-rig hook: reports RDPDR printer job progress up to the
@@ -401,6 +401,15 @@
                                     style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
                                 />
                                 <label for="enable_egfx">Enable EGFX</label>
+                            </div>
+                            <div class="checkbox-wrapper">
+                                <input
+                                    id="auto_resize"
+                                    type="checkbox"
+                                    bind:checked={$autoResizeEnabled}
+                                    style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
+                                />
+                                <label for="auto_resize">Auto Resize</label>
                             </div>
                         </div>
                     </div>
