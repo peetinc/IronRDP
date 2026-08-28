@@ -1849,6 +1849,10 @@ impl ConfigBuilder {
         };
 
         let connector = ironrdp_connector::Config {
+            // This client always registers a GraphicsPipelineClient on DRDYNVC
+            // (see `rdp.rs`), and without advertising the capability the server
+            // never opens that channel, leaving the registration inert.
+            support_graphics_pipeline: true,
             credentials: ironrdp_connector::Credentials::UsernamePassword {
                 username: self.username.unwrap_or_default(),
                 password: self.password.unwrap_or_default(),

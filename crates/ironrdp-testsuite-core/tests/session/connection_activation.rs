@@ -26,6 +26,7 @@ const SHARE_ID: u32 = 0x0001_0000;
 
 fn test_config() -> ironrdp_connector::Config {
     ironrdp_connector::Config {
+        support_graphics_pipeline: false,
         desktop_size: DesktopSize {
             width: 1024,
             height: 768,

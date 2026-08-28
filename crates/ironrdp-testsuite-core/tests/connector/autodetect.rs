@@ -29,6 +29,7 @@ const MESSAGE_CHANNEL_ID: u16 = 1004;
 
 fn test_config() -> ironrdp_connector::Config {
     ironrdp_connector::Config {
+        support_graphics_pipeline: false,
         desktop_size: DesktopSize {
             width: 1024,
             height: 768,

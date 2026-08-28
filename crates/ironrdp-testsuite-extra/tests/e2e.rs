@@ -1013,6 +1013,7 @@ async fn client_server_with_connector<F, Fut, C>(
 
 fn default_client_config() -> connector::Config {
     connector::Config {
+        support_graphics_pipeline: false,
         desktop_size: DesktopSize {
             width: DESKTOP_WIDTH,
             height: DESKTOP_HEIGHT,

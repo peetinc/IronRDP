@@ -191,6 +191,9 @@ pub mod ffi {
 
         pub fn build(&self) -> Result<Box<Config>, Box<IronRdpError>> {
             let connector = ironrdp::connector::Config {
+                // The FFI surface registers no graphics pipeline channel, so
+                // advertising EGFX would only invite a channel nothing handles.
+                support_graphics_pipeline: false,
                 credentials: self.credentials.clone().ok_or("credentials not set")?,
                 domain: self.domain.clone(),
                 enable_tls: self.enable_tls.unwrap_or(false),

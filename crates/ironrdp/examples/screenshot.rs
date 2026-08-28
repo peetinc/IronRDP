@@ -220,6 +220,8 @@ fn build_config(
     };
 
     Ok(connector::Config {
+        // This example renders through the legacy bitmap path.
+        support_graphics_pipeline: false,
         credentials: Credentials::UsernamePassword { username, password },
         domain,
         enable_tls: false, // This example does not expose any frontend.

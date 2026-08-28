@@ -1675,6 +1675,11 @@ fn create_gcc_blocks<'a>(
                     if extended_client_data_supported {
                         early_capability_flags |= ClientEarlyCapabilityFlags::SUPPORT_MONITOR_LAYOUT_PDU;
                     }
+                    // Without this the server never opens the EGFX dynamic channel,
+                    // regardless of what the client registered on DRDYNVC.
+                    if config.support_graphics_pipeline {
+                        early_capability_flags |= ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL;
+                    }
 
                     Some(early_capability_flags)
                 },
@@ -1842,6 +1847,7 @@ mod tests {
     #[test]
     fn remote_application_client_info_uses_rail_launch_data() {
         let config = Config {
+            support_graphics_pipeline: false,
             desktop_size: DesktopSize {
                 width: 1024,
                 height: 768,
@@ -1897,6 +1903,7 @@ mod tests {
     #[test]
     fn audio_capture_flag_is_set_when_enabled() {
         let mut config = Config {
+            support_graphics_pipeline: false,
             desktop_size: DesktopSize {
                 width: 1024,
                 height: 768,
@@ -1953,6 +1960,7 @@ mod tests {
     #[test]
     fn gcc_blocks_advertise_monitor_layout_when_supported() {
         let mut config = Config {
+            support_graphics_pipeline: false,
             desktop_size: DesktopSize {
                 width: 1_920,
                 height: 1_080,

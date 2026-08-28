@@ -141,6 +141,20 @@ impl Credentials {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Advertise support for the Graphics Pipeline Extension ([MS-RDPEGFX]).
+    ///
+    /// Sets `RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL` in the `TS_UD_CS_CORE`
+    /// `earlyCapabilityFlags` ([MS-RDPBCGR] 2.2.1.3.2). Windows will not create
+    /// the `Microsoft::Windows::RDS::Graphics` dynamic channel unless the client
+    /// advertises this, so registering a `GraphicsPipelineClient` on DRDYNVC is
+    /// not by itself enough to get EGFX — the channel is simply never opened and
+    /// the session silently renders through the legacy bitmap path.
+    ///
+    /// Set this only when a graphics pipeline channel is actually registered.
+    ///
+    /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    pub support_graphics_pipeline: bool,
     /// The initial desktop size to request
     pub desktop_size: DesktopSize,
     /// The optional client monitor layout advertised in the GCC Client Monitor Data block.
