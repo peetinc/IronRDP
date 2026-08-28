@@ -57,7 +57,7 @@ use std::rc::Rc;
 use futures_util::future::LocalBoxFuture;
 use futures_util::lock::Mutex;
 use js_sys::{Array, IteratorNext, Reflect, Uint8Array};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -425,7 +425,20 @@ impl DriveFs for WebFsDrive {
                             match move_fn.call1(&handle, &JsValue::from_str(to_name)) {
                                 Ok(promise) => {
                                     let promise: js_sys::Promise = promise.unchecked_into();
-                                    return JsFuture::from(promise).await.map(|_| ()).map_err(fs_error_from_js);
+                                    let result = JsFuture::from(promise).await;
+                                    // `info!` so the outcome is visible at the client's default
+                                    // level — rename failures were untraceable at `debug!`.
+                                    match &result {
+                                        Ok(_) => info!(from, to, "rename via FileSystemHandle.move() succeeded"),
+                                        Err(err) => info!(
+                                            from,
+                                            to,
+                                            error_name = js_error_name(err).unwrap_or_default(),
+                                            error = js_error_message(err),
+                                            "rename via FileSystemHandle.move() failed"
+                                        ),
+                                    }
+                                    return result.map(|_| ()).map_err(fs_error_from_js);
                                 }
                                 Err(err) => return Err(fs_error_from_js(err)),
                             }
@@ -434,6 +447,7 @@ impl DriveFs for WebFsDrive {
                 }
             }
 
+            info!(from, to, "rename falling back to copy+delete (cross-directory or move() unavailable)");
             match JsFuture::from(from_parent.get_file_handle(from_name)).await {
                 Ok(value) => {
                     let file_handle: FileSystemFileHandle = value.unchecked_into();
