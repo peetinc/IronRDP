@@ -58,7 +58,7 @@ use std::collections::BTreeMap;
 use ironrdp_core::{Decode as _, ReadCursor, impl_as_any};
 use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
 use ironrdp_graphics::clearcodec::ClearCodecDecoder;
-use ironrdp_graphics::progressive::{ProgressiveDecoder, TILE_BYTES_PER_PIXEL, TILE_DIM};
+use ironrdp_graphics::progressive::{ProgressiveDecodeError, ProgressiveDecoder, TILE_BYTES_PER_PIXEL, TILE_DIM};
 use ironrdp_graphics::rdp6::BitmapStreamDecoder;
 use ironrdp_graphics::zgfx;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
@@ -853,6 +853,27 @@ impl GraphicsPipelineClient {
             .ok_or_else(|| pdu_other_err!("unknown surface in WireToSurface2"))?;
         let (surface_width, surface_height) = (surface.width, surface.height);
 
+        // Diagnostic capture: `IRONRDP_DUMP_PROGRESSIVE=<dir>` writes every
+        // progressive bitmap stream this session receives to
+        // `<dir>/w2s2-<seq>-s<surface>-c<context>.bin`, BEFORE decoding. A stream
+        // a real Windows encoder produced and this decoder rejects becomes an
+        // offline unit-test fixture — the decoder has never been tested against
+        // anything but its own encoder's output, and live sessions are far too
+        // expensive a way to iterate on it.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Ok(dir) = std::env::var("IRONRDP_DUMP_PROGRESSIVE") {
+            use core::sync::atomic::{AtomicU32, Ordering};
+            static SEQ: AtomicU32 = AtomicU32::new(0);
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::path::Path::new(&dir).join(format!(
+                "w2s2-{seq:04}-s{}-c{}.bin",
+                pdu.surface_id, pdu.codec_context_id
+            ));
+            if let Err(error) = std::fs::write(&path, &pdu.bitmap_data) {
+                warn!(?error, path = %path.display(), "failed to dump progressive stream");
+            }
+        }
+
         let tiles = self
             .progressive_decoder
             .decode_bitmap(
@@ -863,8 +884,28 @@ impl GraphicsPipelineClient {
                 &pdu.bitmap_data,
             )
             .map_err(|error| {
-                warn!(?error, "rfx progressive decode failed");
-                pdu_other_err!("rfx progressive decode failed")
+                warn!(?error, surface_id = pdu.surface_id, codec_context_id = pdu.codec_context_id,
+                      surface_width, surface_height, bitmap_len = pdu.bitmap_data.len(),
+                      "rfx progressive decode failed");
+                // `PduErrorKind::Other` needs a `&'static str` and
+                // `ProgressiveDecodeError` implements only `Display`, so the cause
+                // cannot be attached as a source. Naming the variant keeps it in the
+                // surfaced error instead of collapsing nine distinct failures into
+                // one indistinguishable message.
+                pdu_other_err!(match error {
+                    ProgressiveDecodeError::Pdu(_) => "rfx progressive decode failed: PDU parse",
+                    ProgressiveDecodeError::Rlgr(_) => "rfx progressive decode failed: RLGR",
+                    ProgressiveDecodeError::Srl(_) => "rfx progressive decode failed: SRL (upgrade tile)",
+                    ProgressiveDecodeError::MissingBlock(_) => "rfx progressive decode failed: missing block",
+                    ProgressiveDecodeError::TileOutOfBounds { .. } =>
+                        "rfx progressive decode failed: tile out of surface bounds",
+                    ProgressiveDecodeError::InvalidQuantIndex { .. } =>
+                        "rfx progressive decode failed: invalid quant index",
+                    ProgressiveDecodeError::MissingTileReference { .. } =>
+                        "rfx progressive decode failed: difference tile with no reference",
+                    ProgressiveDecodeError::SurfaceTooLarge { .. } =>
+                        "rfx progressive decode failed: surface too large",
+                })
             })?;
 
         for tile in tiles {
