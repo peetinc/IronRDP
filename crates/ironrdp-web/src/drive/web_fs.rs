@@ -4,7 +4,7 @@
 //! Every [`super::fs::DriveFs`] method interprets an already-[`super::state::normalize_path`]d
 //! path by walking [`FileSystemDirectoryHandle::get_directory_handle`] one component at a time
 //! from `root`; the final component is resolved as either a file or a directory handle depending
-//! on the operation. Three FSAA quirks shape this implementation, all called out where they bite:
+//! on the operation. Several FSAA quirks shape this implementation, all called out where they bite:
 //!
 //! * **No rename primitive.** [`DriveFs::rename`] copies a file's bytes to the destination and
 //!   deletes the source; renaming a directory returns [`FsError::AccessDenied`] (Explorer surfaces
@@ -31,6 +31,20 @@
 //!   fresh [`DriveFs::open_file`] call always gets its own handle and its own writable — nothing
 //!   here is shared across handles even when they name the same path — so a per-handle lock is
 //!   sufficient without a path-keyed one.
+//! * **Chrome refuses a fixed blocklist of filenames outright, `desktop.ini` included.** Every
+//!   FSAA method that takes a name — `getFileHandle`, `getDirectoryHandle`, `removeEntry`, the
+//!   `create: true` variants — throws a plain `TypeError` ("Name is not allowed") for a blocked
+//!   name, regardless of whether an entry by that name exists. Real Windows Explorer probes
+//!   `desktop.ini` in *every* folder it opens (custom-icon / localized-folder-name lookup), so
+//!   without special-casing this, every single folder open would fail: [`fs_error_from_js`] (see
+//!   [`is_blocked_name`]) maps this `TypeError` to [`FsError::NotFound`] rather than the generic
+//!   [`FsError::Other`] it would otherwise become, since `NotFound` is both the honest answer (the
+//!   name is unreachable through this API by construction — indistinguishable from absent) and
+//!   the only status Explorer tolerates here without aborting the whole folder open. This is
+//!   symmetric with writes: a remote attempt to *create* `desktop.ini` on the share hits the same
+//!   `TypeError` and so reports the same "not found"-class failure rather than succeeding — there
+//!   is no way to honor that create through this API, and this is the least-surprising failure
+//!   mode available, not a bug to fix later.
 //!
 //! Sizes and timestamps cross the `f64` boundary the File API represents them with (see
 //! [`file_size_to_u64`] and [`offset_to_f64`] for the precision caveat, which is theoretical, not
@@ -545,18 +559,59 @@ fn is_type_mismatch(err: &JsValue) -> bool {
     js_error_name(err).as_deref() == Some("TypeMismatchError")
 }
 
+/// `true` when a thrown JS value is Chrome's File System Access blocked-filename refusal: a
+/// plain `TypeError` (not a `DOMException` — no `NotFoundError`/`NotAllowedError` name at all)
+/// whose message says the name is disallowed. Chrome maintains a fixed blocklist of
+/// reserved/sensitive names (`desktop.ini` among them, alongside things like `.git`,
+/// `com1`..`com9`) that every FSAA method — `getFileHandle`, `getDirectoryHandle`,
+/// `removeEntry`, `getFileHandleWithOptions({create: true})` — refuses outright, for any path
+/// component, regardless of whether an entry by that name exists. See [`fs_error_from_js`] for
+/// why this maps to [`FsError::NotFound`] rather than [`FsError::Other`].
+fn is_blocked_name(err: &JsValue) -> bool {
+    js_error_name(err).as_deref() == Some("TypeError") && js_error_message(err).contains("Name is not allowed")
+}
+
 /// Maps a thrown JS value from an FSAA call into [`FsError`], per the plan this task implements:
 /// `NotFoundError` -> [`FsError::NotFound`]; `NotAllowedError` / `NoModificationAllowedError` ->
-/// [`FsError::AccessDenied`]; anything else -> [`FsError::Other`] (including `TypeMismatchError`
-/// at every call site that doesn't special-case it — [`is_type_mismatch`] is checked first where
+/// [`FsError::AccessDenied`]; a blocked-name `TypeError` (see [`is_blocked_name`]) ->
+/// [`FsError::NotFound`]; anything else -> [`FsError::Other`] (including `TypeMismatchError` at
+/// every call site that doesn't special-case it — [`is_type_mismatch`] is checked first where
 /// that distinction matters).
+///
+/// Every FSAA-facing call site in this module routes its error through this one function (via
+/// `.map_err(fs_error_from_js)`), so the blocked-name mapping applies uniformly to `stat`,
+/// `open_file`, `list`, `delete`, `rename`, and `mkdir` — a real Windows Explorer probes
+/// `desktop.ini` in *every* folder it opens (custom-icon / localized-folder-name lookup), and
+/// Chrome refuses that name with a `TypeError` rather than the `NotFoundError` a normal
+/// missing-file lookup gets. Mapping it to anything other than [`FsError::NotFound`] — the
+/// generic [`FsError::Other`] this would otherwise fall into — surfaces as `STATUS_UNSUCCESSFUL`
+/// to the RDP server, which Explorer reads as a device I/O failure and aborts the *entire* folder
+/// open on, rather than the graceful "no custom icon here" it expects from a missing file.
+/// `NotFound` is also the honest answer: a blocked name is unreachable through this API by
+/// construction, indistinguishable from one that was never there. The same blocklist applies
+/// symmetrically to writes: a remote `CREATE` of `desktop.ini` on the share hits this exact
+/// mapping too (`getFileHandleWithOptions({create: true})` throws the same `TypeError`), so it
+/// also reports as a "not found"-class failure rather than succeeding — there is no way to honor
+/// that create through this API, and this is the least-surprising failure mode available.
 fn fs_error_from_js(err: JsValue) -> FsError {
+    if is_blocked_name(&err) {
+        return FsError::NotFound;
+    }
     match js_error_name(&err).as_deref() {
         Some("NotFoundError") => FsError::NotFound,
         Some("NotAllowedError") | Some("NoModificationAllowedError") => FsError::AccessDenied,
         _ => FsError::Other(js_error_message(&err)),
     }
 }
+
+// No native unit test for `fs_error_from_js` / `is_blocked_name`: confirmed empirically while
+// building this fix, not assumed — constructing even a bare `js_sys::Error`/`TypeError` to feed
+// it panics off-wasm32 ("cannot call wasm-bindgen imported functions on non-wasm targets"), the
+// same way every other browser call in this module would. Compiling `web_fs.rs` natively only
+// type-checks it (which is why `drive::` tests stay at 40, unchanged by this fix); actually
+// exercising this mapping needs a real `TypeError`/`DOMException`, which only exists under
+// `wasm32-unknown-unknown` in a real (or wasm-bindgen-test-headless) browser — outside this
+// module's compile-gated testing story, per its own doc comment above.
 
 /// Best-effort human-readable description of a thrown JS value, for [`FsError::Other`].
 fn js_error_message(err: &JsValue) -> String {
