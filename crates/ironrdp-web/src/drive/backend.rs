@@ -51,20 +51,19 @@ use super::state::{DriveState, normalize_path};
 /// Maximum bytes this backend will honor from a single `DeviceReadRequest`, regardless of what
 /// the server actually asked for (`dispatch_read` clamps with `.min(MAX_DRIVE_READ_BYTES)`).
 ///
-/// A SHORT READ is legal per MS-RDPEFS: `DeviceReadResponse` carries its own `Length`, and the
-/// redirector already has to handle getting back fewer bytes than requested (the same mechanism
-/// it needs for EOF) by issuing a follow-up read at the advanced offset. What is NOT legal in
-/// practice is the response size this backend used to hand back before this constant existed:
-/// Windows commonly requests up to 1 MiB in a single `DeviceReadRequest`, and
-/// `ironrdp_svc::CHANNEL_CHUNK_LENGTH` chunkifies a static virtual channel message at 1600
-/// bytes — a 1 MiB `DeviceReadResponse` becomes ~650 chunks reassembled by the server. Observed
-/// live: the RDPDR channel dies immediately after two such 1 MiB reads (Explorer surfaces
-/// `0x800703E3 ERROR_OPERATION_ABORTED`), and the entire share is unusable — can't browse, can't
-/// copy — for the rest of the session, the signature of a protocol/reassembly violation rather
-/// than a per-file error. 64 KiB keeps every response to ~41 chunks (comfortably away from
-/// whatever reassembly limit 1 MiB was hitting) while still being large enough to not tank
-/// throughput on a real file copy.
-const MAX_DRIVE_READ_BYTES: u32 = 64 * 1024;
+/// 1 MiB, matching what FreeRDP's drive channel honors (`drive_process_irp_read` in
+/// `channels/drive/client/drive_main.c` reads the requested `Length` outright, with no cap) —
+/// so this is a ceiling on absurd requests, not a throttle on normal ones.
+///
+/// A SHORT READ IS NOT SAFE HERE, despite MS-RDPEFS allowing `DeviceReadResponse` to carry fewer
+/// bytes than requested. Measured against a live Windows Server host: after answering a
+/// `length=1048576, offset=0` request with only 65536 bytes, the redirector's *next* read came in
+/// at `offset=1048576` — it advanced by the REQUESTED length, not the returned one, silently
+/// leaving a 960 KiB hole in the destination file. Windows also pipelines these reads
+/// concurrently rather than issuing them in response to each completion, so there is no
+/// follow-up read at the short-read boundary to fill the gap. Returning less than asked for
+/// therefore corrupts copies instead of throttling them; only a genuine EOF short read is safe.
+const MAX_DRIVE_READ_BYTES: u32 = 1024 * 1024;
 
 /// Message sent from [`WasmDriveBackend`] each time an async `DriveFs` operation completes and
 /// produces RDPDR completion PDU(s) to send back to the server.
@@ -482,9 +481,9 @@ impl WasmDriveBackend {
         let (generation, spawned_generation) = self.spawn_generation();
         let offset = req.offset;
         let requested_len = req.length;
-        // See `MAX_DRIVE_READ_BYTES`'s own doc comment: a short read is legal MS-RDPEFS, a
-        // 1 MiB `DeviceReadResponse` on this static virtual channel is not (observed live to
-        // kill the channel outright).
+        // See `MAX_DRIVE_READ_BYTES`: the redirector advances by the REQUESTED length whether or
+        // not we return that much, so anything short of a real EOF read punches holes in the
+        // destination file. This ceiling only guards against an absurd request.
         let clamped_len = requested_len.min(MAX_DRIVE_READ_BYTES);
 
         let future: LocalBoxFuture<'static, ()> = Box::pin(async move {
@@ -1958,12 +1957,13 @@ mod tests {
     }
 
     #[test]
-    fn large_read_request_is_clamped_to_64kib_from_the_right_offset() {
-        // Regression test: Windows commonly requests up to 1 MiB in a single DeviceReadRequest.
-        // Honoring that literally used to produce a ~650-chunk DeviceReadResponse on the static
-        // virtual channel (ironrdp_svc::CHANNEL_CHUNK_LENGTH == 1600 bytes) — observed live to
-        // kill the RDPDR channel outright after just two such reads. See
-        // `MAX_DRIVE_READ_BYTES`'s own doc comment.
+    fn large_read_request_returns_everything_available_not_a_short_read() {
+        // Regression test for a corruption bug, not a throughput one: Windows requests up to
+        // 1 MiB per DeviceReadRequest and advances its next read by the REQUESTED length
+        // regardless of how much we actually return (measured live: answering
+        // `length=1048576, offset=0` with 65536 bytes produced a follow-up read at
+        // offset=1048576, not 65536). A deliberate short read therefore silently punches holes
+        // in the copied file. Only a genuine EOF short read is safe.
         let fs = Rc::new(MockFs::new());
         let mut contents = vec![0u8; 70 * 1024];
         for (i, byte) in contents.iter_mut().enumerate() {
@@ -1992,18 +1992,17 @@ mod tests {
         let data_len = read_u32_at(&bytes, 16) as usize;
         assert_eq!(
             data_len,
-            64 * 1024,
-            "a 1 MiB request against a file with 70 KiB available must be clamped to exactly 64 KiB, not the full 1 MiB nor the file's true remaining length"
+            70 * 1024,
+            "a 1 MiB request against a 70 KiB file must return ALL 70 KiB (a real EOF short read); returning less makes the redirector skip the remainder"
         );
         assert_eq!(
             &bytes[20..20 + data_len],
-            &contents[..64 * 1024],
-            "clamped read must still return the correct bytes starting at the requested offset"
+            &contents[..],
+            "read must return the correct bytes starting at the requested offset"
         );
 
-        // A follow-up read at the advanced offset — exactly the short-read recovery mechanism
-        // MS-RDPEFS already requires the redirector to implement (also used for EOF) — must
-        // pick up right where the first response left off.
+        // Reading at a non-zero offset must start exactly there — the redirector picks its own
+        // offsets (it pipelines reads rather than chaining them off each completion).
         let second_read = only(
             harness.dispatch(ServerDriveIoRequest::DeviceReadRequest(DeviceReadRequest {
                 device_io_request: dev_io_req(file_id, 3, MajorFunction::Read),
@@ -2017,7 +2016,7 @@ mod tests {
         assert_eq!(
             second_len,
             70 * 1024 - 64 * 1024,
-            "remaining bytes in the file, still clamp-eligible but shorter than the cap"
+            "EOF short read: everything left in the file from the requested offset"
         );
         assert_eq!(&second_bytes[20..20 + second_len], &contents[64 * 1024..]);
     }
