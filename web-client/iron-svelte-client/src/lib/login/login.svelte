@@ -38,18 +38,95 @@
     let folderName = '';
     let folderReadOnly = false;
 
+    // The File System Access API cannot open a picker at an arbitrary path, but a picked
+    // directory HANDLE can be persisted (IndexedDB) and re-armed on the next visit with a
+    // permission re-grant instead of a fresh picker. Tick "Allow on every visit" in Chrome's
+    // re-grant prompt and subsequent loads restore the share with zero clicks.
+    const RIG_DB = 'ironrdp-rig';
+    const RIG_STORE = 'handles';
+    const RIG_KEY = 'share-folder';
+
+    function rigDb(): Promise<IDBDatabase> {
+        return new Promise((resolve, reject) => {
+            const open = indexedDB.open(RIG_DB, 1);
+            open.onupgradeneeded = () => open.result.createObjectStore(RIG_STORE);
+            open.onsuccess = () => resolve(open.result);
+            open.onerror = () => reject(open.error);
+        });
+    }
+
+    async function saveStoredFolder(handle: FileSystemDirectoryHandle) {
+        try {
+            const db = await rigDb();
+            await new Promise<void>((resolve, reject) => {
+                const tx = db.transaction(RIG_STORE, 'readwrite');
+                tx.objectStore(RIG_STORE).put(handle, RIG_KEY);
+                tx.oncomplete = () => resolve();
+                tx.onerror = () => reject(tx.error);
+            });
+        } catch (err) {
+            console.warn('Could not persist share-folder handle:', err);
+        }
+    }
+
+    async function loadStoredFolder(): Promise<FileSystemDirectoryHandle | null> {
+        try {
+            const db = await rigDb();
+            return await new Promise((resolve, reject) => {
+                const req = db.transaction(RIG_STORE, 'readonly').objectStore(RIG_STORE).get(RIG_KEY);
+                req.onsuccess = () => resolve(req.result ?? null);
+                req.onerror = () => reject(req.error);
+            });
+        } catch {
+            return null;
+        }
+    }
+
+    type PermissionCapable = FileSystemDirectoryHandle & {
+        queryPermission(opts: { mode: string }): Promise<PermissionState>;
+        requestPermission(opts: { mode: string }): Promise<PermissionState>;
+    };
+
     async function pickFolder() {
         try {
+            // First choice: re-arm the previously shared folder with a permission prompt only
+            // (no picker). Falls through to the full picker when nothing is stored or the
+            // re-grant is denied.
+            const stored = (await loadStoredFolder()) as PermissionCapable | null;
+            if (stored && folderHandle === null) {
+                if ((await stored.requestPermission({ mode: 'readwrite' })) === 'granted') {
+                    folderHandle = stored;
+                    folderName = stored.name;
+                    return;
+                }
+            }
             // `showDirectoryPicker` is not in the default lib.dom typings used
             // here; guarded by the `'showDirectoryPicker' in window` check below.
-            const handle = await (window as unknown as { showDirectoryPicker: (opts: { mode: string }) => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker({
+            const handle = await (
+                window as unknown as {
+                    showDirectoryPicker: (opts: {
+                        mode: string;
+                        startIn?: FileSystemDirectoryHandle;
+                    }) => Promise<FileSystemDirectoryHandle>;
+                }
+            ).showDirectoryPicker({
                 mode: 'readwrite',
+                ...(stored ? { startIn: stored } : {}),
             });
             folderHandle = handle;
             folderName = handle.name;
+            void saveStoredFolder(handle);
         } catch (err) {
             // User cancelled the picker or denied permission — nothing to report.
             console.warn('Folder share picker dismissed:', err);
+        }
+    }
+
+    async function restoreFolderIfPermitted() {
+        const stored = (await loadStoredFolder()) as PermissionCapable | null;
+        if (stored && (await stored.queryPermission({ mode: 'readwrite' })) === 'granted') {
+            folderHandle = stored;
+            folderName = stored.name;
         }
     }
 
@@ -215,7 +292,14 @@
     };
 
     onMount(async () => {
+        // Bump to 'DEBUG' when diagnosing the drive share — every IRP logs at debug!, and the
+        // DevTools level filter cannot reveal lines the wasm tracing level never emits. Left at
+        // INFO normally: DEBUG floods the console hard enough to stall the tab on big transfers.
         await init('INFO');
+        // Zero-click share restore when Chrome granted persistent permission
+        // ("Allow on every visit"); otherwise the Share Folder button re-arms
+        // the stored handle with a one-click prompt instead of a picker.
+        void restoreFolderIfPermitted();
     });
 </script>
 
