@@ -23,7 +23,7 @@
 
     let username = 'artichoke';
     let password = '';
-    let gatewayAddress = 'ws://localhost:9091';
+    let gatewayAddress = 'ws://localhost:9095';
     let hostname = '10.10.100.78';
     let domain = 'peetinc';
     let kdc_proxy_url = '';
