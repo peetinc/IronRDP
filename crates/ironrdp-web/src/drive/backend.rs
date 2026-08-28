@@ -43,7 +43,7 @@ use ironrdp::rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
 use ironrdp_core::{EncodeResult, impl_as_any};
 use ironrdp_pdu::{PduError, PduErrorExt as _, PduResult, pdu_other_err};
 use ironrdp_svc::SvcMessage;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::fs::{DriveFs, FsEntry, FsError};
 use super::state::{DriveState, normalize_path};
@@ -492,8 +492,12 @@ impl WasmDriveBackend {
                 Ok(data) => (NtStatus::SUCCESS, data),
                 Err(err) => (nt_status_for(&err), Vec::new()),
             };
-            debug!(
-                "[rdpdr-drive] dispatch_read offset={offset} requested_len={requested_len} clamped_len={clamped_len} returned_len={}",
+            // INFO (not debug) on purpose: the read path is the one we are
+            // actively bisecting against a live server, and DEBUG-level output
+            // for every IRP floods the browser console badly enough to kill the
+            // tab. Reads alone are low-volume.
+            info!(
+                "[rdpdr-drive] dispatch_read offset={offset} requested_len={requested_len} clamped_len={clamped_len} returned_len={} status={status:?}",
                 read_data.len()
             );
             log_outgoing(
