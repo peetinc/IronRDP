@@ -40,6 +40,11 @@ ironrdp = { path = "../ironrdp", features = [
 ] }
 ironrdp-core.path = "../ironrdp-core"
 ironrdp-cliprdr-format.path = "../ironrdp-cliprdr-format"
+# No `openh264*` feature: the graphics pipeline is constructed without an H.264
+# decoder, so `start()` filters out every AVC capability set and only the
+# wasm-clean codecs (progressive RFX, ClearCodec, planar, uncompressed) are
+# negotiated.
+ironrdp-egfx.path = "../ironrdp-egfx"
 ironrdp-futures.path = "../ironrdp-futures"
 ironrdp-pdu.path = "../ironrdp-pdu"
 ironrdp-propertyset.path = "../ironrdp-propertyset"
