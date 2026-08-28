@@ -2976,6 +2976,7 @@ dependencies = [
  "ironrdp-graphics",
  "ironrdp-pdu",
  "openh264",
+ "png",
  "tracing",
  "yuv",
 ]
