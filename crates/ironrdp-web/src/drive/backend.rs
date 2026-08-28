@@ -18,6 +18,7 @@
 
 use core::cell::{Cell, RefCell};
 use core::fmt;
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 use futures_channel::mpsc;
@@ -116,6 +117,16 @@ pub(crate) struct WasmDriveBackend {
     /// this counter by the time the future resolves, its completion is dropped instead of being
     /// delivered into the new sequence stamped with a now-stale `device_id`/`completion_id`.
     generation: Rc<Cell<u64>>,
+    /// FIFO of IRP futures awaiting execution, drained strictly one at a time by a single worker
+    /// (see [`Self::enqueue`]). This matches FreeRDP's drive channel, which processes IRPs
+    /// serially on one thread (`drive_thread_func` + `MessageQueue` in
+    /// `channels/drive/client/drive_main.c`): Windows pipelines requests, but every mainstream
+    /// client answers them in order, one at a time. Running them concurrently is spec-legal but
+    /// untested interop territory, and it lets N pipelined 1 MiB reads hold N response buffers
+    /// (plus their JS-side `ArrayBuffer`s) alive at once. Serial execution bounds that to one.
+    queue: Rc<RefCell<VecDeque<LocalBoxFuture<'static, ()>>>>,
+    /// Whether the drain worker spawned by [`Self::enqueue`] is currently running.
+    draining: Rc<Cell<bool>>,
 }
 
 // SAFETY: `RdpdrBackend: Send` is a supertrait bound the SVC processor's generic
@@ -157,7 +168,38 @@ impl WasmDriveBackend {
             tx,
             spawn,
             generation: Rc::new(Cell::new(0)),
+            queue: Rc::new(RefCell::new(VecDeque::new())),
+            draining: Rc::new(Cell::new(false)),
         }
+    }
+
+    /// Queues an IRP future for strictly serial execution: each future runs to completion before
+    /// the next starts, in dispatch (i.e. wire-arrival) order. A single drain worker is spawned
+    /// lazily and exits when the queue empties; everything here runs on one logical thread, and
+    /// there is no `await` between observing the empty queue and clearing `draining`, so the
+    /// spawn-or-not decision cannot race.
+    ///
+    /// `reset()` deliberately does NOT clear this queue: a queued stale-generation future still
+    /// runs (its `DriveFs` side effects happen, matching the previous concurrent behavior), but
+    /// its completion is dropped by `send_completion_if_current`.
+    fn enqueue(&self, future: LocalBoxFuture<'static, ()>) {
+        self.queue.borrow_mut().push_back(future);
+        if self.draining.get() {
+            return;
+        }
+        self.draining.set(true);
+        let queue = Rc::clone(&self.queue);
+        let draining = Rc::clone(&self.draining);
+        (self.spawn)(Box::pin(async move {
+            loop {
+                let next = queue.borrow_mut().pop_front();
+                match next {
+                    Some(irp_future) => irp_future.await,
+                    None => break,
+                }
+            }
+            draining.set(false);
+        }));
     }
 
     /// Snapshots the current generation before spawning a future, so the future can check —
@@ -266,7 +308,7 @@ impl WasmDriveBackend {
                 vec![SvcMessage::from(RdpdrPdu::DeviceCreateResponse(response))],
             );
         });
-        (self.spawn)(future);
+        self.enqueue(future);
         Vec::new()
     }
 
@@ -323,7 +365,7 @@ impl WasmDriveBackend {
                 ))],
             );
         });
-        (self.spawn)(future);
+        self.enqueue(future);
         Vec::new()
     }
 
@@ -382,7 +424,7 @@ impl WasmDriveBackend {
                 vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(response))],
             );
         });
-        (self.spawn)(future);
+        self.enqueue(future);
         Vec::new()
     }
 
@@ -477,7 +519,7 @@ impl WasmDriveBackend {
                 vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryDirectoryResponse(response))],
             );
         });
-        (self.spawn)(future);
+        self.enqueue(future);
         Vec::new()
     }
 
@@ -539,7 +581,7 @@ impl WasmDriveBackend {
                 vec![SvcMessage::from(RdpdrPdu::DeviceReadResponse(response))],
             );
         });
-        (self.spawn)(future);
+        self.enqueue(future);
         Vec::new()
     }
 
@@ -602,7 +644,7 @@ impl WasmDriveBackend {
                 vec![SvcMessage::from(RdpdrPdu::DeviceWriteResponse(response))],
             );
         });
-        (self.spawn)(future);
+        self.enqueue(future);
         Vec::new()
     }
 
@@ -678,7 +720,7 @@ impl WasmDriveBackend {
                     });
                     send_completion_if_current(&tx, &generation, spawned_generation, vec![message]);
                 });
-                (self.spawn)(future);
+                self.enqueue(future);
                 Ok(Vec::new())
             }
             FileInformationClass::Disposition(disposition) if disposition.delete_pending != 0 => {
@@ -706,7 +748,7 @@ impl WasmDriveBackend {
                     });
                     send_completion_if_current(&tx, &generation, spawned_generation, vec![message]);
                 });
-                (self.spawn)(future);
+                self.enqueue(future);
                 Ok(Vec::new())
             }
             // `Disposition` with `delete_pending == 0` (clearing a delete request we never
@@ -760,7 +802,7 @@ impl RdpdrBackend for WasmDriveBackend {
                     let _ = fs.close(handle).await;
                 }
             });
-            (self.spawn)(future);
+            self.enqueue(future);
         }
 
         Ok(())
