@@ -3,6 +3,9 @@
 /dependencies
 # Local cargo root
 /.cargo/local_root
+# Claude Code worktrees live inside the checkout and hold their own
+# target/ + node_modules/ (~1.5 GB), which must never be committed.
+.claude/worktrees/
 
 # Log files
 *.log

@@ -45,6 +45,20 @@ export function displayControl(enable: boolean): Extension {
     return new Extension('display_control', enable);
 }
 
+/**
+ * Toggle the EGFX graphics pipeline (progressive RemoteFX / ClearCodec).
+ *
+ * Enabled by default — EGFX is negotiated, so a host that does not offer it
+ * never opens the channel and the legacy bitmap path is used untouched. Pass
+ * `false` as a kill-switch if rendering regresses.
+ *
+ * No H.264 is involved: the pipeline is built without a decoder, so every AVC
+ * capability set is filtered out at advertisement time.
+ */
+export function egfx(enable: boolean): Extension {
+    return new Extension('egfx', enable);
+}
+
 export function kdcProxyUrl(url: string): Extension {
     return new Extension('kdc_proxy_url', url);
 }
