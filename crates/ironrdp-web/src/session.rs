@@ -33,7 +33,7 @@ use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_core::WriteBuf;
 use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
-use ironrdp_egfx::pdu::CapabilitySet;
+use ironrdp_egfx::pdu::{CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitySet};
 use ironrdp_futures::{FramedWrite as _, single_sequence_step, single_sequence_step_read};
 use rgb::AsPixels as _;
 use tap::prelude::*;
@@ -476,6 +476,12 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
         info!("Connect to RDP host");
 
+        // Read before `build_config`: the EGFX early capability flag has to go out
+        // in the GCC client core data during the connection sequence, long before
+        // the DRDYNVC attach below decides whether to register the channel.
+        // `legacy_graphics` asks for a codec-free session, so it wins over EGFX.
+        let use_egfx = self.0.borrow().use_egfx && !legacy_graphics;
+
         let mut config = build_config(
             username,
             password,
@@ -484,6 +490,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             desktop_size,
             legacy_graphics,
             security,
+            use_egfx,
         );
 
         let enable_server_pointer = self.0.borrow().enable_server_pointer;
@@ -601,7 +608,6 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         }
 
         let use_display_control = self.0.borrow().use_display_control;
-        let use_egfx = self.0.borrow().use_egfx;
 
         let (connection_result, stream, rdp_leftover) = connect(ConnectParams {
             ws,
@@ -1731,6 +1737,7 @@ fn build_config(
     desktop_size: DesktopSize,
     legacy_graphics: bool,
     security: SecurityConfig,
+    support_dyn_vc_gfx_protocol: bool,
 ) -> connector::Config {
     // Win7-class servers need 32-bpp lossless bitmaps and no advertised codecs.
     let bitmap = if legacy_graphics {
@@ -1787,7 +1794,7 @@ fn build_config(
         request_data: None,
         pointer_software_rendering: false,
         multitransport_flags: None,
-        support_dyn_vc_gfx_protocol: false,
+        support_dyn_vc_gfx_protocol,
         performance_flags: PerformanceFlags::default(),
         desktop_scale_factor: 0,
         hardware_id: None,
@@ -2028,6 +2035,27 @@ async fn connect(
             }
 
             impl GraphicsPipelineHandler for WebEgfxHandler {
+                fn capabilities(&self) -> Vec<CapabilitySet> {
+                    // Same sets as the trait default — this override exists only to
+                    // prove the channel opened. `start()` calls this the moment the
+                    // server creates the DVC, and every DVC-layer log in
+                    // ironrdp-dvc is debug!, which Chrome hides.
+                    //
+                    // AVC420_ENABLED stays on V8_1 exactly as upstream has it;
+                    // `start()` then filters that set out because no H.264 decoder
+                    // is configured, leaving V8 as what actually goes on the wire.
+                    let caps = vec![
+                        CapabilitySet::V8_1 {
+                            flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
+                        },
+                        CapabilitySet::V8 {
+                            flags: CapabilitiesV8Flags::SMALL_CACHE,
+                        },
+                    ];
+                    info!(?caps, "EGFX channel OPENED — advertising capabilities");
+                    caps
+                }
+
                 fn on_capabilities_confirmed(&mut self, caps: &CapabilitySet) {
                     // The definitive "EGFX is live" signal, and it names the
                     // version the server settled on.
@@ -2047,9 +2075,15 @@ async fn connect(
                         info!(frame_id, "EGFX first frame complete — pixels flowing");
                     }
                 }
+
+                fn on_close(&mut self) {
+                    // A server that opens the channel and then closes it is a very
+                    // different failure from one that never opens it at all.
+                    info!("EGFX channel CLOSED by server");
+                }
             }
 
-            debug!("Attaching EGFX graphics pipeline (no H.264 decoder)");
+            info!("Attaching EGFX graphics pipeline (no H.264 decoder)");
             drdynvc = drdynvc
                 .with_dynamic_channel(GraphicsPipelineClient::new(Box::new(WebEgfxHandler::default()), None));
         }
@@ -2245,6 +2279,7 @@ mod tests {
             },
             false,
             security,
+            false,
         )
     }
 
