@@ -34,3 +34,6 @@ openh264-libloading = ["openh264", "openh264/libloading"]
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+png = "0.18"
