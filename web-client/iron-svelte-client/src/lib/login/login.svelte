@@ -5,6 +5,7 @@
     import type { PrintJobEntry } from '../../models/print-job';
     import {
         displayControl,
+        egfx,
         kdcProxyUrl,
         init,
         driveShare,
@@ -23,13 +24,18 @@
 
     let username = 'artichoke';
     let password = '';
-    let gatewayAddress = 'ws://localhost:9095';
+    // 9096, not 9095: the RDPDR rig on the direct-websocket-mode checkout owns
+    // 9095 (and vite 5180), and concurrent sessions must not fight over ports.
+    let gatewayAddress = 'ws://localhost:9096';
     let hostname = '10.10.100.78';
     let domain = 'peetinc';
     let kdc_proxy_url = '';
     let desktopSize = { width: 1280, height: 720 };
     let pop_up = false;
     let enable_clipboard = true;
+    // EGFX kill-switch for the T4 test matrix: unticking this must fall back to
+    // the legacy bitmap path and still render.
+    let enable_egfx = true;
 
     // e2e test-rig hook: RDPDR folder share. Populated via
     // window.showDirectoryPicker(); kept component-scoped (no module-level
@@ -188,7 +194,8 @@
             .withServerDomain(domain)
             .withAuthToken('')
             .withDesktopSize(desktopSize)
-            .withExtension(displayControl(true));
+            .withExtension(displayControl(true))
+            .withExtension(egfx(enable_egfx));
 
         if (kdc_proxy_url !== '') {
             configBuilder.withExtension(kdcProxyUrl(kdc_proxy_url));
@@ -385,6 +392,15 @@
                                     style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
                                 />
                                 <label for="enable_clipboard">Enable Clipboard</label>
+                            </div>
+                            <div class="checkbox-wrapper">
+                                <input
+                                    id="enable_egfx"
+                                    type="checkbox"
+                                    bind:checked={enable_egfx}
+                                    style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
+                                />
+                                <label for="enable_egfx">Enable EGFX</label>
                             </div>
                         </div>
                     </div>
