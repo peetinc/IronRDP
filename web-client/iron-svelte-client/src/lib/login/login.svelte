@@ -130,6 +130,12 @@
         // configured) — see iron-remote-desktop-rdp/src/extensions.ts.
         const printJobChunks = new Map<number, Uint8Array[]>();
 
+        // e2e bisect toggle: set false to test the drive share with NO printer
+        // device announced (both ride the same RDPDR channel via the composite
+        // backend, so a printer-side failure would take the drive down too).
+        const ENABLE_PRINTER = false;
+
+        if (ENABLE_PRINTER)
         configBuilder
             .withExtension(printerName('LithiumBridge Printer'))
             .withExtension(printerDriverName('Microsoft Print to PDF'))
@@ -209,7 +215,7 @@
     };
 
     onMount(async () => {
-        await init('DEBUG');
+        await init('INFO');
     });
 </script>
 
