@@ -20,6 +20,11 @@ pub(crate) struct OpenEntry {
     /// `fs_handle`.
     pub(crate) fs_handle: Option<u32>,
     pub(crate) is_dir: bool,
+    /// Set by a `FileDispositionInformation` SetInformation IRP with `delete_pending != 0`, and
+    /// honored when this handle is closed (delete-on-close, mirroring FreeRDP's
+    /// `file->delete_pending`): the deletion itself happens in the Close IRP path, never at
+    /// SetInformation time — the redirector still holds the file open when it sets this.
+    pub(crate) delete_pending: bool,
     /// Cached `DriveFs::list` result backing `IRP_MJ_DIRECTORY_CONTROL` /
     /// `QueryDirectory`, populated on the first query for this handle.
     pub(crate) dir_listing: Option<Vec<FsEntry>>,
@@ -70,6 +75,7 @@ impl DriveState {
                 path: path.into(),
                 fs_handle,
                 is_dir,
+                delete_pending: false,
                 dir_listing: None,
                 dir_cursor: 0,
             },

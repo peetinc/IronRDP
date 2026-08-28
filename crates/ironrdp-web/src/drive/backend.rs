@@ -247,6 +247,28 @@ impl WasmDriveBackend {
 
         let is_directory = create.create_options.contains(CreateOptions::FILE_DIRECTORY_FILE);
         let must_not_be_directory = create.create_options.contains(CreateOptions::FILE_NON_DIRECTORY_FILE);
+        // Windows opens temp files with delete-on-close at Create time, never sending a
+        // Disposition IRP at all — `ironrdp-rdpdr-native`'s Windows backend honors this create
+        // option, and requires DELETE access alongside it (INVALID_PARAMETER otherwise).
+        let delete_on_close = create.create_options.contains(CreateOptions::FILE_DELETE_ON_CLOSE);
+        if delete_on_close
+            && !create
+                .desired_access
+                .intersects(DesiredAccess::DELETE | DesiredAccess::GENERIC_ALL)
+        {
+            log_outgoing(
+                "DeviceCreateResponse",
+                create.device_io_request.completion_id,
+                create.device_io_request.device_id,
+                NtStatus::INVALID_PARAMETER,
+            );
+            let response = DeviceCreateResponse {
+                device_io_reply: DeviceIoResponse::new(create.device_io_request, NtStatus::INVALID_PARAMETER),
+                file_id: 0,
+                information: Information::empty(),
+            };
+            return vec![SvcMessage::from(RdpdrPdu::DeviceCreateResponse(response))];
+        }
         let creates_new = !matches!(create.create_disposition, CreateDisposition::FILE_OPEN);
         let truncates = matches!(
             create.create_disposition,
@@ -284,7 +306,13 @@ impl WasmDriveBackend {
 
             let (status, file_id, information) = match outcome {
                 Ok((fs_handle, is_dir)) => {
-                    let file_id = state.borrow_mut().open(path, fs_handle, is_dir);
+                    let mut state = state.borrow_mut();
+                    let file_id = state.open(path, fs_handle, is_dir);
+                    if delete_on_close {
+                        if let Some(entry) = state.get_mut(file_id) {
+                            entry.delete_pending = true;
+                        }
+                    }
                     (NtStatus::SUCCESS, file_id, create_information)
                 }
                 Err(err) => (create_status_for(&err), 0, Information::empty()),
@@ -314,7 +342,12 @@ impl WasmDriveBackend {
 
     fn dispatch_query_information(&self, req: ServerDriveQueryInformationRequest) -> Vec<SvcMessage> {
         let file_id = req.device_io_request.file_id;
-        let Some(path) = self.state.borrow().get(file_id).map(|entry| entry.path.clone()) else {
+        let Some((path, delete_pending)) = self
+            .state
+            .borrow()
+            .get(file_id)
+            .map(|entry| (entry.path.clone(), entry.delete_pending))
+        else {
             log_outgoing(
                 "ClientDriveQueryInformationResponse",
                 req.device_io_request.completion_id,
@@ -340,7 +373,7 @@ impl WasmDriveBackend {
 
         let future: LocalBoxFuture<'static, ()> = Box::pin(async move {
             let (status, buffer) = match fs.stat(&path).await {
-                Ok(entry) => match build_query_info(&class_lvl, &entry) {
+                Ok(entry) => match build_query_info(&class_lvl, &entry, delete_pending) {
                     Some(info) => (NtStatus::SUCCESS, Some(info)),
                     None => (NtStatus::NOT_SUPPORTED, None),
                 },
@@ -384,9 +417,12 @@ impl WasmDriveBackend {
             return vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(response))];
         };
 
-        let Some(fs_handle) = entry.fs_handle else {
+        let delete_pending = entry.delete_pending;
+
+        if entry.fs_handle.is_none() && !delete_pending {
             // Directory handles have nothing to close on the `DriveFs` side (see
-            // `OpenEntry::fs_handle`'s doc comment in `state.rs`).
+            // `OpenEntry::fs_handle`'s doc comment in `state.rs`), and with no deferred delete
+            // there is nothing async left to do.
             log_outgoing(
                 "DeviceCloseResponse",
                 req.device_io_request.completion_id,
@@ -397,17 +433,32 @@ impl WasmDriveBackend {
                 device_io_response: DeviceIoResponse::new(req.device_io_request, NtStatus::SUCCESS),
             };
             return vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(response))];
-        };
+        }
 
         let fs = Rc::clone(&self.fs);
         let tx = self.tx.clone();
         let (generation, spawned_generation) = self.spawn_generation();
         let device_io_request = req.device_io_request;
+        let fs_handle = entry.fs_handle;
+        let path = entry.path;
         let future: LocalBoxFuture<'static, ()> = Box::pin(async move {
-            let status = match fs.close(fs_handle).await {
-                Ok(()) => NtStatus::SUCCESS,
-                Err(err) => nt_status_for(&err),
+            let status = match fs_handle {
+                Some(fs_handle) => match fs.close(fs_handle).await {
+                    Ok(()) => NtStatus::SUCCESS,
+                    Err(err) => nt_status_for(&err),
+                },
+                None => NtStatus::SUCCESS,
             };
+            // Delete-on-close (mirroring FreeRDP's `drive_file_free`): the close above released
+            // this backend's own writable/handle first, so Chrome's FSA lock on a write-opened
+            // file is gone by the time the delete runs. Best-effort, like FreeRDP: the close
+            // status is what the redirector cares about, and there is no meaningful way to
+            // surface "closed fine, but the deferred delete failed" through a close response.
+            if delete_pending && status == NtStatus::SUCCESS {
+                if let Err(err) = fs.delete(&path).await {
+                    warn!(?err, path, "delete-on-close failed; file remains on the share");
+                }
+            }
             log_outgoing(
                 "DeviceCloseResponse",
                 device_io_request.completion_id,
@@ -686,7 +737,14 @@ impl WasmDriveBackend {
             FileInformationClass::Rename(rename) => {
                 // Same rule as `Create`'s path (see `dispatch_create`): a server-supplied path
                 // must clear `normalize_path` before it ever reaches `DriveFs`.
+                // `info!` (not `debug!`): rename failures have historically been invisible at the
+                // client's default INFO level, which left this exact rejection untraceable.
                 if !path_is_valid(&rename.file_name) {
+                    info!(
+                        file_id,
+                        target = rename.file_name,
+                        "rename rejected before DriveFs: target fails path validation"
+                    );
                     log_outgoing(
                         "ClientDriveSetInformationResponse",
                         req.device_io_request.completion_id,
@@ -702,8 +760,46 @@ impl WasmDriveBackend {
                 let (generation, spawned_generation) = self.spawn_generation();
                 let from = path;
                 let to = rename.file_name;
+                let replace_if_exists = rename.replace_if_exists == Boolean::True;
                 let future: LocalBoxFuture<'static, ()> = Box::pin(async move {
-                    let status = match fs.rename(&from, &to).await {
+                    // `replace_if_exists == False` must NOT clobber an existing destination
+                    // (`ironrdp-rdpdr-native`'s Windows backend passes the flag through to the
+                    // native rename; FreeRDP maps it to MOVEFILE_REPLACE_EXISTING). Our
+                    // copy+delete fallback overwrites unconditionally, so the collision has to
+                    // be rejected up front — checked BEFORE closing our own handle below, so a
+                    // rejected rename leaves the handle usable.
+                    if !replace_if_exists && fs.stat(&to).await.is_ok() {
+                        info!(file_id, from, to, "rename rejected: destination exists and replace_if_exists is unset");
+                        let message =
+                            set_information_message(&req, NtStatus::OBJECT_NAME_COLLISION).unwrap_or_else(|error| {
+                                warn!(
+                                    ?error,
+                                    "Failed to encode ClientDriveSetInformationResponse; sending UNSUCCESSFUL fallback"
+                                );
+                                set_information_fallback_message(&req, NtStatus::UNSUCCESSFUL)
+                            });
+                        send_completion_if_current(&tx, &generation, spawned_generation, vec![message]);
+                        return;
+                    }
+                    // Close this backend's own handle BEFORE renaming, like FreeRDP's Win32 path
+                    // does before `MoveFileExW` (`drive_file.c`, `#ifdef _WIN32`): Chrome's FSA
+                    // behaves Windows-like here — a file with an open writable is locked, so a
+                    // rename attempted while our own writable is open fails `NotAllowedError`.
+                    // Closing commits any pending swap-file content first, so the renamed file
+                    // carries everything written so far. The entry's `fs_handle` is cleared;
+                    // like FreeRDP after its CloseHandle, later read/write IRPs on this file_id
+                    // would fail — in practice the redirector closes the handle right after a
+                    // rename.
+                    if let Some(fs_handle) = fs_handle {
+                        let closed = fs.close(fs_handle).await;
+                        if let Some(entry) = state.borrow_mut().get_mut(file_id) {
+                            entry.fs_handle = None;
+                        }
+                        info!(file_id, from, ?closed, "rename: closed own handle before move");
+                    }
+                    let result = fs.rename(&from, &to).await;
+                    info!(file_id, from, to, ?result, "rename completed");
+                    let status = match result {
                         Ok(()) => {
                             if let Some(entry) = state.borrow_mut().get_mut(file_id) {
                                 entry.path = to;
@@ -730,37 +826,32 @@ impl WasmDriveBackend {
                 self.enqueue(future);
                 Ok(Vec::new())
             }
-            FileInformationClass::Disposition(disposition) if disposition.delete_pending != 0 => {
-                let fs = Rc::clone(&self.fs);
-                let tx = self.tx.clone();
-                let (generation, spawned_generation) = self.spawn_generation();
-                let target = path;
-                let future: LocalBoxFuture<'static, ()> = Box::pin(async move {
-                    let status = match fs.delete(&target).await {
-                        Ok(()) => NtStatus::SUCCESS,
-                        Err(err) => nt_status_for(&err),
-                    };
+            // Delete-on-close, mirroring FreeRDP (`drive_file.c`): SetInformation only records
+            // (or clears) the intent on the open entry; the actual deletion happens when the
+            // handle is closed (`dispatch_close`). Deleting immediately here — the previous
+            // behavior — removed a path the redirector still held open, and on Chrome's FSA a
+            // file with an open writable is locked, so the immediate delete could not succeed
+            // for a write-opened file at all.
+            FileInformationClass::Disposition(disposition) => {
+                // Only 0 and 1 are legal values (`ironrdp-rdpdr-native`'s Windows backend
+                // rejects anything else the same way).
+                if disposition.delete_pending > 1 {
                     log_outgoing(
                         "ClientDriveSetInformationResponse",
                         req.device_io_request.completion_id,
                         req.device_io_request.device_id,
-                        status,
+                        NtStatus::INVALID_PARAMETER,
                     );
-                    let message = set_information_message(&req, status).unwrap_or_else(|error| {
-                        warn!(
-                            ?error,
-                            "Failed to encode ClientDriveSetInformationResponse; sending UNSUCCESSFUL fallback"
-                        );
-                        set_information_fallback_message(&req, NtStatus::UNSUCCESSFUL)
-                    });
-                    send_completion_if_current(&tx, &generation, spawned_generation, vec![message]);
-                });
-                self.enqueue(future);
-                Ok(Vec::new())
-            }
-            // `Disposition` with `delete_pending == 0` (clearing a delete request we never
-            // actually deferred) is a trivial acknowledgement.
-            FileInformationClass::Disposition(_) => {
+                    return Ok(vec![set_information_message(&req, NtStatus::INVALID_PARAMETER)?]);
+                }
+                if let Some(entry) = self.state.borrow_mut().get_mut(file_id) {
+                    entry.delete_pending = disposition.delete_pending != 0;
+                }
+                debug!(
+                    file_id,
+                    delete_pending = disposition.delete_pending != 0,
+                    "FileDispositionInformation recorded; deletion deferred to close"
+                );
                 log_outgoing(
                     "ClientDriveSetInformationResponse",
                     req.device_io_request.completion_id,
@@ -1330,7 +1421,11 @@ fn entry_size_i64(entry: &FsEntry) -> i64 {
 
 /// Builds a `ClientDriveQueryInformationResponse` buffer for the classes this backend supports.
 /// `None` means "class not supported" (caller maps that to `NtStatus::NOT_SUPPORTED`).
-fn build_query_info(class_lvl: &FileInformationClassLevel, entry: &FsEntry) -> Option<FileInformationClass> {
+fn build_query_info(
+    class_lvl: &FileInformationClassLevel,
+    entry: &FsEntry,
+    delete_pending: bool,
+) -> Option<FileInformationClass> {
     if *class_lvl == FileInformationClassLevel::FILE_BASIC_INFORMATION {
         let (creation_time, last_access_time, last_write_time, change_time) = nt_times(entry);
         Some(
@@ -1350,7 +1445,9 @@ fn build_query_info(class_lvl: &FileInformationClassLevel, entry: &FsEntry) -> O
                 allocation_size: size,
                 end_of_file: size,
                 number_of_links: 1,
-                delete_pending: Boolean::False,
+                // FreeRDP reports its real `delete_pending` flag here (`drive_file.c`); Windows
+                // reads it back after setting a delete disposition.
+                delete_pending: if delete_pending { Boolean::True } else { Boolean::False },
                 directory: if entry.is_dir { Boolean::True } else { Boolean::False },
             }
             .into(),
@@ -2086,6 +2183,212 @@ mod tests {
         assert_eq!(status_of(&response), NtStatus::SUCCESS);
         harness.assert_no_completion();
         assert_eq!(read_all_via_fs(&fs, "\\stamped.txt"), b"content");
+    }
+
+    fn close_request(file_id: u32, completion_id: u32) -> DeviceCloseRequest {
+        DeviceCloseRequest {
+            device_io_request: dev_io_req(file_id, completion_id, MajorFunction::Close),
+        }
+    }
+
+    fn disposition_request(file_id: u32, completion_id: u32, delete_pending: u8) -> ServerDriveSetInformationRequest {
+        ServerDriveSetInformationRequest {
+            device_io_request: dev_io_req(file_id, completion_id, MajorFunction::SetInformation),
+            set_buffer: FileInformationClass::Disposition(FileDispositionInformation { delete_pending }),
+        }
+    }
+
+    #[test]
+    fn disposition_defers_delete_until_close() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\doomed.txt", b"bytes");
+        let mut harness = Harness::new(Rc::clone(&fs), false);
+
+        let created = only(
+            harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(open_request(
+                "\\doomed.txt",
+                1,
+            ))),
+        );
+        let file_id = read_u32_at(&encoded(&created), 16);
+
+        let disposed = only(harness.dispatch(ServerDriveIoRequest::ServerDriveSetInformationRequest(
+            disposition_request(file_id, 2, 1),
+        )));
+        assert_eq!(status_of(&disposed), NtStatus::SUCCESS);
+        // The file must STILL exist — the redirector holds it open; deletion happens at close.
+        assert_eq!(read_all_via_fs(&fs, "\\doomed.txt"), b"bytes");
+
+        let closed = only(harness.dispatch(ServerDriveIoRequest::DeviceCloseRequest(close_request(file_id, 3))));
+        assert_eq!(status_of(&closed), NtStatus::SUCCESS);
+
+        // Now it must be gone: a plain open comes back NO_SUCH_FILE.
+        let reopened = only(
+            harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(open_request(
+                "\\doomed.txt",
+                4,
+            ))),
+        );
+        assert_eq!(status_of(&reopened), NtStatus::NO_SUCH_FILE);
+    }
+
+    #[test]
+    fn disposition_cleared_cancels_delete_on_close() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\spared.txt", b"kept");
+        let mut harness = Harness::new(Rc::clone(&fs), false);
+
+        let created = only(
+            harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(open_request(
+                "\\spared.txt",
+                1,
+            ))),
+        );
+        let file_id = read_u32_at(&encoded(&created), 16);
+
+        only(harness.dispatch(ServerDriveIoRequest::ServerDriveSetInformationRequest(
+            disposition_request(file_id, 2, 1),
+        )));
+        only(harness.dispatch(ServerDriveIoRequest::ServerDriveSetInformationRequest(
+            disposition_request(file_id, 3, 0),
+        )));
+        let closed = only(harness.dispatch(ServerDriveIoRequest::DeviceCloseRequest(close_request(file_id, 4))));
+        assert_eq!(status_of(&closed), NtStatus::SUCCESS);
+        assert_eq!(read_all_via_fs(&fs, "\\spared.txt"), b"kept");
+    }
+
+    #[test]
+    fn disposition_invalid_value_is_invalid_parameter() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\v.txt", b"x");
+        let mut harness = Harness::new(fs, false);
+
+        let created = only(
+            harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(open_request("\\v.txt", 1))),
+        );
+        let file_id = read_u32_at(&encoded(&created), 16);
+
+        let response = only(harness.dispatch(ServerDriveIoRequest::ServerDriveSetInformationRequest(
+            disposition_request(file_id, 2, 2),
+        )));
+        assert_eq!(status_of(&response), NtStatus::INVALID_PARAMETER);
+        harness.assert_no_completion();
+    }
+
+    #[test]
+    fn standard_query_reports_delete_pending() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\flagged.txt", b"x");
+        let mut harness = Harness::new(fs, false);
+
+        let created = only(
+            harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(open_request(
+                "\\flagged.txt",
+                1,
+            ))),
+        );
+        let file_id = read_u32_at(&encoded(&created), 16);
+
+        only(harness.dispatch(ServerDriveIoRequest::ServerDriveSetInformationRequest(
+            disposition_request(file_id, 2, 1),
+        )));
+
+        let query = only(
+            harness.dispatch(ServerDriveIoRequest::ServerDriveQueryInformationRequest(
+                ServerDriveQueryInformationRequest {
+                    device_io_request: dev_io_req(file_id, 3, MajorFunction::QueryInformation),
+                    file_info_class_lvl: FileInformationClassLevel::FILE_STANDARD_INFORMATION,
+                },
+            )),
+        );
+        assert_eq!(status_of(&query), NtStatus::SUCCESS);
+        // FileStandardInformation layout after the 4-byte Length field at offset 16:
+        // AllocationSize(8) EndOfFile(8) NumberOfLinks(4) DeletePending(1) — offset 20+20 = 40.
+        let bytes = encoded(&query);
+        assert_eq!(bytes[40], 1, "DeletePending must read back as set");
+    }
+
+    #[test]
+    fn delete_on_close_create_option_deletes_at_close() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\temp.txt", b"scratch");
+        let mut harness = Harness::new(Rc::clone(&fs), false);
+
+        let created = only(harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(
+            DeviceCreateRequest {
+                device_io_request: dev_io_req(0, 1, MajorFunction::Create),
+                desired_access: DesiredAccess::FILE_READ_DATA_OR_FILE_LIST_DIRECTORY | DesiredAccess::DELETE,
+                allocation_size: 0,
+                file_attributes: FileAttributes::empty(),
+                shared_access: SharedAccess::empty(),
+                create_disposition: CreateDisposition::FILE_OPEN,
+                create_options: CreateOptions::FILE_DELETE_ON_CLOSE,
+                path: "\\temp.txt".to_string(),
+            },
+        )));
+        assert_eq!(status_of(&created), NtStatus::SUCCESS);
+        let file_id = read_u32_at(&encoded(&created), 16);
+
+        let closed = only(harness.dispatch(ServerDriveIoRequest::DeviceCloseRequest(close_request(file_id, 2))));
+        assert_eq!(status_of(&closed), NtStatus::SUCCESS);
+
+        let reopened = only(
+            harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(open_request(
+                "\\temp.txt",
+                3,
+            ))),
+        );
+        assert_eq!(status_of(&reopened), NtStatus::NO_SUCH_FILE);
+    }
+
+    #[test]
+    fn delete_on_close_without_delete_access_is_invalid_parameter() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\t2.txt", b"x");
+        let mut harness = Harness::new(fs, false);
+
+        let response = only(harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(
+            DeviceCreateRequest {
+                device_io_request: dev_io_req(0, 1, MajorFunction::Create),
+                desired_access: DesiredAccess::FILE_READ_DATA_OR_FILE_LIST_DIRECTORY,
+                allocation_size: 0,
+                file_attributes: FileAttributes::empty(),
+                shared_access: SharedAccess::empty(),
+                create_disposition: CreateDisposition::FILE_OPEN,
+                create_options: CreateOptions::FILE_DELETE_ON_CLOSE,
+                path: "\\t2.txt".to_string(),
+            },
+        )));
+        assert_eq!(status_of(&response), NtStatus::INVALID_PARAMETER);
+        harness.assert_no_completion();
+    }
+
+    #[test]
+    fn rename_without_replace_does_not_clobber_existing_destination() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\src.txt", b"source");
+        fs.seed_file("\\dst.txt", b"precious");
+        let mut harness = Harness::new(Rc::clone(&fs), false);
+
+        let created = only(
+            harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(open_request(
+                "\\src.txt", 1,
+            ))),
+        );
+        let file_id = read_u32_at(&encoded(&created), 16);
+
+        let renamed = only(harness.dispatch(ServerDriveIoRequest::ServerDriveSetInformationRequest(
+            ServerDriveSetInformationRequest {
+                device_io_request: dev_io_req(file_id, 2, MajorFunction::SetInformation),
+                set_buffer: FileInformationClass::Rename(FileRenameInformation {
+                    replace_if_exists: Boolean::False,
+                    file_name: "\\dst.txt".to_string(),
+                }),
+            },
+        )));
+        assert_eq!(status_of(&renamed), NtStatus::OBJECT_NAME_COLLISION);
+        assert_eq!(read_all_via_fs(&fs, "\\src.txt"), b"source");
+        assert_eq!(read_all_via_fs(&fs, "\\dst.txt"), b"precious");
     }
 
     #[test]
