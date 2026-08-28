@@ -52,6 +52,9 @@ pub struct Rdpdr {
     client_id: Option<u32>,
     server_capabilities_received: bool,
     client_id_confirmed: bool,
+    /// A Server User Logged On that arrived before Server Client ID Confirm,
+    /// replayed once the confirm lands. See `handle_user_logged_on`.
+    user_logged_on_deferred: bool,
     post_logon_devices_announced: bool,
     pending_device_announcements: Vec<u32>,
     pending_drive_removals: Vec<u32>,
@@ -78,6 +81,7 @@ impl Rdpdr {
             client_id: None,
             server_capabilities_received: false,
             client_id_confirmed: false,
+            user_logged_on_deferred: false,
             post_logon_devices_announced: false,
             pending_device_announcements: Vec::new(),
             pending_drive_removals: Vec::new(),
@@ -337,6 +341,7 @@ impl Rdpdr {
 
         self.server_capabilities_received = false;
         self.client_id_confirmed = false;
+        self.user_logged_on_deferred = false;
         self.post_logon_devices_announced = false;
         self.pending_device_announcements.clear();
         self.manually_announced_device_ids.clear();
@@ -416,6 +421,13 @@ impl Rdpdr {
 
         self.client_id_confirmed = true;
         self.post_logon_devices_announced = announce_all_devices;
+
+        // Replay a Server User Logged On that outran this confirm.
+        if core::mem::take(&mut self.user_logged_on_deferred) {
+            let mut messages = messages;
+            messages.extend(self.handle_user_logged_on()?);
+            return Ok(messages);
+        }
         Ok(messages)
     }
 
@@ -544,9 +556,19 @@ impl Rdpdr {
 
     fn handle_user_logged_on(&mut self) -> PduResult<Vec<SvcMessage>> {
         if !self.client_id_confirmed {
-            return Err(pdu_other_err!(
-                "received RDPDR user logged on before client ID confirmation"
-            ));
+            // NOT an error. MS-RDPEFS does not order Server User Logged On after
+            // Server Client ID Confirm — the server sends it when a user logs on
+            // and is free to pipeline it. It routinely arrives in the same read
+            // as Server Announce Request, which means we see it before we have
+            // even sent the Client Name Request that Client ID Confirm answers.
+            //
+            // Failing here propagates out of ActiveStage::process and kills the
+            // whole RDP session over a benign ordering. Defer instead and replay
+            // it from handle_client_id_confirm, so post-logon devices (a folder
+            // shared after sign-in) are still announced rather than dropped.
+            debug!("Deferring RDPDR user logged on until client ID confirmation");
+            self.user_logged_on_deferred = true;
+            return Ok(Vec::new());
         }
 
         let mut backend = self.backend.take().expect("missing rdpdr backend");
