@@ -48,6 +48,24 @@ use tracing::{debug, trace, warn};
 use super::fs::{DriveFs, FsEntry, FsError};
 use super::state::{DriveState, normalize_path};
 
+/// Maximum bytes this backend will honor from a single `DeviceReadRequest`, regardless of what
+/// the server actually asked for (`dispatch_read` clamps with `.min(MAX_DRIVE_READ_BYTES)`).
+///
+/// A SHORT READ is legal per MS-RDPEFS: `DeviceReadResponse` carries its own `Length`, and the
+/// redirector already has to handle getting back fewer bytes than requested (the same mechanism
+/// it needs for EOF) by issuing a follow-up read at the advanced offset. What is NOT legal in
+/// practice is the response size this backend used to hand back before this constant existed:
+/// Windows commonly requests up to 1 MiB in a single `DeviceReadRequest`, and
+/// `ironrdp_svc::CHANNEL_CHUNK_LENGTH` chunkifies a static virtual channel message at 1600
+/// bytes — a 1 MiB `DeviceReadResponse` becomes ~650 chunks reassembled by the server. Observed
+/// live: the RDPDR channel dies immediately after two such 1 MiB reads (Explorer surfaces
+/// `0x800703E3 ERROR_OPERATION_ABORTED`), and the entire share is unusable — can't browse, can't
+/// copy — for the rest of the session, the signature of a protocol/reassembly violation rather
+/// than a per-file error. 64 KiB keeps every response to ~41 chunks (comfortably away from
+/// whatever reassembly limit 1 MiB was hitting) while still being large enough to not tank
+/// throughput on a real file copy.
+const MAX_DRIVE_READ_BYTES: u32 = 64 * 1024;
+
 /// Message sent from [`WasmDriveBackend`] each time an async `DriveFs` operation completes and
 /// produces RDPDR completion PDU(s) to send back to the server.
 ///
@@ -463,13 +481,21 @@ impl WasmDriveBackend {
         let tx = self.tx.clone();
         let (generation, spawned_generation) = self.spawn_generation();
         let offset = req.offset;
-        let length = req.length;
+        let requested_len = req.length;
+        // See `MAX_DRIVE_READ_BYTES`'s own doc comment: a short read is legal MS-RDPEFS, a
+        // 1 MiB `DeviceReadResponse` on this static virtual channel is not (observed live to
+        // kill the channel outright).
+        let clamped_len = requested_len.min(MAX_DRIVE_READ_BYTES);
 
         let future: LocalBoxFuture<'static, ()> = Box::pin(async move {
-            let (status, read_data) = match fs.read(fs_handle, offset, length).await {
+            let (status, read_data) = match fs.read(fs_handle, offset, clamped_len).await {
                 Ok(data) => (NtStatus::SUCCESS, data),
                 Err(err) => (nt_status_for(&err), Vec::new()),
             };
+            debug!(
+                "[rdpdr-drive] dispatch_read offset={offset} requested_len={requested_len} clamped_len={clamped_len} returned_len={}",
+                read_data.len()
+            );
             log_outgoing(
                 "DeviceReadResponse",
                 device_io_request.completion_id,
@@ -1925,6 +1951,71 @@ mod tests {
         let bytes = encoded(&query);
         let file_attributes = read_u32_at(&bytes, 20);
         assert_eq!(file_attributes, FileAttributes::FILE_ATTRIBUTE_DIRECTORY.bits());
+    }
+
+    #[test]
+    fn large_read_request_is_clamped_to_64kib_from_the_right_offset() {
+        // Regression test: Windows commonly requests up to 1 MiB in a single DeviceReadRequest.
+        // Honoring that literally used to produce a ~650-chunk DeviceReadResponse on the static
+        // virtual channel (ironrdp_svc::CHANNEL_CHUNK_LENGTH == 1600 bytes) — observed live to
+        // kill the RDPDR channel outright after just two such reads. See
+        // `MAX_DRIVE_READ_BYTES`'s own doc comment.
+        let fs = Rc::new(MockFs::new());
+        let mut contents = vec![0u8; 70 * 1024];
+        for (i, byte) in contents.iter_mut().enumerate() {
+            *byte = u8::try_from(i % 251).expect("i % 251 fits in a u8");
+        }
+        fs.seed_file("\\big.bin", &contents);
+        let mut harness = Harness::new(fs, false);
+
+        let created = only(
+            harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(open_request(
+                "\\big.bin",
+                1,
+            ))),
+        );
+        let file_id = read_u32_at(&encoded(&created), 16);
+
+        let read = only(
+            harness.dispatch(ServerDriveIoRequest::DeviceReadRequest(DeviceReadRequest {
+                device_io_request: dev_io_req(file_id, 2, MajorFunction::Read),
+                length: 1024 * 1024,
+                offset: 0,
+            })),
+        );
+        assert_eq!(status_of(&read), NtStatus::SUCCESS);
+        let bytes = encoded(&read);
+        let data_len = read_u32_at(&bytes, 16) as usize;
+        assert_eq!(
+            data_len,
+            64 * 1024,
+            "a 1 MiB request against a file with 70 KiB available must be clamped to exactly 64 KiB, not the full 1 MiB nor the file's true remaining length"
+        );
+        assert_eq!(
+            &bytes[20..20 + data_len],
+            &contents[..64 * 1024],
+            "clamped read must still return the correct bytes starting at the requested offset"
+        );
+
+        // A follow-up read at the advanced offset — exactly the short-read recovery mechanism
+        // MS-RDPEFS already requires the redirector to implement (also used for EOF) — must
+        // pick up right where the first response left off.
+        let second_read = only(
+            harness.dispatch(ServerDriveIoRequest::DeviceReadRequest(DeviceReadRequest {
+                device_io_request: dev_io_req(file_id, 3, MajorFunction::Read),
+                length: 1024 * 1024,
+                offset: 64 * 1024,
+            })),
+        );
+        assert_eq!(status_of(&second_read), NtStatus::SUCCESS);
+        let second_bytes = encoded(&second_read);
+        let second_len = read_u32_at(&second_bytes, 16) as usize;
+        assert_eq!(
+            second_len,
+            70 * 1024 - 64 * 1024,
+            "remaining bytes in the file, still clamp-eligible but shorter than the cap"
+        );
+        assert_eq!(&second_bytes[20..20 + second_len], &contents[64 * 1024..]);
     }
 
     #[test]
