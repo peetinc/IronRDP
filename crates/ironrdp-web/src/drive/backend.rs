@@ -30,13 +30,14 @@ use ironrdp::rdpdr::pdu::efs::{
     ClientDriveSetInformationResponse, ClientDriveSetSecurityResponse, CreateDisposition, CreateOptions, DesiredAccess,
     DeviceCloseRequest, DeviceCloseResponse, DeviceControlResponse, DeviceCreateRequest, DeviceCreateResponse,
     DeviceFlushBuffersResponse, DeviceIoResponse, DeviceReadRequest, DeviceReadResponse, DeviceWriteRequest,
-    DeviceWriteResponse, FileAttributes, FileBasicInformation, FileBothDirectoryInformation, FileDirectoryInformation,
-    FileDispositionInformation, FileFsAttributeInformation, FileFsDeviceInformation, FileFsFullSizeInformation,
-    FileFsSizeInformation, FileFsVolumeInformation, FileFullDirectoryInformation, FileInformationClass,
-    FileInformationClassLevel, FileNamesInformation, FileStandardInformation, FileSystemAttributes,
-    FileSystemInformationClass, FileSystemInformationClassLevel, Information, NtStatus, PrinterIoRequest,
-    ServerDeviceAnnounceResponse, ServerDriveIoRequest, ServerDriveQueryDirectoryRequest,
-    ServerDriveQueryInformationRequest, ServerDriveQueryVolumeInformationRequest, ServerDriveSetInformationRequest,
+    DeviceWriteResponse, FileAttributeTagInformation, FileAttributes, FileBasicInformation,
+    FileBothDirectoryInformation, FileDirectoryInformation, FileDispositionInformation, FileFsAttributeInformation,
+    FileFsDeviceInformation, FileFsFullSizeInformation, FileFsSizeInformation, FileFsVolumeInformation,
+    FileFullDirectoryInformation, FileInformationClass, FileInformationClassLevel, FileNamesInformation,
+    FileStandardInformation, FileSystemAttributes, FileSystemInformationClass, FileSystemInformationClassLevel,
+    Information, NtStatus, PrinterIoRequest, ServerDeviceAnnounceResponse, ServerDriveIoRequest,
+    ServerDriveQueryDirectoryRequest, ServerDriveQueryInformationRequest, ServerDriveQueryVolumeInformationRequest,
+    ServerDriveSetInformationRequest,
 };
 use ironrdp::rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
 use ironrdp_core::{EncodeResult, impl_as_any};
@@ -1176,6 +1177,19 @@ fn build_query_info(class_lvl: &FileInformationClassLevel, entry: &FsEntry) -> O
             }
             .into(),
         )
+    } else if *class_lvl == FileInformationClassLevel::FILE_ATTRIBUTE_TAG_INFORMATION {
+        // Windows queries this on the source file during Explorer copy/move operations;
+        // FreeRDP's own drive backend answers exactly three query classes — Basic, Standard,
+        // and this one — so leaving it `NOT_SUPPORTED` (the `None` fallback below) aborts the
+        // copy and, worse, tears down the whole redirected share for the rest of the session.
+        // We never expose reparse points, so `reparse_tag` is always 0.
+        Some(
+            FileAttributeTagInformation {
+                file_attributes: attrs_for(entry.is_dir),
+                reparse_tag: 0,
+            }
+            .into(),
+        )
     } else {
         None
     }
@@ -1845,6 +1859,72 @@ mod tests {
             )),
         );
         assert_eq!(status_of(&response), NtStatus::INVALID_HANDLE);
+    }
+
+    #[test]
+    fn query_information_file_attribute_tag_returns_success_with_decodable_buffer() {
+        // Regression test: Windows queries FileAttributeTagInformation on the source file
+        // during Explorer copy/move operations (FreeRDP's own drive backend answers exactly
+        // three query classes: Basic, Standard, and this one). Before this fix, this class
+        // fell through to the NOT_SUPPORTED default — the one non-SUCCESS status observed in
+        // a live capture — which aborted the copy AND tore down the whole share for the rest
+        // of the session.
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\hello.txt", b"hello world");
+        let mut harness = Harness::new(fs, false);
+
+        let created = only(
+            harness.dispatch(ServerDriveIoRequest::ServerCreateDriveRequest(open_request(
+                "\\hello.txt",
+                1,
+            ))),
+        );
+        let file_id = read_u32_at(&encoded(&created), 16);
+
+        let query = only(
+            harness.dispatch(ServerDriveIoRequest::ServerDriveQueryInformationRequest(
+                ServerDriveQueryInformationRequest {
+                    device_io_request: dev_io_req(file_id, 2, MajorFunction::QueryInformation),
+                    file_info_class_lvl: FileInformationClassLevel::FILE_ATTRIBUTE_TAG_INFORMATION,
+                },
+            )),
+        );
+        assert_eq!(status_of(&query), NtStatus::SUCCESS);
+
+        let bytes = encoded(&query);
+        // 16-byte SharedHeader+DeviceIoResponse prefix, then a 4-byte Length field, then the
+        // FileAttributeTagInformation buffer itself: FileAttributes(u32 LE) + ReparseTag(u32 LE)
+        // per MS-FSCC 2.4.6 — see `FileAttributeTagInformation::size()` in ironrdp-rdpdr's efs.rs.
+        let length = read_u32_at(&bytes, 16);
+        assert_eq!(
+            length, 8,
+            "FileAttributeTagInformation must be exactly 8 bytes on the wire"
+        );
+        let file_attributes = read_u32_at(&bytes, 20);
+        let reparse_tag = read_u32_at(&bytes, 24);
+        assert_eq!(file_attributes, FileAttributes::FILE_ATTRIBUTE_NORMAL.bits());
+        assert_eq!(reparse_tag, 0, "this backend never exposes reparse points");
+    }
+
+    #[test]
+    fn query_information_file_attribute_tag_on_directory_reports_directory_attribute() {
+        let fs = Rc::new(MockFs::new());
+        fs.seed_dir("\\dir");
+        let mut harness = Harness::new(fs, false);
+        let file_id = open_dir(&mut harness, "\\dir", 1);
+
+        let query = only(
+            harness.dispatch(ServerDriveIoRequest::ServerDriveQueryInformationRequest(
+                ServerDriveQueryInformationRequest {
+                    device_io_request: dev_io_req(file_id, 2, MajorFunction::QueryInformation),
+                    file_info_class_lvl: FileInformationClassLevel::FILE_ATTRIBUTE_TAG_INFORMATION,
+                },
+            )),
+        );
+        assert_eq!(status_of(&query), NtStatus::SUCCESS);
+        let bytes = encoded(&query);
+        let file_attributes = read_u32_at(&bytes, 20);
+        assert_eq!(file_attributes, FileAttributes::FILE_ATTRIBUTE_DIRECTORY.bits());
     }
 
     #[test]
