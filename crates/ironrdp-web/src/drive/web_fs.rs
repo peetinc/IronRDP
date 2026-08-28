@@ -383,6 +383,35 @@ impl DriveFs for WebFsDrive {
 
             let from_parent = self.resolve_dir(from_parent_components).await?;
 
+            // Fast path: Chromium ships a non-standard `FileSystemHandle.move()` that renames in
+            // place. It is strictly better than the copy+delete fallback below — it is atomic, it
+            // does not read the whole file into memory, it works on DIRECTORIES (which the
+            // fallback cannot do at all), and crucially it succeeds while the redirector still
+            // holds the source file open, which is exactly the state Explorer performs a rename
+            // in. No web-sys binding exists for a non-standard method, hence `Reflect`.
+            //
+            // Only used for a same-directory rename (`to` has the same parent as `from`), which
+            // is what Explorer's F2 rename issues; a cross-directory move still takes the
+            // fallback so the semantics stay identical to what was there before.
+            if from_parent_components == to_parent_components {
+                if let Ok(handle) = JsFuture::from(from_parent.get_file_handle(from_name))
+                    .await
+                    .or(JsFuture::from(from_parent.get_directory_handle(from_name)).await)
+                {
+                    if let Ok(move_fn) = Reflect::get(&handle, &JsValue::from_str("move")) {
+                        if let Some(move_fn) = move_fn.dyn_ref::<js_sys::Function>() {
+                            match move_fn.call1(&handle, &JsValue::from_str(to_name)) {
+                                Ok(promise) => {
+                                    let promise: js_sys::Promise = promise.unchecked_into();
+                                    return JsFuture::from(promise).await.map(|_| ()).map_err(fs_error_from_js);
+                                }
+                                Err(err) => return Err(fs_error_from_js(err)),
+                            }
+                        }
+                    }
+                }
+            }
+
             match JsFuture::from(from_parent.get_file_handle(from_name)).await {
                 Ok(value) => {
                     let file_handle: FileSystemFileHandle = value.unchecked_into();
