@@ -26,14 +26,14 @@ use futures_util::future::LocalBoxFuture;
 use ironrdp::rdpdr::backend::RdpdrBackend;
 use ironrdp::rdpdr::pdu::RdpdrPdu;
 use ironrdp::rdpdr::pdu::efs::{
-    Boolean, Characteristics, ClientDriveLockControlResponse, ClientDriveQueryDirectoryResponse,
+    Boolean, ClientDriveLockControlResponse, ClientDriveQueryDirectoryResponse,
     ClientDriveQueryInformationResponse, ClientDriveQuerySecurityResponse, ClientDriveQueryVolumeInformationResponse,
     ClientDriveSetInformationResponse, ClientDriveSetSecurityResponse, CreateDisposition, CreateOptions, DesiredAccess,
     DeviceCloseRequest, DeviceCloseResponse, DeviceControlResponse, DeviceCreateRequest, DeviceCreateResponse,
     DeviceFlushBuffersResponse, DeviceIoResponse, DeviceReadRequest, DeviceReadResponse, DeviceWriteRequest,
     DeviceWriteResponse, FileAttributeTagInformation, FileAttributes, FileBasicInformation,
     FileBothDirectoryInformation, FileDirectoryInformation, FileDispositionInformation, FileFsAttributeInformation,
-    FileFsDeviceInformation, FileFsFullSizeInformation, FileFsSizeInformation, FileFsVolumeInformation,
+    FileFsFullSizeInformation, FileFsSizeInformation, FileFsVolumeInformation,
     FileFullDirectoryInformation, FileInformationClass, FileInformationClassLevel, FileNamesInformation,
     FileStandardInformation, FileSystemAttributes, FileSystemInformationClass, FileSystemInformationClassLevel,
     Information, NtStatus, PrinterIoRequest, ServerDeviceAnnounceResponse, ServerDriveIoRequest,
@@ -124,7 +124,7 @@ pub(crate) struct WasmDriveBackend {
     /// client answers them in order, one at a time. Running them concurrently is spec-legal but
     /// untested interop territory, and it lets N pipelined 1 MiB reads hold N response buffers
     /// (plus their JS-side `ArrayBuffer`s) alive at once. Serial execution bounds that to one.
-    queue: Rc<RefCell<VecDeque<LocalBoxFuture<'static, ()>>>>,
+    queue: Rc<RefCell<VecDeque<(&'static str, LocalBoxFuture<'static, ()>)>>>,
     /// Whether the drain worker spawned by [`Self::enqueue`] is currently running.
     draining: Rc<Cell<bool>>,
 }
@@ -182,8 +182,19 @@ impl WasmDriveBackend {
     /// `reset()` deliberately does NOT clear this queue: a queued stale-generation future still
     /// runs (its `DriveFs` side effects happen, matching the previous concurrent behavior), but
     /// its completion is dropped by `send_completion_if_current`.
-    fn enqueue(&self, future: LocalBoxFuture<'static, ()>) {
-        self.queue.borrow_mut().push_back(future);
+    fn enqueue(&self, label: &'static str, future: LocalBoxFuture<'static, ()>) {
+        let depth = {
+            let mut queue = self.queue.borrow_mut();
+            queue.push_back((label, future));
+            queue.len()
+        };
+        // A single FSA promise that never settles wedges this queue silently — the share then
+        // looks dead with zero console errors. Surface the backlog at WARN so that failure mode
+        // is diagnosable at the client's default level; the `label` of the entry the worker is
+        // stuck on shows in the debug-level start/end pair below.
+        if depth > 16 && depth.is_multiple_of(16) {
+            warn!(depth, label, "drive IRP queue backing up — possible wedged IRP");
+        }
         if self.draining.get() {
             return;
         }
@@ -194,7 +205,11 @@ impl WasmDriveBackend {
             loop {
                 let next = queue.borrow_mut().pop_front();
                 match next {
-                    Some(irp_future) => irp_future.await,
+                    Some((label, irp_future)) => {
+                        debug!(label, "irp exec start");
+                        irp_future.await;
+                        debug!(label, "irp exec end");
+                    }
                     None => break,
                 }
             }
@@ -336,7 +351,7 @@ impl WasmDriveBackend {
                 vec![SvcMessage::from(RdpdrPdu::DeviceCreateResponse(response))],
             );
         });
-        self.enqueue(future);
+        self.enqueue("create", future);
         Vec::new()
     }
 
@@ -398,7 +413,7 @@ impl WasmDriveBackend {
                 ))],
             );
         });
-        self.enqueue(future);
+        self.enqueue("query_information", future);
         Vec::new()
     }
 
@@ -475,7 +490,7 @@ impl WasmDriveBackend {
                 vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(response))],
             );
         });
-        self.enqueue(future);
+        self.enqueue("close", future);
         Vec::new()
     }
 
@@ -570,7 +585,7 @@ impl WasmDriveBackend {
                 vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryDirectoryResponse(response))],
             );
         });
-        self.enqueue(future);
+        self.enqueue("query_directory", future);
         Vec::new()
     }
 
@@ -632,7 +647,7 @@ impl WasmDriveBackend {
                 vec![SvcMessage::from(RdpdrPdu::DeviceReadResponse(response))],
             );
         });
-        self.enqueue(future);
+        self.enqueue("read", future);
         Vec::new()
     }
 
@@ -695,7 +710,7 @@ impl WasmDriveBackend {
                 vec![SvcMessage::from(RdpdrPdu::DeviceWriteResponse(response))],
             );
         });
-        self.enqueue(future);
+        self.enqueue("write", future);
         Vec::new()
     }
 
@@ -823,7 +838,7 @@ impl WasmDriveBackend {
                     });
                     send_completion_if_current(&tx, &generation, spawned_generation, vec![message]);
                 });
-                self.enqueue(future);
+                self.enqueue("rename", future);
                 Ok(Vec::new())
             }
             // Delete-on-close, mirroring FreeRDP (`drive_file.c`): SetInformation only records
@@ -946,7 +961,7 @@ impl WasmDriveBackend {
             });
             send_completion_if_current(&tx, &generation, spawned_generation, vec![message]);
         });
-        self.enqueue(future);
+        self.enqueue("set_len", future);
         Ok(Vec::new())
     }
 }
@@ -977,7 +992,7 @@ impl RdpdrBackend for WasmDriveBackend {
                     let _ = fs.close(handle).await;
                 }
             });
-            self.enqueue(future);
+            self.enqueue("reset_close", future);
         }
 
         Ok(())
@@ -1617,15 +1632,12 @@ fn build_volume_info(fs_info_class_lvl: &FileSystemInformationClassLevel) -> Opt
             }
             .into(),
         )
-    } else if *fs_info_class_lvl == FileSystemInformationClassLevel::FILE_FS_DEVICE_INFORMATION {
-        Some(
-            FileFsDeviceInformation {
-                device_type: 0x0000_0007, // FILE_DEVICE_DISK, MS-FSCC 2.5.10
-                characteristics: Characteristics::empty(),
-            }
-            .into(),
-        )
     } else {
+        // Includes FILE_FS_DEVICE_INFORMATION, deliberately: per `ironrdp-rdpdr-native`'s
+        // volume.rs, `mstscax.dll!W32Drive::MsgIrpQueryVolumeInfo` recognizes only the four
+        // classes above and expects this one to fail — answering it SUCCESS with a buffer the
+        // redirector does not parse for this class is worse than the expected error. (The
+        // `None` fallback maps to a non-success status in `query_volume_information_response`.)
         None
     }
 }
@@ -1634,6 +1646,10 @@ fn query_volume_information_response(req: ServerDriveQueryVolumeInformationReque
     let buffer = build_volume_info(&req.fs_info_class_lvl);
     let status = if buffer.is_some() {
         NtStatus::SUCCESS
+    } else if req.fs_info_class_lvl == FileSystemInformationClassLevel::FILE_FS_DEVICE_INFORMATION {
+        // The exact status mstscax maps ERROR_INVALID_FUNCTION to for this class — see
+        // `build_volume_info`'s fallback comment.
+        NtStatus::INVALID_DEVICE_REQUEST
     } else {
         NtStatus::NOT_SUPPORTED
     };
