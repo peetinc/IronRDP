@@ -561,7 +561,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
         let use_display_control = self.0.borrow().use_display_control;
 
-        let (connection_result, stream) = connect(ConnectParams {
+        let (connection_result, stream, rdp_leftover) = connect(ConnectParams {
             ws,
             config,
             destination,
@@ -598,7 +598,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             set_cursor_style_callback_context,
 
             input_events_rx: RefCell::new(Some(input_events_rx)),
-            rdp_reader: RefCell::new(Some(rdp_reader)),
+            rdp_reader: RefCell::new(Some((rdp_reader, rdp_leftover))),
             connection_result: RefCell::new(Some(connection_result)),
             clipboard: RefCell::new(Some(clipboard)),
             printer: RefCell::new(Some(printer)),
@@ -673,7 +673,7 @@ pub(crate) struct Session {
     // Consumed when `run` is called
     input_events_rx: RefCell<Option<mpsc::UnboundedReceiver<RdpInputEvent>>>,
     connection_result: RefCell<Option<connector::ConnectionResult>>,
-    rdp_reader: RefCell<Option<ReadHalf<RdpStream>>>,
+    rdp_reader: RefCell<Option<(ReadHalf<RdpStream>, bytes::BytesMut)>>,
     clipboard: RefCell<Option<Option<WasmClipboard>>>,
     printer: RefCell<Option<Option<WasmPrinter>>>,
 
@@ -732,7 +732,7 @@ impl iron_remote_desktop::Session for Session {
     type Error = IronError;
 
     async fn run(&self) -> Result<Self::SessionTerminationInfo, Self::Error> {
-        let rdp_reader = self
+        let (rdp_reader, rdp_leftover) = self
             .rdp_reader
             .borrow_mut()
             .take()
@@ -753,7 +753,10 @@ impl iron_remote_desktop::Session for Session {
         let mut clipboard = self.clipboard.borrow_mut().take().expect("run called only once");
         let mut wasm_printer = self.printer.borrow_mut().take().expect("run called only once");
 
-        let mut framed = ironrdp_futures::LocalFuturesFramed::new(rdp_reader);
+        // Any post-finalization PDUs that coalesced into the connector's last read
+        // (typically the server's DVC capabilities request) are in `rdp_leftover`
+        // and must be replayed ahead of fresh socket reads — see `connect()`.
+        let mut framed = ironrdp_futures::LocalFuturesFramed::new_with_leftover(rdp_reader, rdp_leftover);
 
         debug!("Initialize canvas");
 
@@ -1859,7 +1862,7 @@ async fn connect(
         computer_name,
         use_display_control,
     }: ConnectParams,
-) -> Result<(connector::ConnectionResult, RdpStream), IronError> {
+) -> Result<(connector::ConnectionResult, RdpStream, bytes::BytesMut), IronError> {
     let framed = ironrdp_futures::LocalFuturesFramed::new(ws);
 
     // In web browser environments, we do not have an easy access to the local address of the socket.
@@ -1871,6 +1874,20 @@ async fn connect(
         connector.attach_static_channel(CliprdrClient::new(Box::new(clipboard_backend)));
     }
 
+    // RDPSND is attached unconditionally, like every real-world client (mstsc,
+    // FreeRDP). Windows gates more than audio on its presence:
+    //   - RDPDR: servers only speak on it when RDPSND is advertised too
+    //     (MS-RDPEFS Appendix A<1>).
+    //   - DRDYNVC: observed empirically against Windows Server — with only
+    //     cliprdr + drdynvc announced, the server completed the connection and
+    //     then never initiated the DVC capability exchange at all (no EGFX, no
+    //     DisplayControl), going silent after Font Map and dropping the session
+    //     60 seconds later. The identical build with RDPSND announced gets the
+    //     DVC caps request immediately after finalization.
+    // We do not play audio in the web client; the no-op processor exists to
+    // satisfy those dependencies.
+    connector.attach_static_channel(Rdpsnd::new(Box::new(NoopRdpsndBackend)));
+
     // Drive and printer redirection coexist on the one RDPDR channel `Rdpdr` accepts a single
     // backend for, via `WasmCompositeBackend` — see `drive::composite`'s module doc comment for
     // how it routes each IRP-handling method to whichever member is configured. Both device
@@ -1881,12 +1898,11 @@ async fn connect(
     // so a session that starts with no redirection would otherwise be permanently unable to
     // mount a folder the user picks mid-session. Announcing zero devices on an otherwise idle
     // channel is what mstsc does when redirection is enabled with nothing to redirect.
+    //
+    // RDPSND used to be attached here, inside this block; it now goes up
+    // unconditionally with the other static channels above, because Windows
+    // gates the DVC capability exchange on it and not just RDPDR.
     {
-        // Windows servers only speak on RDPDR when RDPSND is advertised too
-        // (MS-RDPEFS Appendix A<1>). We do not play audio in the web client,
-        // but the no-op RDPSND processor satisfies that channel dependency.
-        connector.attach_static_channel(Rdpsnd::new(Box::new(NoopRdpsndBackend)));
-
         // `DRIVE_DEVICE_ID` is a fixed constant but `printer_device_id` is caller-settable via
         // the `printerDeviceId()` extension — resolve a collision deterministically before
         // either device is announced (see `resolve_drive_device_id`'s doc comment). Mandatory
@@ -1962,9 +1978,23 @@ async fn connect(
     )
     .await?;
 
-    let stream = framed.into_inner_no_leftover();
+    // The leftover MUST travel with the stream. Windows sends its first
+    // post-connection PDUs — the DRDYNVC capabilities request, CLIPRDR
+    // capabilities, RDPSND formats — immediately after the Font Map, and over a
+    // buffered transport they routinely coalesce into the same read. Whatever
+    // arrived beyond the last finalization PDU is sitting in this framed's
+    // buffer; the previous `into_inner_no_leftover()` silently discarded it
+    // (its debug_assert is compiled out in release wasm). Losing the DVC caps
+    // request means the server never gets a caps response, initiates nothing
+    // further — no EGFX, no DisplayControl, no clipboard — and drops the
+    // session after its 60-second timeout. Whether the burst coalesced was a
+    // network-timing race, which is why this presented as sessions that
+    // sometimes worked and usually sat on a black canvas until disconnect.
+    // The native client has always threaded leftovers through every handoff
+    // (`TokioFramed::new_with_leftover`).
+    let (stream, leftover) = framed.into_inner();
 
-    Ok((connection_result, stream))
+    Ok((connection_result, stream, leftover))
 }
 
 /// Direct connection mode (no RDCleanPath, no TLS-terminating proxy).
