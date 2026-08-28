@@ -29,11 +29,29 @@ import { WebSocketServer } from 'ws';
 import * as net from 'net';
 import * as tls from 'tls';
 import * as crypto from 'crypto';
+import * as fs from 'fs';
 
 const listenPort = parseInt(process.argv[2] || '8765', 10);
 const targetAddr = process.argv[3] || 'localhost:3389';
 const [targetHost, targetPortStr] = targetAddr.split(':');
 const targetPort = parseInt(targetPortStr || '3389', 10);
+
+// Passive wire capture (post-TLS plaintext). Record format, repeated:
+//   [dir u8: 0=client->server, 1=server->client][ts_ms f64 LE][len u32 LE][payload]
+// Client->server frames carry full payload (our RDPDR responses live here);
+// server->client records are length-only (payload omitted) to skip the GFX flood.
+const capturePath = process.env.RDP_CAPTURE || null;
+const captureStream = capturePath ? fs.createWriteStream(capturePath) : null;
+if (capturePath) console.log(`[proxy] Capturing wire traffic to ${capturePath}`);
+function capture(dir, buf) {
+  if (!captureStream) return;
+  const includeBody = dir === 0;
+  const header = Buffer.alloc(13);
+  header.writeUInt8(dir, 0);
+  header.writeDoubleLE(Date.now(), 1);
+  header.writeUInt32LE(buf.length, 9);
+  captureStream.write(includeBody ? Buffer.concat([header, buf]) : header);
+}
 
 const wss = new WebSocketServer({ port: listenPort });
 console.log(`[proxy] Listening on ws://localhost:${listenPort}`);
@@ -167,6 +185,7 @@ wss.on('connection', (ws, req) => {
 
       // Now relay all TLS data to browser
       tlsSocket.on('data', (data) => {
+        capture(1, data);
         if (ws.readyState === ws.OPEN) {
           ws.send(data);
         }
@@ -208,6 +227,7 @@ wss.on('connection', (ws, req) => {
     }
 
     if (tcpReady && activeSocket && !activeSocket.destroyed) {
+      if (tlsUpgraded) capture(0, buf);
       activeSocket.write(buf);
     } else {
       // Buffer until TCP is connected
