@@ -49,8 +49,11 @@ use ironrdp::rdpdr::pdu::efs::{
     ServerDeviceAnnounceResponse, ServerDriveIoRequest,
 };
 use ironrdp::rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
+use core::cell::RefCell;
+use std::rc::Rc;
+
 use ironrdp_core::impl_as_any;
-use ironrdp_pdu::PduResult;
+use ironrdp_pdu::{PduResult, pdu_other_err};
 use ironrdp_svc::SvcMessage;
 use tracing::{debug, warn};
 
@@ -66,25 +69,36 @@ use crate::printer::WasmPrinterBackend;
 /// matching backend is `Some`) — they exist only to route
 /// [`RdpdrBackend::handle_server_device_announce_response`], the one method `Rdpdr` calls for
 /// both device types through a single entry point (see this module's doc comment).
+/// The drive member, shared with the session so a folder picked mid-session can be installed
+/// without reaching back into `Rdpdr`'s private backend slot. Holding it behind `Rc<RefCell<_>>`
+/// is what makes [`RdpdrBackend::add_drive`] — and therefore
+/// [`ironrdp::rdpdr::Rdpdr::add_dynamic_drive`] — implementable here: the channel hands us only a
+/// device id, never a filesystem, so the filesystem has to arrive through a side channel the
+/// session already owns a handle to.
+pub(crate) type DriveSlot = Rc<RefCell<Option<(WasmDriveBackend, u32)>>>;
+
 #[derive(Debug)]
 pub(crate) struct WasmCompositeBackend {
     printer: Option<WasmPrinterBackend>,
     printer_device_id: Option<u32>,
-    drive: Option<WasmDriveBackend>,
-    drive_device_id: Option<u32>,
+    drive: DriveSlot,
 }
 
 impl_as_any!(WasmCompositeBackend);
 
+// SAFETY: same single-threaded argument as `WasmDriveBackend`'s own `unsafe impl Send` (see its
+// doc comment): `RdpdrBackend: Send` is an unconditional supertrait bound of the SVC processor's
+// `Box<dyn RdpdrBackend>` storage, not evidence that this backend is ever moved across a real OS
+// thread. The `Rc<RefCell<_>>` drive slot is created, cloned, and borrowed exclusively on the
+// wasm event loop (or, in native tests, one harness thread).
+unsafe impl Send for WasmCompositeBackend {}
+
 impl WasmCompositeBackend {
     /// Builds a composite from whichever of `printer` / `drive` were configured for this
-    /// session, each paired with the device id it will be announced under.
-    pub(crate) fn new(printer: Option<(WasmPrinterBackend, u32)>, drive: Option<(WasmDriveBackend, u32)>) -> Self {
+    /// session, each paired with the device id it will be announced under. The drive slot may be
+    /// empty at connect and filled later — see [`DriveSlot`].
+    pub(crate) fn new(printer: Option<(WasmPrinterBackend, u32)>, drive: DriveSlot) -> Self {
         let (printer, printer_device_id) = match printer {
-            Some((backend, device_id)) => (Some(backend), Some(device_id)),
-            None => (None, None),
-        };
-        let (drive, drive_device_id) = match drive {
             Some((backend, device_id)) => (Some(backend), Some(device_id)),
             None => (None, None),
         };
@@ -92,8 +106,11 @@ impl WasmCompositeBackend {
             printer,
             printer_device_id,
             drive,
-            drive_device_id,
         }
+    }
+
+    fn drive_device_id(&self) -> Option<u32> {
+        self.drive.borrow().as_ref().map(|(_, device_id)| *device_id)
     }
 }
 
@@ -107,7 +124,7 @@ impl RdpdrBackend for WasmCompositeBackend {
         if let Some(printer) = &mut self.printer {
             printer.reset()?;
         }
-        if let Some(drive) = &mut self.drive {
+        if let Some((drive, _)) = self.drive.borrow_mut().as_mut() {
             drive.reset()?;
         }
         Ok(())
@@ -121,8 +138,8 @@ impl RdpdrBackend for WasmCompositeBackend {
     /// visible instead of invisible.
     fn handle_server_device_announce_response(&mut self, pdu: ServerDeviceAnnounceResponse) -> PduResult<()> {
         let device_id = pdu.device_id;
-        if self.drive_device_id == Some(device_id) {
-            if let Some(drive) = &mut self.drive {
+        if self.drive_device_id() == Some(device_id) {
+            if let Some((drive, _)) = self.drive.borrow_mut().as_mut() {
                 return drive.handle_server_device_announce_response(pdu);
             }
         }
@@ -158,8 +175,8 @@ impl RdpdrBackend for WasmCompositeBackend {
     /// module's doc comment), so an absent `drive` member here is the "drive redirection was
     /// never configured for this session" case, not a routing ambiguity.
     fn handle_drive_io_request(&mut self, req: ServerDriveIoRequest) -> PduResult<Vec<SvcMessage>> {
-        match &mut self.drive {
-            Some(drive) => {
+        match self.drive.borrow_mut().as_mut() {
+            Some((drive, _)) => {
                 debug!("[rdpdr-drive] composite: routing drive IRP to the configured drive member");
                 drive.handle_drive_io_request(req)
             }
@@ -167,6 +184,21 @@ impl RdpdrBackend for WasmCompositeBackend {
                 debug!("[rdpdr-drive] composite: no drive member configured; using not-configured fallback");
                 Ok(drive_not_configured_response(req))
             }
+        }
+    }
+
+    /// Activates a filesystem device announced mid-session by
+    /// [`ironrdp::rdpdr::Rdpdr::add_dynamic_drive`]. The channel passes only the device id, so
+    /// the session installs the backend into the shared [`DriveSlot`] first and this method's
+    /// job is to confirm the slot really holds that device — otherwise the channel would
+    /// announce a drive whose IRPs land on the not-configured fallback.
+    fn add_drive(&mut self, device_id: u32) -> PduResult<()> {
+        match self.drive.borrow().as_ref() {
+            Some((_, staged_id)) if *staged_id == device_id => Ok(()),
+            Some(_) => Err(pdu_other_err!(
+                "dynamic drive activation asked for a device id the staged backend does not carry"
+            )),
+            None => Err(pdu_other_err!("no drive backend staged for dynamic activation")),
         }
     }
 
@@ -377,7 +409,7 @@ mod tests {
                 (WasmDriveBackend::new(drive_tx, fs, false, spawn), DRIVE_DEVICE_ID)
             });
 
-            let backend = WasmCompositeBackend::new(printer_member, drive_member);
+            let backend = WasmCompositeBackend::new(printer_member, Rc::new(RefCell::new(drive_member)));
             Self {
                 backend,
                 printer_rx,
@@ -408,6 +440,58 @@ mod tests {
                 other => panic!("unexpected event: {other:?}"),
             }
         }
+    }
+
+    /// `add_drive` is what `Rdpdr::add_dynamic_drive` calls to activate a mid-session folder
+    /// share. It must accept exactly the device the session staged and reject anything else,
+    /// because the channel announces the device only after this returns Ok.
+    #[test]
+    fn add_drive_accepts_the_staged_device_and_rejects_others() {
+        let fs = Rc::new(MockFs::new());
+        let mut harness = Harness::new(false, Some(fs));
+
+        harness.backend.add_drive(DRIVE_DEVICE_ID).expect("staged device activates");
+        harness
+            .backend
+            .add_drive(DRIVE_DEVICE_ID + 1)
+            .expect_err("a device the staged backend does not carry must not activate");
+    }
+
+    #[test]
+    fn add_drive_without_a_staged_backend_is_an_error() {
+        let mut harness = Harness::new(true, None);
+
+        harness
+            .backend
+            .add_drive(DRIVE_DEVICE_ID)
+            .expect_err("activation with nothing staged must not announce a drive");
+    }
+
+    #[test]
+    fn drive_staged_after_construction_receives_irps() {
+        // The hotplug path: a composite built with no drive, filled later through the shared
+        // slot, must route drive IRPs to the new member instead of the not-configured fallback.
+        let mut harness = Harness::new(false, None);
+        let fs = Rc::new(MockFs::new());
+        fs.seed_file("\\hot.txt", b"hotplugged");
+
+        let spawner = harness.pool.spawner();
+        let spawn: DriveFsSpawner = Rc::new(move |future| {
+            spawner.spawn_local(future).expect("spawn_local must succeed in tests");
+        });
+        let (drive_tx, drive_rx) = mpsc::unbounded();
+        harness.drive_rx = drive_rx;
+        *harness.backend.drive.borrow_mut() = Some((
+            WasmDriveBackend::new(drive_tx, fs, false, spawn),
+            DRIVE_DEVICE_ID,
+        ));
+
+        harness.backend.add_drive(DRIVE_DEVICE_ID).expect("staged device activates");
+
+        let response = only(harness.dispatch_drive(ServerDriveIoRequest::ServerCreateDriveRequest(
+            open_request("\\hot.txt", 1),
+        )));
+        assert_eq!(status_of(&response), NtStatus::SUCCESS);
     }
 
     #[test]

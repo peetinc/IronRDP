@@ -44,7 +44,7 @@ use crate::canvas::Canvas;
 use crate::clipboard;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
 use crate::drive::backend::{DriveBackendMessage, WasmDriveBackend, wasm_drive_pair};
-use crate::drive::composite::{WasmCompositeBackend, resolve_drive_device_id};
+use crate::drive::composite::{DriveSlot, WasmCompositeBackend, resolve_drive_device_id};
 use crate::drive::fs::DriveFs;
 use crate::drive::web_fs::WebFsDrive;
 use crate::error::IronError;
@@ -529,6 +529,10 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             None => None,
         };
 
+        // Shared with the live composite backend so a folder picked mid-session can be
+        // installed into it (see `invoke_extension`'s `drive_share` arm).
+        let drive_slot: DriveSlot = Rc::new(RefCell::new(None));
+
         let ws = WebSocket::open(&proxy_address).context("couldn't open WebSocket")?;
 
         // NOTE: ideally, when the WebSocket can't be opened, the above call should fail with details on why is that
@@ -569,6 +573,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_name,
             printer_driver_name,
             drive,
+            drive_slot: Rc::clone(&drive_slot),
             computer_name: client_name.clone(),
             use_display_control,
         })
@@ -597,6 +602,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             connection_result: RefCell::new(Some(connection_result)),
             clipboard: RefCell::new(Some(clipboard)),
             printer: RefCell::new(Some(printer)),
+            drive_slot,
+            drive_device_id: resolve_drive_device_id(DRIVE_DEVICE_ID, printer_device_id),
         })
     }
 }
@@ -630,6 +637,9 @@ pub(crate) enum RdpInputEvent {
     /// produced RDPDR completion PDU(s) that must be injected on the Rdpdr
     /// static channel. See [`DriveBackendMessage`].
     DriveBackend(SyncDriveBackendMessage),
+    /// A folder was shared mid-session: the backend is already staged in the
+    /// session's [`DriveSlot`], so the loop only has to announce the device.
+    DriveHotplug { device_id: u32, share_name: String },
     FastPath(FastPathInputEvents),
     Resize {
         width: u32,
@@ -666,6 +676,13 @@ pub(crate) struct Session {
     rdp_reader: RefCell<Option<ReadHalf<RdpStream>>>,
     clipboard: RefCell<Option<Option<WasmClipboard>>>,
     printer: RefCell<Option<Option<WasmPrinter>>>,
+
+    /// Live drive member of the composite RDPDR backend, shared with it so a folder picked
+    /// mid-session can be installed without reaching into `Rdpdr`'s private backend slot.
+    drive_slot: DriveSlot,
+    /// Device id a mid-session drive is announced under — the same value `connect` resolves,
+    /// recomputed here from the same pure function of the printer id.
+    drive_device_id: u32,
 }
 
 impl Session {
@@ -981,6 +998,38 @@ impl iron_remote_desktop::Session for Session {
                             } else {
                                 warn!("Drive IRP completion received, but Rdpdr is not available");
                                 Vec::new()
+                            }
+                        }
+                        RdpInputEvent::DriveHotplug { device_id, share_name } => {
+                            // The backend is already staged in the shared slot (see the
+                            // `drive_share` arm of `invoke_extension`); `add_dynamic_drive`
+                            // activates it through the composite's `add_drive` and returns the
+                            // device announcement to put on the wire.
+                            match active_stage.get_svc_processor_mut::<Rdpdr>() {
+                                Some(rdpdr) => match rdpdr.add_dynamic_drive(device_id, share_name) {
+                                    Ok(messages) if messages.is_empty() => Vec::new(),
+                                    Ok(messages) => {
+                                        match active_stage.process_svc_processor_messages::<Rdpdr>(messages.into()) {
+                                            Ok(frame) if !frame.is_empty() => {
+                                                info!(device_id, "drive shared mid-session");
+                                                vec![ActiveStageOutput::ResponseFrame(frame)]
+                                            }
+                                            Ok(_) => Vec::new(),
+                                            Err(e) => {
+                                                error!(error = %e, "Failed to encode dynamic drive announcement");
+                                                Vec::new()
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!(error = %e, "Dynamic drive announcement rejected");
+                                        Vec::new()
+                                    }
+                                },
+                                None => {
+                                    warn!("Drive share requested, but Rdpdr is not available");
+                                    Vec::new()
+                                }
                             }
                         }
                         RdpInputEvent::TerminateSession => {
@@ -1356,6 +1405,51 @@ impl iron_remote_desktop::Session for Session {
 
                 return Ok(JsValue::NULL);
             };
+            |drive_share: JsValue| {
+                // Mid-session folder share. The same `driveShare` extension the config builder
+                // accepts, invoked on a live session: MS-RDPEFS allows announcing a device after
+                // connect, and `Rdpdr::add_dynamic_drive` implements that sequencing — but it is
+                // handed only a device id, so the filesystem has to be staged in the shared
+                // `DriveSlot` here, before the event loop announces it.
+                if self.drive_slot.borrow().is_some() {
+                    return Err(IronError::from(anyhow::anyhow!(
+                        "a folder is already shared with this session; reconnect to change it"
+                    ))
+                    .with_kind(IronErrorKind::General));
+                }
+
+                let config = parse_drive_share(drive_share).map_err(IronError::from)?;
+                let share_name = config.share_name.clone();
+                let fs: Rc<dyn DriveFs> = Rc::new(WebFsDrive::new(config.handle));
+                let (drive_tx, mut drive_rx) = mpsc::unbounded();
+                let backend = wasm_drive_pair(drive_tx, fs, config.read_only);
+
+                // Same completion-forwarding adapter the connect-time path installs; it ends on
+                // its own when the backend is dropped.
+                let forward_tx = self.input_events_tx.clone();
+                spawn_local(async move {
+                    while let Some(message) = drive_rx.next().await {
+                        if forward_tx
+                            .unbounded_send(RdpInputEvent::DriveBackend(SyncDriveBackendMessage(message)))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+
+                *self.drive_slot.borrow_mut() = Some((backend, self.drive_device_id));
+
+                self.input_events_tx
+                    .unbounded_send(RdpInputEvent::DriveHotplug {
+                        device_id: self.drive_device_id,
+                        share_name,
+                    })
+                    .context("send drive hotplug")
+                    .map_err(IronError::from)?;
+
+                return Ok(JsValue::NULL);
+            };
             |initiate_file_copy: JsValue| {
                 let file_list = parse_file_metadata_array(initiate_file_copy)?;
 
@@ -1706,6 +1800,10 @@ struct ConnectParams {
     /// [`RdpInputEvent::DriveBackend`] for how this backend's completions
     /// reach the event loop.
     drive: Option<(WasmDriveBackend, String)>,
+    /// Shared with the `Session` so a folder picked mid-session can be installed
+    /// into the live composite backend — see [`crate::drive::composite::DriveSlot`]
+    /// and the `drive_share` arm of `invoke_extension`.
+    drive_slot: DriveSlot,
     /// Matches the `client_name` in the connector config; used as the
     /// `computer_name` when constructing the `Rdpdr` processor.
     computer_name: String,
@@ -1757,6 +1855,7 @@ async fn connect(
         printer_name,
         printer_driver_name,
         drive,
+        drive_slot,
         computer_name,
         use_display_control,
     }: ConnectParams,
@@ -1776,7 +1875,13 @@ async fn connect(
     // backend for, via `WasmCompositeBackend` — see `drive::composite`'s module doc comment for
     // how it routes each IRP-handling method to whichever member is configured. Both device
     // classes are announced together in one `Rdpdr` when both are configured.
-    if printer_backend.is_some() || drive.is_some() {
+    // RDPDR is attached unconditionally, not only when a device is configured up front: the
+    // drive capability must be negotiated with the server BEFORE its capability exchange for
+    // `add_dynamic_drive` to be legal later (it rejects late capability configuration outright),
+    // so a session that starts with no redirection would otherwise be permanently unable to
+    // mount a folder the user picks mid-session. Announcing zero devices on an otherwise idle
+    // channel is what mstsc does when redirection is enabled with nothing to redirect.
+    {
         // Windows servers only speak on RDPDR when RDPSND is advertised too
         // (MS-RDPEFS Appendix A<1>). We do not play audio in the web client,
         // but the no-op RDPSND processor satisfies that channel dependency.
@@ -1797,16 +1902,24 @@ async fn connect(
 
         let printer_configured = printer_backend.is_some();
         let printer_member = printer_backend.map(|backend| (backend, printer_device_id));
-        let drive_member = drive_backend.zip(drive_device_id);
+        *drive_slot.borrow_mut() = drive_backend.zip(drive_device_id);
 
-        let composite = WasmCompositeBackend::new(printer_member, drive_member);
+        let composite = WasmCompositeBackend::new(printer_member, Rc::clone(&drive_slot));
 
         let mut rdpdr = Rdpdr::new(Box::new(composite), computer_name);
         if printer_configured {
             rdpdr = rdpdr.with_printer_driver(printer_device_id, printer_name, printer_driver_name);
         }
-        if let (Some(share_name), Some(device_id)) = (drive_share_name, drive_device_id) {
-            rdpdr = rdpdr.with_drives(Some(vec![(device_id, share_name)]));
+        // `with_drives` is called either way: with the initial drive when one is configured, and
+        // with `None` otherwise purely to enable the capability so a later `add_dynamic_drive`
+        // is accepted (see the attach comment above).
+        match (drive_share_name, drive_device_id) {
+            (Some(share_name), Some(device_id)) => {
+                rdpdr = rdpdr.with_drives(Some(vec![(device_id, share_name)]));
+            }
+            _ => {
+                rdpdr = rdpdr.with_drives(None);
+            }
         }
         connector.attach_static_channel(rdpdr);
     }
