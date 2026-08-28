@@ -485,10 +485,16 @@ impl ChunkProcessor {
                 if last {
                     flags |= ChannelFlags::LAST;
                 }
-                if is_chunked {
-                    flags |= ChannelFlags::SHOW_PROTOCOL;
-                }
-
+                // NOTE: CHANNEL_FLAG_SHOW_PROTOCOL is deliberately NOT set here. Earlier
+                // versions set it on every chunked message, but per MS-RDPBCGR the flag belongs
+                // only on channels opened with CHANNEL_OPTION_SHOW_PROTOCOL (FreeRDP's
+                // VirtualChannelWriteEx behaves the same way). Observed live against a Windows
+                // Server host: a 41-chunk RDPDR DeviceReadResponse carrying SHOW_PROTOCOL on a
+                // channel not opened with that option made the server drop the redirected
+                // device immediately (client-side symptom: ERROR_DEVICE_NOT_CONNECTED /
+                // "Attempt to access invalid address" on \\tsclient), while byte-identical
+                // framing without the flag is accepted. A channel that genuinely needs it can
+                // pass it via `message.flags`.
                 flags |= message.flags;
 
                 ChannelPduHeader {
