@@ -1,4 +1,4 @@
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::num::NonZeroU32;
 use core::time::Duration;
@@ -26,6 +26,8 @@ use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::{BitmapCodecs, client_codecs_capabilities};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
+use ironrdp::pdu::rdp::server_redirection::{RedirectionFlags, ServerRedirectionPdu};
+use ironrdp::pdu::rdstls::RdstlsAuthenticationRequest;
 use ironrdp::rdpdr::Rdpdr;
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
 use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
@@ -393,6 +395,15 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
     }
 
     async fn connect(&self) -> Result<Self::Session, Self::Error> {
+        self.connect_with(None, None).await
+    }
+}
+
+impl SessionBuilder {
+    /// Connects, either fresh (`redirect` and `reuse` both `None`) or following a
+    /// Server Redirection PDU, in which case the live session's input channel and
+    /// drive slot carry over so nothing JS holds goes stale.
+    async fn connect_with(&self, redirect: Option<Redirect>, reuse: Option<Reuse>) -> Result<Session, IronError> {
         let (
             username,
             destination,
@@ -474,7 +485,31 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             };
         }
 
-        info!("Connect to RDP host");
+        // A redirection hands over its own identity; the password is only replaced
+        // when the server sent one the client can read (RDSTLS carries the opaque
+        // one instead).
+        let (username, password, server_domain) = match &redirect {
+            Some(redirect) => (
+                redirect.username.clone().unwrap_or(username),
+                redirect.password.clone().unwrap_or(password),
+                redirect.domain.clone().or(server_domain),
+            ),
+            None => (username, password, server_domain),
+        };
+
+        let redirect = redirect.map(|redirect| RedirectConnector {
+            routing_token: redirect.routing_token,
+            rdstls: redirect
+                .rdstls
+                .map(|(redirection_guid, password)| RdstlsAuthenticationRequest {
+                    redirection_guid,
+                    username: username.clone(),
+                    domain: server_domain.clone(),
+                    password,
+                }),
+        });
+
+        info!(redirected = redirect.is_some(), "Connect to RDP host");
 
         // Read before `build_config`: the EGFX early capability flag has to go out
         // in the GCC client core data during the connection sequence, long before
@@ -496,7 +531,20 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         let enable_server_pointer = self.0.borrow().enable_server_pointer;
         config.enable_server_pointer = enable_server_pointer;
 
-        let (input_events_tx, input_events_rx) = mpsc::unbounded();
+        let (input_events_tx, input_events_rx, drive_slot) = match reuse {
+            Some(Reuse {
+                input_events_tx,
+                input_events_rx,
+                drive_slot,
+            }) => (input_events_tx, input_events_rx, drive_slot),
+            None => {
+                let (tx, rx) = mpsc::unbounded();
+                // Shared with the live composite backend so a folder picked mid-session can be
+                // installed into it (see `invoke_extension`'s `drive_share` arm).
+                let drive_slot: DriveSlot = Rc::new(RefCell::new(None));
+                (tx, rx, drive_slot)
+            }
+        };
 
         let clipboard = remote_clipboard_changed_callback.clone().map(|callback| {
             WasmClipboard::new(
@@ -577,10 +625,6 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             None => None,
         };
 
-        // Shared with the live composite backend so a folder picked mid-session can be
-        // installed into it (see `invoke_extension`'s `drive_share` arm).
-        let drive_slot: DriveSlot = Rc::new(RefCell::new(None));
-
         let ws = WebSocket::open(&proxy_address).context("couldn't open WebSocket")?;
 
         // NOTE: ideally, when the WebSocket can't be opened, the above call should fail with details on why is that
@@ -625,6 +669,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             computer_name: client_name.clone(),
             use_display_control,
             use_egfx,
+            redirect,
         })
         .await?;
 
@@ -637,9 +682,10 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         spawn_local(writer_task(writer_rx, rdp_writer, outbound_message_size_limit));
 
         Ok(Session {
-            desktop_size: connection_result.desktop_size,
+            builder: self.clone(),
+            desktop_size: Cell::new(connection_result.desktop_size),
             input_database: RefCell::new(ironrdp::input::Database::new()),
-            writer_tx,
+            writer_tx: RefCell::new(writer_tx),
             input_events_tx,
 
             render_canvas,
@@ -709,10 +755,76 @@ impl iron_remote_desktop::SessionTerminationInfo for SessionTerminationInfo {
     }
 }
 
+/// What a Server Redirection PDU asks of the next connection.
+///
+/// The target is always the same relay: in direct mode the WebSocket address names
+/// the RDP host, so a redirection that names a different host cannot be followed
+/// and is attempted against the current one (GNOME Remote Desktop, the case this
+/// exists for, hands over on the same address and names no target).
+struct Redirect {
+    routing_token: Option<String>,
+    username: Option<String>,
+    domain: Option<String>,
+    /// Readable password, for a redirection that continues with CredSSP.
+    password: Option<String>,
+    /// `(redirection GUID, password blob)` when the password is opaque and the
+    /// next connection must authenticate with RDSTLS.
+    rdstls: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+impl Redirect {
+    fn from_pdu(pdu: ServerRedirectionPdu) -> Self {
+        if pdu.target_net_address.is_some() || pdu.target_fqdn.is_some() || pdu.target_net_addresses.is_some() {
+            warn!(
+                target_net_address = ?pdu.target_net_address,
+                target_fqdn = ?pdu.target_fqdn,
+                "Server Redirection names a target host; direct mode can only reconnect through the same relay"
+            );
+        }
+
+        let rdstls = pdu.flags.contains(RedirectionFlags::PASSWORD_IS_PK_ENCRYPTED).then(|| {
+            (
+                pdu.redirection_guid.clone().unwrap_or_default(),
+                pdu.password.clone().unwrap_or_default(),
+            )
+        });
+
+        Self {
+            routing_token: pdu.routing_token(),
+            password: pdu.plaintext_password(),
+            username: pdu.username,
+            domain: pdu.domain,
+            rdstls,
+        }
+    }
+}
+
+/// [`Redirect`] resolved against the builder's own credentials, for the connector.
+struct RedirectConnector {
+    routing_token: Option<String>,
+    rdstls: Option<RdstlsAuthenticationRequest>,
+}
+
+/// State a redirected connection inherits from the session it replaces.
+struct Reuse {
+    input_events_tx: mpsc::UnboundedSender<RdpInputEvent>,
+    input_events_rx: mpsc::UnboundedReceiver<RdpInputEvent>,
+    drive_slot: DriveSlot,
+}
+
+/// How one connection of a session ended.
+enum ConnectionEnd {
+    Terminated(GracefulDisconnectReason),
+    Redirected(Box<ServerRedirectionPdu>),
+}
+
 pub(crate) struct Session {
-    desktop_size: connector::DesktopSize,
+    /// Kept to reconnect when the server redirects the session.
+    builder: SessionBuilder,
+    desktop_size: Cell<connector::DesktopSize>,
     input_database: RefCell<ironrdp::input::Database>,
-    writer_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Replaced when a Server Redirection moves the session to a new connection.
+    writer_tx: RefCell<mpsc::UnboundedSender<Vec<u8>>>,
     input_events_tx: mpsc::UnboundedSender<RdpInputEvent>,
 
     render_canvas: HtmlCanvasElement,
@@ -735,52 +847,10 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    fn h_send_inputs(&self, inputs: smallvec::SmallVec<[FastPathInputEvent; 2]>) -> Result<(), IronError> {
-        if !inputs.is_empty() {
-            trace!("Inputs: {inputs:?}");
-
-            self.input_events_tx
-                .unbounded_send(RdpInputEvent::FastPath(inputs))
-                .context("Send input events to writer task")?;
-        }
-
-        Ok(())
-    }
-
-    fn set_cursor_style(&self, style: CursorStyle) -> Result<(), IronError> {
-        let (kind, data, hotspot_x, hotspot_y) = match style {
-            CursorStyle::Default => ("default", None, None, None),
-            CursorStyle::Hidden => ("hidden", None, None, None),
-            CursorStyle::Url {
-                data,
-                hotspot_x,
-                hotspot_y,
-            } => ("url", Some(data), Some(hotspot_x), Some(hotspot_y)),
-        };
-
-        let args = js_sys::Array::from_iter([
-            JsValue::from_str(kind),
-            JsValue::from(data),
-            JsValue::from_f64(hotspot_x.unwrap_or_default().into()),
-            JsValue::from_f64(hotspot_y.unwrap_or_default().into()),
-        ]);
-
-        let _ret = self
-            .set_cursor_style_callback
-            .apply(&self.set_cursor_style_callback_context, &args)
-            .map_err(|e| anyhow::Error::msg(format!("set cursor style callback failed: {e:?}")))?;
-
-        Ok(())
-    }
-}
-
-impl iron_remote_desktop::Session for Session {
-    type SessionTerminationInfo = SessionTerminationInfo;
-    type InputTransaction = InputTransaction;
-    type ClipboardData = ClipboardData;
-    type Error = IronError;
-
-    async fn run(&self) -> Result<Self::SessionTerminationInfo, Self::Error> {
+    /// Drives one connection until it ends, returning why. The connection's
+    /// reader and per-connection state are taken from `self`, and the input
+    /// channel is put back on the way out so a redirected session can resume.
+    async fn run_connection(&self) -> Result<ConnectionEnd, IronError> {
         let (rdp_reader, rdp_leftover) = self
             .rdp_reader
             .borrow_mut()
@@ -850,7 +920,7 @@ impl iron_remote_desktop::Session for Session {
         // Timer interval for driving clipboard lock timeouts (5 second interval)
         let mut cleanup_interval = IntervalStream::new(5_000).fuse();
 
-        let disconnect_reason = 'outer: loop {
+        let connection_end = 'outer: loop {
             let outputs = select! {
                 frame = framed.read_pdu().fuse() => {
                     let (action, payload) = frame.context("read frame")?;
@@ -1117,6 +1187,7 @@ impl iron_remote_desktop::Session for Session {
                 match out {
                     ActiveStageOutput::ResponseFrame(frame) => {
                         self.writer_tx
+                            .borrow()
                             .unbounded_send(frame)
                             .context("Send frame to writer task")?;
                     }
@@ -1274,6 +1345,7 @@ impl iron_remote_desktop::Session for Session {
 
                             if written.size().is_some() {
                                 self.writer_tx
+                                    .borrow()
                                     .unbounded_send(buf.filled().to_vec())
                                     .context("Send frame to writer task")?;
                             }
@@ -1328,22 +1400,138 @@ impl iron_remote_desktop::Session for Session {
                     ActiveStageOutput::SaveSessionInfo { logon_complete: false } => {
                         debug!("RDP session info notification");
                     }
-                    ActiveStageOutput::Terminate(reason) => break 'outer reason,
+                    ActiveStageOutput::ServerRedirection(pdu) => {
+                        if pdu.flags.contains(RedirectionFlags::NO_REDIRECT) {
+                            debug!("Server Redirection PDU flagged NO_REDIRECT, ignoring");
+                        } else {
+                            break 'outer ConnectionEnd::Redirected(pdu);
+                        }
+                    }
+                    ActiveStageOutput::Terminate(reason) => break 'outer ConnectionEnd::Terminated(reason),
                 }
             }
         };
 
-        info!(%disconnect_reason, "RDP session terminated");
+        // A redirected session keeps going on a new connection, fed by the same
+        // input channel.
+        *self.input_events_rx.borrow_mut() = Some(input_events);
 
-        Ok(SessionTerminationInfo {
-            reason: disconnect_reason,
-        })
+        Ok(connection_end)
+    }
+
+    /// Replaces this session's connection with the one a Server Redirection PDU
+    /// points at, keeping the input channel so JS-held handles stay valid.
+    async fn follow_redirection(&self, pdu: ServerRedirectionPdu) -> Result<(), IronError> {
+        let redirect = Redirect::from_pdu(pdu);
+
+        info!(
+            routing_token = ?redirect.routing_token,
+            username = ?redirect.username,
+            rdstls = redirect.rdstls.is_some(),
+            "Following Server Redirection"
+        );
+
+        let input_events_rx = self
+            .input_events_rx
+            .borrow_mut()
+            .take()
+            .context("input channel missing while following a redirection")?;
+
+        let Session {
+            desktop_size,
+            writer_tx,
+            input_events_rx,
+            connection_result,
+            rdp_reader,
+            clipboard,
+            printer,
+            ..
+        } = self
+            .builder
+            .connect_with(
+                Some(redirect),
+                Some(Reuse {
+                    input_events_tx: self.input_events_tx.clone(),
+                    input_events_rx,
+                    drive_slot: Rc::clone(&self.drive_slot),
+                }),
+            )
+            .await?;
+
+        self.desktop_size.set(desktop_size.get());
+        // Dropping the previous sender ends the old writer task, which closes the
+        // old connection's write half.
+        *self.writer_tx.borrow_mut() = writer_tx.into_inner();
+        *self.input_events_rx.borrow_mut() = input_events_rx.into_inner();
+        *self.connection_result.borrow_mut() = connection_result.into_inner();
+        *self.rdp_reader.borrow_mut() = rdp_reader.into_inner();
+        *self.clipboard.borrow_mut() = clipboard.into_inner();
+        *self.printer.borrow_mut() = printer.into_inner();
+
+        Ok(())
+    }
+
+    fn h_send_inputs(&self, inputs: smallvec::SmallVec<[FastPathInputEvent; 2]>) -> Result<(), IronError> {
+        if !inputs.is_empty() {
+            trace!("Inputs: {inputs:?}");
+
+            self.input_events_tx
+                .unbounded_send(RdpInputEvent::FastPath(inputs))
+                .context("Send input events to writer task")?;
+        }
+
+        Ok(())
+    }
+
+    fn set_cursor_style(&self, style: CursorStyle) -> Result<(), IronError> {
+        let (kind, data, hotspot_x, hotspot_y) = match style {
+            CursorStyle::Default => ("default", None, None, None),
+            CursorStyle::Hidden => ("hidden", None, None, None),
+            CursorStyle::Url {
+                data,
+                hotspot_x,
+                hotspot_y,
+            } => ("url", Some(data), Some(hotspot_x), Some(hotspot_y)),
+        };
+
+        let args = js_sys::Array::from_iter([
+            JsValue::from_str(kind),
+            JsValue::from(data),
+            JsValue::from_f64(hotspot_x.unwrap_or_default().into()),
+            JsValue::from_f64(hotspot_y.unwrap_or_default().into()),
+        ]);
+
+        let _ret = self
+            .set_cursor_style_callback
+            .apply(&self.set_cursor_style_callback_context, &args)
+            .map_err(|e| anyhow::Error::msg(format!("set cursor style callback failed: {e:?}")))?;
+
+        Ok(())
+    }
+}
+
+impl iron_remote_desktop::Session for Session {
+    type SessionTerminationInfo = SessionTerminationInfo;
+    type InputTransaction = InputTransaction;
+    type ClipboardData = ClipboardData;
+    type Error = IronError;
+
+    async fn run(&self) -> Result<Self::SessionTerminationInfo, Self::Error> {
+        loop {
+            match self.run_connection().await? {
+                ConnectionEnd::Terminated(reason) => {
+                    info!(%reason, "RDP session terminated");
+                    return Ok(SessionTerminationInfo { reason });
+                }
+                ConnectionEnd::Redirected(pdu) => self.follow_redirection(*pdu).await?,
+            }
+        }
     }
 
     fn desktop_size(&self) -> DesktopSize {
         DesktopSize {
-            width: self.desktop_size.width,
-            height: self.desktop_size.height,
+            width: self.desktop_size.get().width,
+            height: self.desktop_size.get().height,
         }
     }
 
@@ -1372,6 +1560,7 @@ impl iron_remote_desktop::Session for Session {
         let frame = ironrdp::core::encode_vec(&fastpath_input).context("FastPathInput encoding")?;
 
         self.writer_tx
+            .borrow()
             .unbounded_send(frame)
             .context("Send frame to writer task")?;
 
@@ -1897,6 +2086,8 @@ struct ConnectParams {
     /// ride the same DRDYNVC static channel, so either one alone is enough to
     /// warrant attaching it.
     use_egfx: bool,
+    /// Set when this connection follows a Server Redirection PDU.
+    redirect: Option<RedirectConnector>,
 }
 
 fn default_printer_driver_name() -> String {
@@ -1948,6 +2139,7 @@ async fn connect(
         computer_name,
         use_display_control,
         use_egfx,
+        redirect,
     }: ConnectParams,
 ) -> Result<(connector::ConnectionResult, RdpStream, bytes::BytesMut), IronError> {
     let framed = ironrdp_futures::LocalFuturesFramed::new(ws);
@@ -1956,6 +2148,15 @@ async fn connect(
     let dummy_client_addr = core::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 33899));
 
     let mut connector = ClientConnector::new(config, dummy_client_addr);
+
+    if let Some(RedirectConnector { routing_token, rdstls }) = redirect {
+        if let Some(routing_token) = routing_token {
+            connector = connector.with_load_balance_info(routing_token);
+        }
+        if let Some(rdstls) = rdstls {
+            connector = connector.with_rdstls(rdstls);
+        }
+    }
 
     if let Some(clipboard_backend) = clipboard_backend {
         connector.attach_static_channel(CliprdrClient::new(Box::new(clipboard_backend)));
