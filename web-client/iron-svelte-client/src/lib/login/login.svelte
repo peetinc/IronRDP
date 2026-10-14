@@ -27,7 +27,7 @@
     // 9096, not 9095: the RDPDR rig on the direct-websocket-mode checkout owns
     // 9095 (and vite 5180), and concurrent sessions must not fight over ports.
     let gatewayAddress = 'ws://localhost:9096';
-    let hostname = '10.10.100.78';
+    let hostname = '10.10.100.193';
     let domain = 'peetinc';
     let kdc_proxy_url = '';
     let desktopSize = { width: 1280, height: 720 };
