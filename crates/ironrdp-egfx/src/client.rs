@@ -67,6 +67,25 @@ use tracing::{debug, trace, warn};
 
 use crate::CHANNEL_NAME;
 use crate::compositor::{Compositor, OutputUpdate};
+
+/// Diagnostic capture hook: the in-process twin of `IRONRDP_DUMP_EGFX` for
+/// targets with no filesystem (wasm).
+///
+/// When set, it receives every raw (still ZGFX-compressed) server-to-client
+/// EGFX message, in order, before decoding. The bytes are exactly what the
+/// file dump writes, so the `egfx_replay` example replays either capture.
+static CAPTURE_HOOK: std::sync::RwLock<Option<fn(&[u8])>> = std::sync::RwLock::new(None);
+
+/// Installs (or, with `None`, removes) the [`CAPTURE_HOOK`] for all
+/// [`GraphicsPipelineClient`]s in this process.
+pub fn set_capture_hook(hook: Option<fn(&[u8])>) {
+    let mut slot = CAPTURE_HOOK.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = hook;
+}
+
+fn capture_hook() -> Option<fn(&[u8])> {
+    *CAPTURE_HOOK.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 use crate::decode::H264Decoder;
 use crate::pdu::{
     Avc420BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu, CapabilitiesV8Flags,
@@ -1309,6 +1328,9 @@ impl DvcProcessor for GraphicsPipelineClient {
             if let Err(error) = std::fs::write(&path, payload) {
                 warn!(?error, path = %path.display(), "failed to dump EGFX message");
             }
+        }
+        if let Some(hook) = capture_hook() {
+            hook(payload);
         }
 
         // ZGFX decompress

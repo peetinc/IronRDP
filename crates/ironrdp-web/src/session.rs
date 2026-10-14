@@ -2309,6 +2309,8 @@ async fn connect(
                 }
             }
 
+            egfx_capture::install_if_requested();
+
             info!("Attaching EGFX graphics pipeline (no H.264 decoder)");
             drdynvc = drdynvc
                 .with_dynamic_channel(GraphicsPipelineClient::new(Box::new(WebEgfxHandler::default()), None));
@@ -2385,6 +2387,60 @@ async fn connect(
 /// ordering changes per MS-RDPEPS: the Preconnection Blob goes out first, in the clear,
 /// TLS follows immediately, and CredSSP runs *before* X.224 via
 /// [`ironrdp_vmconnect::connect_front`].
+/// Diagnostic EGFX capture for the browser, the wasm stand-in for the native
+/// `IRONRDP_DUMP_EGFX=<dir>` file dump.
+///
+/// Off unless the page defines `globalThis.__ironrdpEgfxDump(seq, bytes)`
+/// before connecting (the test rig does, behind a build flag). Each raw server
+/// message is handed to it in order; saved as `egfx-<seq>.bin`, the files
+/// replay with the `egfx_replay` example exactly like a native capture.
+mod egfx_capture {
+    use core::cell::{Cell, RefCell};
+
+    use wasm_bindgen::JsValue;
+
+    const DUMP_FN: &str = "__ironrdpEgfxDump";
+
+    thread_local! {
+        static DUMP: RefCell<Option<js_sys::Function>> = const { RefCell::new(None) };
+        static SEQ: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// Looks for the page's dump function and, when present, routes every EGFX
+    /// message of the next session to it. Numbering restarts at zero because
+    /// ZGFX state is per connection: a capture is only replayable from its start.
+    pub(super) fn install_if_requested() {
+        let dump = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str(DUMP_FN))
+            .ok()
+            .and_then(|value| wasm_bindgen::JsCast::dyn_into::<js_sys::Function>(value).ok());
+
+        let enabled = dump.is_some();
+        DUMP.with(|slot| *slot.borrow_mut() = dump);
+        SEQ.with(|seq| seq.set(0));
+        ironrdp_egfx::client::set_capture_hook(enabled.then_some(forward as fn(&[u8])));
+
+        if enabled {
+            tracing::warn!("EGFX capture enabled: every server graphics message goes to {DUMP_FN}");
+        }
+    }
+
+    fn forward(payload: &[u8]) {
+        DUMP.with(|slot| {
+            if let Some(dump) = slot.borrow().as_ref() {
+                let seq = SEQ.with(|seq| {
+                    let current = seq.get();
+                    seq.set(current.wrapping_add(1));
+                    current
+                });
+                // `from` copies out of wasm memory, so the JS side may hold the
+                // bytes past this call (it posts them asynchronously).
+                let bytes = js_sys::Uint8Array::from(payload);
+                let _ = dump.call2(&JsValue::NULL, &JsValue::from(seq), &bytes);
+            }
+        });
+    }
+}
+
 async fn connect_direct(
     mut framed: ironrdp_futures::LocalFuturesFramed<WebSocket>,
     connector: &mut ClientConnector,
