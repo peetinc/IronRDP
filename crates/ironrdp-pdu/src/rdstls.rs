@@ -101,7 +101,8 @@ impl core::fmt::Debug for RdstlsAuthenticationRequest {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("RdstlsAuthenticationRequest")
             .field("redirection_guid_len", &self.redirection_guid.len())
-            .field("username", &self.username)
+            // A g-r-d handover username is a one-time credential, like the password.
+            .field("username", &"<redacted>")
             .field("domain", &self.domain)
             .field("password", &"<redacted>")
             .finish()
@@ -304,6 +305,21 @@ mod tests {
             ]
         );
         assert_eq!(bytes.len(), request.size());
+    }
+
+    /// The username in a g-r-d handover is a one-time credential, like the password.
+    #[test]
+    fn debug_redacts_the_credentials() {
+        let request = RdstlsAuthenticationRequest {
+            redirection_guid: vec![0xAA, 0xBB],
+            username: "gdm-handover".to_owned(),
+            domain: None,
+            password: vec![0x61, 0x00, 0x00, 0x00],
+        };
+        let printed = format!("{request:?}");
+
+        assert!(!printed.contains("gdm-handover"), "{printed}");
+        assert!(!printed.contains("[97, 0, 0, 0]"), "{printed}");
     }
 
     #[test]

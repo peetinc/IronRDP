@@ -79,7 +79,12 @@ impl RedirectionFlags {
 /// Every field is kept byte-for-byte where the client has to hand it back
 /// unchanged: the routing token, the password blob and the redirection GUID are
 /// echoed to the target, never interpreted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` prints only the presence or length of `username`, `password`,
+/// `redirection_guid` and `target_certificate`: on GNOME Remote Desktop the
+/// "PK-encrypted" password is plaintext UTF-16, and with the GUID and username it
+/// is a working RDSTLS credential.
+#[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct ServerRedirectionPdu {
     pub session_id: u32,
@@ -99,6 +104,32 @@ pub struct ServerRedirectionPdu {
     pub redirection_guid: Option<Vec<u8>>,
     pub target_certificate: Option<Vec<u8>>,
     pub target_net_addresses: Option<Vec<String>>,
+}
+
+impl core::fmt::Debug for ServerRedirectionPdu {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ServerRedirectionPdu")
+            .field("session_id", &self.session_id)
+            .field("flags", &self.flags)
+            .field("target_net_address", &self.target_net_address)
+            .field(
+                "load_balance_info",
+                &self.load_balance_info.as_deref().map(String::from_utf8_lossy),
+            )
+            .field("has_username", &self.username.is_some())
+            .field("domain", &self.domain)
+            .field("password_len", &self.password.as_ref().map(Vec::len))
+            .field("target_fqdn", &self.target_fqdn)
+            .field("target_netbios_name", &self.target_netbios_name)
+            .field("tsv_url_len", &self.tsv_url.as_ref().map(Vec::len))
+            .field("redirection_guid_len", &self.redirection_guid.as_ref().map(Vec::len))
+            .field(
+                "target_certificate_len",
+                &self.target_certificate.as_ref().map(Vec::len),
+            )
+            .field("target_net_addresses", &self.target_net_addresses)
+            .finish()
+    }
 }
 
 impl ServerRedirectionPdu {
@@ -388,6 +419,20 @@ mod tests {
         );
         assert_eq!(pdu.target_certificate.as_deref(), Some(b"cert-container".as_slice()));
         assert!(!pdu.flags.contains(RedirectionFlags::NO_REDIRECT));
+    }
+
+    /// g-r-d's "PK-encrypted" password is plaintext UTF-16, and together with the
+    /// GUID it is the whole RDSTLS secret, so neither may reach a log.
+    #[test]
+    fn debug_redacts_the_handover_credentials() {
+        let pdu = decode::<ServerRedirectionPdu>(&gnome_handover_bytes()).unwrap();
+        let printed = format!("{pdu:?}");
+
+        assert!(!printed.contains("gdm-handover"), "{printed}");
+        for secret in [utf16z("hunter2"), utf16z("q83vEjRWeJCrze8SNFZ4kA==")] {
+            assert!(!printed.contains(&format!("{secret:?}")), "{printed}");
+        }
+        assert!(printed.contains("Cookie: msts=484355192"), "{printed}");
     }
 
     #[test]
