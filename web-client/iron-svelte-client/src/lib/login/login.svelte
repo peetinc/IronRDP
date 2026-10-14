@@ -30,7 +30,7 @@
     // port, without retyping the form: set them in the environment of `vite dev`.
     let gatewayAddress: string = import.meta.env.VITE_RIG_GATEWAY ?? 'ws://localhost:9096';
     let hostname: string = import.meta.env.VITE_RIG_HOSTNAME ?? '10.10.100.193';
-    let domain: string = import.meta.env.VITE_RIG_DOMAIN ?? 'peetinc';
+    let domain: string = import.meta.env.VITE_RIG_DOMAIN ?? '';
     let kdc_proxy_url = '';
     let desktopSize = { width: 1280, height: 720 };
     let pop_up = false;
