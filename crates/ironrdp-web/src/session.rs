@@ -2396,23 +2396,6 @@ async fn connect(
     Ok((connection_result, stream, leftover))
 }
 
-/// Direct connection mode (no RDCleanPath, no TLS-terminating proxy).
-///
-/// The WebSocket is a plain byte pipe to the RDP target — anything that relays bytes
-/// will do. This function drives the pre-TLS part of the sequence over that raw pipe,
-/// performs the TLS handshake in the browser (`crate::tls`), and returns a fresh
-/// [`ironrdp_futures::Framed`] over the TLS stream for CredSSP and everything after it.
-///
-/// 1. X.224 connection request/confirm, in the clear, until the server asks for the
-///    security upgrade.
-/// 2. TLS handshake, terminated here. The peer certificate yields the server public
-///    key CredSSP binds to — previously asserted by the relay, now observed directly.
-/// 3. `connect_finalize` continues on the TLS stream.
-///
-/// When `vmconnect` is set, the target is a Hyper-V host console (port 2179) and the
-/// ordering changes per MS-RDPEPS: the Preconnection Blob goes out first, in the clear,
-/// TLS follows immediately, and CredSSP runs *before* X.224 via
-/// [`ironrdp_vmconnect::connect_front`].
 /// Diagnostic EGFX capture for the browser, the wasm stand-in for the native
 /// `IRONRDP_DUMP_EGFX=<dir>` file dump.
 ///
@@ -2468,6 +2451,23 @@ mod egfx_capture {
     }
 }
 
+/// Direct connection mode (no RDCleanPath, no TLS-terminating proxy).
+///
+/// The WebSocket is a plain byte pipe to the RDP target — anything that relays bytes
+/// will do. This function drives the pre-TLS part of the sequence over that raw pipe,
+/// performs the TLS handshake in the browser (`crate::tls`), and returns a fresh
+/// [`ironrdp_futures::Framed`] over the TLS stream for CredSSP and everything after it.
+///
+/// 1. X.224 connection request/confirm, in the clear, until the server asks for the
+///    security upgrade.
+/// 2. TLS handshake, terminated here. The peer certificate yields the server public
+///    key CredSSP binds to — previously asserted by the relay, now observed directly.
+/// 3. `connect_finalize` continues on the TLS stream.
+///
+/// When `vmconnect` is set, the target is a Hyper-V host console (port 2179) and the
+/// ordering changes per MS-RDPEPS: the Preconnection Blob goes out first, in the clear,
+/// TLS follows immediately, and CredSSP runs *before* X.224 via
+/// [`ironrdp_vmconnect::connect_front`].
 async fn connect_direct(
     mut framed: ironrdp_futures::LocalFuturesFramed<WebSocket>,
     connector: &mut ClientConnector,
