@@ -138,6 +138,17 @@ export declare interface DroppedFile {
 
 export declare function enableCredssp(enable: boolean): Extension;
 
+export declare function enableServerPointer(enable: boolean): Extension;
+
+/**
+ * Allow unencrypted Standard RDP Security over a trusted RDCleanPath transport.
+ *
+ * Enabling this disables TLS and CredSSP protocol negotiation. Use it only when
+ * the WebSocket and proxy-to-server transports already provide the required
+ * confidentiality and peer authentication.
+ */
+export declare function enableStandardRdpSecurity(enable: boolean): Extension;
+
 declare type EventHandler<T extends unknown[]> = (...args: T) => void;
 
 declare type EventMap = {
@@ -404,6 +415,8 @@ declare class InputTransaction {
 }
 
 export declare function kdcProxyUrl(url: string): Extension;
+
+export declare function legacyGraphics(enable: boolean): Extension;
 
 export declare function lockCallback(cb: (dataId: number) => void): Extension;
 

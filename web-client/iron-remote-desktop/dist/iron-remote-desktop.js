@@ -92,10 +92,10 @@ function Di(t, e = false) {
 }
 // @__NO_SIDE_EFFECTS__
 function Lr(t) {
-  return S !== null && !Z && (S.f & Q) !== 0 && (se === null ? Ur([t]) : se.push(t)), t;
+  return k !== null && !Z && (k.f & Q) !== 0 && (se === null ? Ur([t]) : se.push(t)), t;
 }
 function H(t, e) {
-  return S !== null && !Z && Xi() && (S.f & (Q | Gt)) !== 0 && // If the source was created locally within the current derived, then
+  return k !== null && !Z && Xi() && (k.f & (Q | Gt)) !== 0 && // If the source was created locally within the current derived, then
   // we allow the mutation.
   (se === null || !se.includes(t)) && Or(), Mr(t, e);
 }
@@ -119,9 +119,9 @@ function Ti(t, e) {
 }
 // @__NO_SIDE_EFFECTS__
 function Ri(t) {
-  var e = Q | Ce, i = S !== null && (S.f & Q) !== 0 ? (
+  var e = Q | Ce, i = k !== null && (k.f & Q) !== 0 ? (
     /** @type {Derived} */
-    S
+    k
   ) : null;
   return T === null || i !== null && (i.f & G) !== 0 ? e |= G : T.f |= _i, {
     ctx: z,
@@ -358,9 +358,9 @@ function li(t) {
   Zt = t;
 }
 let et = [];
-let S = null, Z = false;
+let k = null, Z = false;
 function ge(t) {
-  S = t;
+  k = t;
 }
 let T = null;
 function _e(t) {
@@ -456,9 +456,9 @@ function Bi(t, e, i = true) {
 }
 function zi(t) {
   var _a2;
-  var e = U, i = q, r = le, n = S, o = me, c = se, f = z, h = Z, d = t.f;
+  var e = U, i = q, r = le, n = k, o = me, c = se, f = z, h = Z, d = t.f;
   U = /** @type {null | Value[]} */
-  null, q = 0, le = null, me = (d & G) !== 0 && (Z || !ht || S === null), S = (d & (ye | Ke)) === 0 ? t : null, se = null, ui(t.ctx), Z = false, Et++;
+  null, q = 0, le = null, me = (d & G) !== 0 && (Z || !ht || k === null), k = (d & (ye | Ke)) === 0 ? t : null, se = null, ui(t.ctx), Z = false, Et++;
   try {
     var p = (
       /** @type {Function} */
@@ -485,7 +485,7 @@ function zi(t) {
         );
     return n !== null && Et++, p;
   } finally {
-    U = e, q = i, le = r, S = n, me = o, se = c, ui(f), Z = h;
+    U = e, q = i, le = r, k = n, me = o, se = c, ui(f), Z = h;
   }
 }
 function Kr(t, e) {
@@ -595,13 +595,13 @@ function qr(t) {
       else if (n)
         i.f ^= j;
       else {
-        var c = S;
+        var c = k;
         try {
-          S = i, Rt(i) && Qt(i);
+          k = i, Rt(i) && Qt(i);
         } catch (d) {
           $t(d, i, null, i.ctx);
         } finally {
-          S = c;
+          k = c;
         }
       }
       var f = i.first;
@@ -627,9 +627,9 @@ function Ye(t) {
 }
 function B(t) {
   var e = t.f, i = (e & Q) !== 0;
-  if (S !== null && !Z) {
+  if (k !== null && !Z) {
     se !== null && se.includes(t) && $r();
-    var r = S.deps;
+    var r = k.deps;
     t.rv < Et && (t.rv = Et, U === null && r !== null && r[q] === t ? q++ : U === null ? U = [t] : (!me || !U.includes(t)) && U.push(t));
   } else if (i && /** @type {Derived} */
   t.deps === null && /** @type {Derived} */
@@ -656,7 +656,7 @@ function ce(t, e) {
   t.f = t.f & Hr | e;
 }
 function jr(t) {
-  T === null && S === null && kr(), S !== null && (S.f & G) !== 0 && T === null && Er(), Zt && Cr();
+  T === null && k === null && kr(), k !== null && (k.f & G) !== 0 && T === null && Er(), Zt && Cr();
 }
 function Gr(t, e) {
   var i = e.last;
@@ -687,10 +687,10 @@ function Te(t, e, i, r = true) {
     }
   else e !== null && Jt(c);
   var f = i && c.deps === null && c.first === null && c.nodes_start === null && c.teardown === null && (c.f & (_i | pt)) === 0;
-  if (!f && !n && r && (o !== null && Gr(c, o), S !== null && (S.f & Q) !== 0)) {
+  if (!f && !n && r && (o !== null && Gr(c, o), k !== null && (k.f & Q) !== 0)) {
     var h = (
       /** @type {Derived} */
-      S
+      k
     );
     (h.effects ?? (h.effects = [])).push(c);
   }
@@ -711,7 +711,7 @@ function Xr(t) {
     (i.e ?? (i.e = [])).push({
       fn: t,
       effect: T,
-      reaction: S
+      reaction: k
     });
   } else {
     var r = ei(t);
@@ -751,7 +751,7 @@ function tn(t, e = true) {
 function Wi(t) {
   var e = t.teardown;
   if (e !== null) {
-    const i = Zt, r = S;
+    const i = Zt, r = k;
     li(true), ge(null);
     try {
       e.call(null);
@@ -848,7 +848,7 @@ function Yi(t) {
     t !== void 0 && (e.x = t);
     const c = e.e;
     if (c !== null) {
-      var i = T, r = S;
+      var i = T, r = k;
       e.e = null;
       try {
         for (var n = 0; n < c.length; n++) {
@@ -872,7 +872,7 @@ function an(t) {
   return on.includes(t);
 }
 function ln(t) {
-  var e = S, i = T;
+  var e = k, i = T;
   ge(null), _e(null);
   try {
     return t();
@@ -931,7 +931,7 @@ function Xe(t) {
         return o || i;
       }
     });
-    var p = S, w = T;
+    var p = k, w = T;
     ge(null), _e(null);
     try {
       for (var s, l = []; o !== null; ) {
@@ -1570,7 +1570,7 @@ var Ze = { exports: {} }, Tn = Ze.exports, bi;
 function Rn() {
   return bi || (bi = 1, (function(t, e) {
     (function(i, r) {
-      var n = "1.0.41", o = "", c = "?", f = "function", h = "undefined", d = "object", p = "string", w = "major", s = "model", l = "name", a = "type", u = "vendor", b = "version", $ = "architecture", O = "console", g = "mobile", _ = "tablet", L = "smarttv", M = "wearable", Y = "embedded", Re = 500, $e = "Amazon", de = "Apple", rt = "ASUS", fe = "BlackBerry", Oe = "Browser", Ae = "Chrome", Ot = "Edge", Le = "Firefox", Ee = "Google", nt = "Honor", st = "Huawei", At = "Lenovo", Me = "LG", ke = "Microsoft", Ve = "Motorola", qe = "Nvidia", He = "OnePlus", he = "Opera", Fe = "OPPO", ee = "Samsung", be = "Sharp", pe = "Sony", Se = "Xiaomi", K = "Zebra", v = "Facebook", k = "Chromium OS", A = "Mac OS", R = " Browser", N = function(y, C) {
+      var n = "1.0.41", o = "", c = "?", f = "function", h = "undefined", d = "object", p = "string", w = "major", s = "model", l = "name", a = "type", u = "vendor", b = "version", $ = "architecture", O = "console", g = "mobile", _ = "tablet", L = "smarttv", M = "wearable", Y = "embedded", Re = 500, $e = "Amazon", de = "Apple", rt = "ASUS", fe = "BlackBerry", Oe = "Browser", Ae = "Chrome", Ot = "Edge", Le = "Firefox", Ee = "Google", nt = "Honor", st = "Huawei", At = "Lenovo", Me = "LG", ke = "Microsoft", Ve = "Motorola", qe = "Nvidia", He = "OnePlus", he = "Opera", Fe = "OPPO", ee = "Samsung", be = "Sharp", pe = "Sony", Se = "Xiaomi", K = "Zebra", v = "Facebook", S = "Chromium OS", A = "Mac OS", R = " Browser", N = function(y, C) {
         var x = {};
         for (var D in y)
           C[D] && C[D].length % 2 === 0 ? x[D] = C[D].concat(y[D]) : x[D] = y[D];
@@ -2792,7 +2792,7 @@ function Rn() {
             /(cros) [\w]+(?:\)| ([\w\.]+)\b)/i
             // Chromium OS
           ],
-          [[l, k], b],
+          [[l, S], b],
           [
             // Smart TVs
             /panasonic;(viera)/i,
@@ -2860,7 +2860,7 @@ function Rn() {
           return m[l] = r, m[b] = r, je.call(m, D, te.engine), m;
         }, this.getOS = function() {
           var m = {};
-          return m[l] = r, m[b] = r, je.call(m, D, te.os), E && !m[l] && ae && ae.platform && ae.platform != "Unknown" && (m[l] = ae.platform.replace(/chrome os/i, k).replace(/macos/i, A)), m;
+          return m[l] = r, m[b] = r, je.call(m, D, te.os), E && !m[l] && ae && ae.platform && ae.platform != "Unknown" && (m[l] = ae.platform.replace(/chrome os/i, S).replace(/macos/i, A)), m;
         }, this.getResult = function() {
           return {
             ua: this.getUA(),
@@ -3964,12 +3964,12 @@ function or(t, e) {
   function L(v) {
     n() === "true" && (h.style.flexGrow = "1", h.style.display = "flex", h.style.justifyContent = "center", h.style.alignItems = "center");
   }
-  function M(v, k, A) {
-    let R = `height: ${v}; width: ${k}`;
-    R = `${R}; max-height: ${v}; max-width: ${k}; min-height: ${v}; min-width: ${k}`, H(w, De(R));
+  function M(v, S, A) {
+    let R = `height: ${v}; width: ${S}`;
+    R = `${R}; max-height: ${v}; max-width: ${S}; min-height: ${v}; min-width: ${S}`, H(w, De(R));
   }
-  function Y(v, k, A) {
-    H(s, `height: ${v}; width: ${k}; overflow: ${A}`);
+  function Y(v, S, A) {
+    H(s, `height: ${v}; width: ${S}; overflow: ${A}`);
   }
   const Re = (v) => {
     fe(i());
@@ -4009,13 +4009,13 @@ function or(t, e) {
       }
   }
   function Oe() {
-    const v = ke(), k = v.x, A = v.y;
+    const v = ke(), S = v.x, A = v.y;
     let R = p.width, N = p.height;
-    const P = Math.min(k / p.width, A / p.height);
-    R = R * P, N = N * P, Y(`${A}px`, `${k}px`, "hidden"), R = R > 0 ? R : 0, N = N > 0 ? N : 0, M(`${N}px`, `${R}px`);
+    const P = Math.min(S / p.width, A / p.height);
+    R = R * P, N = N * P, Y(`${A}px`, `${S}px`, "hidden"), R = R > 0 ? R : 0, N = N > 0 ? N : 0, M(`${N}px`, `${R}px`);
   }
   function Ae(v = false) {
-    const k = ke(), A = d.getBoundingClientRect(), R = k.x - A.x, N = k.y - A.y;
+    const S = ke(), A = d.getBoundingClientRect(), R = S.x - A.x, N = S.y - A.y;
     let P = p.width, oe = p.height;
     if (!v || R < p.width || N < p.height) {
       const ve = Math.min(R / p.width, N / p.height);
@@ -4024,18 +4024,18 @@ function or(t, e) {
     P = P > 0 ? P : 0, oe = oe > 0 ? oe : 0, Y("initial", "initial", "hidden"), M(`${oe}px`, `${P}px`), L();
   }
   function Ot() {
-    const v = ke(), k = d.getBoundingClientRect(), A = v.x - k.x, R = v.y - k.y;
+    const v = ke(), S = d.getBoundingClientRect(), A = v.x - S.x, R = v.y - S.y;
     A < p.width || R < p.height ? Y(`${Math.min(R, p.height)}px`, `${Math.min(A, p.width)}px`, "auto") : Y("initial", "initial", "initial"), M(`${p.height}px`, `${p.width}px`), L();
   }
   function Le(v) {
-    const k = p == null ? void 0 : p.getBoundingClientRect(), A = (p == null ? void 0 : p.width) / k.width, R = (p == null ? void 0 : p.height) / k.height, N = {
-      x: Math.round((v.clientX - k.left) * A),
-      y: Math.round((v.clientY - k.top) * R)
+    const S = p == null ? void 0 : p.getBoundingClientRect(), A = (p == null ? void 0 : p.width) / S.width, R = (p == null ? void 0 : p.height) / S.height, N = {
+      x: Math.round((v.clientX - S.left) * A),
+      y: Math.round((v.clientY - S.top) * R)
     };
     l.updateMousePosition(N);
   }
-  function Ee(v, k) {
-    l.mouseButtonState(v, k, true);
+  function Ee(v, S) {
+    l.mouseButtonState(v, S, true);
   }
   function nt(v) {
     l.mouseWheel(v);
@@ -4050,19 +4050,20 @@ function or(t, e) {
     return l.sendKeyboardEvent(v), true;
   }
   function ke() {
-    const v = window, k = document, A = k.documentElement, R = k.getElementsByTagName("body")[0], N = v.innerWidth ?? A.clientWidth ?? R.clientWidth, P = v.innerHeight ?? A.clientHeight ?? R.clientHeight;
+    const v = window, S = document, A = S.documentElement, R = S.getElementsByTagName("body")[0], N = v.innerWidth ?? A.clientWidth ?? R.clientWidth, P = v.innerHeight ?? A.clientHeight ?? R.clientHeight;
     return { x: N, y: P };
   }
   async function Ve() {
-    return F.info("Start canvas initialization..."), p.width = 800, p.height = 600, l.setCanvas(p), l.setOnCanvasResized(rt), g(), {
-      irgUserInteraction: u.getExposedFunctions()
-    };
+    F.info("Start canvas initialization..."), p.width = 800, p.height = 600, l.setCanvas(p), l.setOnCanvasResized(rt), g();
   }
-  function qe(v) {
+  function qe() {
     if (b) {
       F.info("Skipping ready dispatch: component was destroyed during clipboard init");
       return;
     }
+    let v = {
+      irgUserInteraction: u.getExposedFunctions()
+    };
     F.info("Component ready"), F.info("Dispatching ready event"), h.dispatchEvent(new CustomEvent("ready", {
       detail: v,
       bubbles: true,
@@ -4085,14 +4086,13 @@ function or(t, e) {
     document.visibilityState === "hidden" && l.focusLost();
   }
   tr(async () => {
-    b = false, mi.set(false), F.verbose = r() === "true", F.info("Dom ready");
-    const v = await Ve();
+    b = false, mi.set(false), F.verbose = r() === "true", F.info("Dom ready"), await Ve();
     try {
       await a.initClipboard();
-    } catch (k) {
-      F.info(`Clipboard initialization failed, continuing without it: ${k}`);
+    } catch (v) {
+      F.error("Clipboard initialization failed: " + v);
     }
-    qe(v);
+    qe();
   }), gn(() => {
     window.removeEventListener("resize", Re), window.removeEventListener("keydown", O, false), window.removeEventListener("keyup", O, false), window.removeEventListener("focus", He), window.removeEventListener("blur", he), document.removeEventListener("visibilitychange", Fe), a.markDestroyed(), mi.set(true), b = true;
   });
