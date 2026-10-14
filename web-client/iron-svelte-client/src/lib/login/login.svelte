@@ -22,14 +22,13 @@
     // connect, so it cannot render it itself).
     export let onPrintJobUpdate: (fileId: number, patch: Partial<PrintJobEntry>) => void = () => {};
 
-    let username = 'artichoke';
-    let password = '';
-    // 9096, not 9095: the RDPDR rig on the direct-websocket-mode checkout owns
-    // 9095 (and vite 5180), and concurrent sessions must not fight over ports.
     // VITE_RIG_* let one checkout serve a rig per target, each on its own vite
     // port, without retyping the form: set them in the environment of `vite dev`.
+    // No target or account is baked in; an unset variable leaves the field empty.
+    let username: string = import.meta.env.VITE_RIG_USERNAME ?? '';
+    let password = '';
     let gatewayAddress: string = import.meta.env.VITE_RIG_GATEWAY ?? 'ws://localhost:9096';
-    let hostname: string = import.meta.env.VITE_RIG_HOSTNAME ?? '10.10.100.193';
+    let hostname: string = import.meta.env.VITE_RIG_HOSTNAME ?? '';
     let domain: string = import.meta.env.VITE_RIG_DOMAIN ?? '';
     let kdc_proxy_url = '';
     let desktopSize = { width: 1280, height: 720 };
