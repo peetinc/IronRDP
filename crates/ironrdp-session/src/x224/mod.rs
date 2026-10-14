@@ -11,6 +11,7 @@ use ironrdp_pdu::rdp::headers::{
 use ironrdp_pdu::rdp::heartbeat::HeartbeatPdu;
 use ironrdp_pdu::rdp::multitransport::{MultitransportRequestPdu, MultitransportResponsePdu};
 use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
+use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
 use ironrdp_pdu::rdp::session_info::{InfoData, SaveSessionInfoPdu, ServerAutoReconnect};
 use ironrdp_pdu::x224::X224;
 use ironrdp_svc::{
@@ -69,6 +70,11 @@ pub enum ProcessorOutput {
     ///
     /// [\[MS-RDPBCGR\] 2.2.4.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/5073f4ed-1e93-45e1-b039-6e30c385867c
     AutoReconnectFailed,
+    /// Server Redirection PDU ([\[MS-RDPBCGR\] 2.2.13]). The server will close this
+    /// connection; the client should reconnect as the PDU directs.
+    ///
+    /// [\[MS-RDPBCGR\] 2.2.13]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/0ff8c84d-c6f3-4d2b-b22c-3d0b4fae4f8f
+    ServerRedirection(Box<ServerRedirectionPdu>),
     /// Auto-detect network characteristics from server ([\[MS-RDPBCGR\] 2.2.14]).
     ///
     /// Currently only surfaces [`AutoDetectRequest::NetworkCharacteristicsResult`].
@@ -314,6 +320,10 @@ impl Processor {
                 Ok(Vec::new())
             }
             IoChannelPdu::DeactivateAll(_) => Ok(vec![ProcessorOutput::DeactivateAll]),
+            IoChannelPdu::ServerRedirection(pdu) => {
+                debug!(session_id = pdu.session_id, flags = ?pdu.flags, "Received Server Redirection PDU");
+                Ok(vec![ProcessorOutput::ServerRedirection(pdu)])
+            }
         }
     }
 

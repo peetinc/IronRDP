@@ -16,6 +16,7 @@ use crate::rdp::finalization_messages::{ControlPdu, FontPdu, MonitorLayoutPdu, S
 use crate::rdp::multitransport::MultitransportRequestPdu;
 use crate::rdp::refresh_rectangle::RefreshRectanglePdu;
 use crate::rdp::server_error_info::ServerSetErrorInfoPdu;
+use crate::rdp::server_redirection::ServerRedirectionPdu;
 use crate::rdp::session_info::SaveSessionInfoPdu;
 use crate::rdp::suppress_output::SuppressOutputPdu;
 
@@ -211,6 +212,9 @@ pub enum IoChannelPdu {
     ///
     /// Received when the server wants the client to establish a sideband UDP transport.
     MultitransportRequest(MultitransportRequestPdu),
+    /// Server Redirection PDU: the session lives elsewhere and the client must
+    /// reconnect with the routing token and credentials it carries.
+    ServerRedirection(Box<ServerRedirectionPdu>),
 }
 
 /// Decodes a PDU received on the RDP IO channel from the user data of a Send Data Indication.
@@ -239,6 +243,7 @@ pub fn decode_io_channel(ctx: SendDataIndicationCtx<'_>) -> DecodeResult<IoChann
 
     match ctx.pdu {
         ShareControlPdu::ServerDeactivateAll(deactivate_all) => Ok(IoChannelPdu::DeactivateAll(deactivate_all)),
+        ShareControlPdu::ServerRedirection(pdu) => Ok(IoChannelPdu::ServerRedirection(pdu)),
         ShareControlPdu::Data(share_data_header) => {
             let share_data_ctx = ShareDataCtx {
                 initiator_id: ctx.initiator_id,
@@ -272,6 +277,12 @@ impl ShareControlHeader {
     const NAME: &'static str = "ShareControlHeader";
 
     const FIXED_PART_SIZE: usize = SHARE_CONTROL_HEADER_SIZE;
+
+    /// The Server Redirection PDU has no `shareId`: `pad2Octets` and the packet
+    /// follow the 6-byte header directly (MS-RDPBCGR 2.2.13.3.1).
+    fn has_share_id(&self) -> bool {
+        !matches!(self.share_control_pdu, ShareControlPdu::ServerRedirection(_))
+    }
 }
 
 impl Encode for ShareControlHeader {
@@ -280,12 +291,12 @@ impl Encode for ShareControlHeader {
 
         let pdu_type_with_version = PROTOCOL_VERSION | self.share_control_pdu.share_header_type().as_u16();
 
-        dst.write_u16(cast_length!(
-            "len",
-            self.share_control_pdu.size() + SHARE_CONTROL_HEADER_SIZE, in: dst)?);
+        dst.write_u16(cast_length!("len", self.size(), in: dst)?);
         dst.write_u16(pdu_type_with_version);
         dst.write_u16(self.pdu_source);
-        dst.write_u32(self.share_id);
+        if self.has_share_id() {
+            dst.write_u32(self.share_id);
+        }
 
         self.share_control_pdu.encode(dst)
     }
@@ -295,7 +306,12 @@ impl Encode for ShareControlHeader {
     }
 
     fn size(&self) -> usize {
-        Self::FIXED_PART_SIZE + self.share_control_pdu.size()
+        let header_size = if self.has_share_id() {
+            Self::FIXED_PART_SIZE
+        } else {
+            SHARE_CONTROL_HEADER_WIRE_SIZE
+        };
+        header_size + self.share_control_pdu.size()
     }
 }
 
@@ -308,7 +324,6 @@ impl<'de> Decode<'de> for ShareControlHeader {
         let total_length = usize::from(src.read_u16());
         let pdu_type_with_version = src.read_u16();
         let pdu_source = src.read_u16();
-        let share_id = if src.len() >= 4 { src.read_u32() } else { 0 };
 
         let pdu_type = ShareControlPduType::from_u16(pdu_type_with_version & SHARE_CONTROL_HEADER_MASK)
             .ok_or_else(|| invalid_field_err!("pdu_type", "invalid pdu type", in: src))?;
@@ -316,6 +331,13 @@ impl<'de> Decode<'de> for ShareControlHeader {
         if pdu_version != PROTOCOL_VERSION {
             return Err(invalid_field_err!("pdu_version", "invalid PDU version", in: src));
         }
+
+        // Server Redirection carries `pad2Octets` where every other PDU has `shareId`.
+        let share_id = if pdu_type != ShareControlPduType::ServerRedirect && src.len() >= 4 {
+            src.read_u32()
+        } else {
+            0
+        };
 
         let share_pdu = ShareControlPdu::from_type(src, pdu_type)?;
         let header = Self {
@@ -374,6 +396,7 @@ pub enum ShareControlPdu {
     ClientConfirmActive(ClientConfirmActive),
     Data(ShareDataHeader),
     ServerDeactivateAll(ServerDeactivateAll),
+    ServerRedirection(Box<ServerRedirectionPdu>),
 }
 
 impl ShareControlPdu {
@@ -385,6 +408,7 @@ impl ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(_) => "Client Confirm Active PDU",
             ShareControlPdu::Data(_) => "Data PDU",
             ShareControlPdu::ServerDeactivateAll(_) => "Server Deactivate All PDU",
+            ShareControlPdu::ServerRedirection(_) => "Server Redirection PDU",
         }
     }
 
@@ -394,6 +418,7 @@ impl ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(_) => ShareControlPduType::ConfirmActivePdu,
             ShareControlPdu::Data(_) => ShareControlPduType::DataPdu,
             ShareControlPdu::ServerDeactivateAll(_) => ShareControlPduType::DeactivateAllPdu,
+            ShareControlPdu::ServerRedirection(_) => ShareControlPduType::ServerRedirect,
         }
     }
 
@@ -409,7 +434,9 @@ impl ShareControlPdu {
             ShareControlPduType::DeactivateAllPdu => {
                 Ok(ShareControlPdu::ServerDeactivateAll(ServerDeactivateAll::decode(src)?))
             }
-            _ => Err(invalid_field_err!("share_type", "unexpected share control PDU type", in: src)),
+            ShareControlPduType::ServerRedirect => Ok(ShareControlPdu::ServerRedirection(Box::new(
+                ServerRedirectionPdu::decode(src)?,
+            ))),
         }
     }
 }
@@ -421,6 +448,7 @@ impl Encode for ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(pdu) => pdu.encode(dst),
             ShareControlPdu::Data(share_data_header) => share_data_header.encode(dst),
             ShareControlPdu::ServerDeactivateAll(deactivate_all) => deactivate_all.encode(dst),
+            ShareControlPdu::ServerRedirection(pdu) => pdu.encode(dst),
         }
     }
 
@@ -434,6 +462,7 @@ impl Encode for ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(pdu) => pdu.size(),
             ShareControlPdu::Data(share_data_header) => share_data_header.size(),
             ShareControlPdu::ServerDeactivateAll(deactivate_all) => deactivate_all.size(),
+            ShareControlPdu::ServerRedirection(pdu) => pdu.size(),
         }
     }
 }

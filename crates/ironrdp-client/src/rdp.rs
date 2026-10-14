@@ -3765,6 +3765,10 @@ async fn active_session(
                 // The status pre-scan above discarded the reconnect state before
                 // success can be reported; this output has no host-facing event.
                 ActiveStageOutput::AutoReconnectFailed => {}
+                ActiveStageOutput::ServerRedirection(pdu) => {
+                    // Following a redirection is implemented in the web client only.
+                    warn!(session_id = pdu.session_id, flags = ?pdu.flags, "Server Redirection PDU received but not followed");
+                }
                 ActiveStageOutput::ResponseFrame(frame) => {
                     let Some(result) = cancelable_operation(writer.write_all(&frame), close_receiver).await else {
                         return Ok(RdpControlFlow::TerminatedGracefully(

@@ -314,6 +314,9 @@ pub mod ffi {
         WindowingOrders = 12,
         AutoReconnectFailed = 13,
         MonitorLayout = 14,
+        /// Server Redirection PDU. Not followed by the FFI session; surfaced so the
+        /// host can see why the server is about to close the connection.
+        ServerRedirection = 15,
     }
 
     impl ActiveStageOutput {
@@ -338,6 +341,7 @@ pub mod ffi {
                 }
                 ironrdp::session::ActiveStageOutput::AutoReconnectFailed => ActiveStageOutputType::AutoReconnectFailed,
                 ironrdp::session::ActiveStageOutput::MonitorLayout(_) => ActiveStageOutputType::MonitorLayout,
+                ironrdp::session::ActiveStageOutput::ServerRedirection(_) => ActiveStageOutputType::ServerRedirection,
             }
         }
 

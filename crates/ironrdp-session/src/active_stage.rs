@@ -16,6 +16,7 @@ use ironrdp_pdu::rdp::client_info::CompressionType;
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
 use ironrdp_pdu::rdp::multitransport::{MultitransportRequestPdu, MultitransportResponsePdu};
 use ironrdp_pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
+use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
 use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
 use ironrdp_pdu::rdp::suppress_output::SuppressOutputPdu;
 use ironrdp_pdu::slow_path::{self, GraphicsUpdateType};
@@ -859,6 +860,16 @@ pub enum ActiveStageOutput {
     AutoReconnectCookie(ServerAutoReconnect),
     /// Server rejected the automatic reconnection attempt.
     AutoReconnectFailed,
+    /// Server Redirection PDU ([\[MS-RDPBCGR\] 2.2.13]): the session lives elsewhere.
+    ///
+    /// The server closes this connection after sending it. Reconnect presenting
+    /// [`ServerRedirectionPdu::routing_token`] via
+    /// `ClientConnector::with_load_balance_info`, and, when
+    /// `PASSWORD_IS_PK_ENCRYPTED` is set, authenticate with
+    /// `ClientConnector::with_rdstls`. A PDU flagged `NO_REDIRECT` is informational.
+    ///
+    /// [\[MS-RDPBCGR\] 2.2.13]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/0ff8c84d-c6f3-4d2b-b22c-3d0b4fae4f8f
+    ServerRedirection(Box<ServerRedirectionPdu>),
 }
 
 impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
@@ -885,6 +896,7 @@ impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
             x224::ProcessorOutput::AutoDetect(request) => Ok(Self::AutoDetect(request)),
             x224::ProcessorOutput::AutoReconnectCookie(cookie) => Ok(Self::AutoReconnectCookie(cookie)),
             x224::ProcessorOutput::AutoReconnectFailed => Ok(Self::AutoReconnectFailed),
+            x224::ProcessorOutput::ServerRedirection(pdu) => Ok(Self::ServerRedirection(pdu)),
             x224::ProcessorOutput::MonitorLayout(monitors) => Ok(Self::MonitorLayout(monitors)),
             // GraphicsUpdate and PointerUpdate are consumed in ActiveStage::process()
             // before reaching this conversion.
