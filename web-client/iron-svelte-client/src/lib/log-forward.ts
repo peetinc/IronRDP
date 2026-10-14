@@ -58,7 +58,32 @@ function format(level: string, args: unknown[]): string {
     return line.length > MAX_LINE ? `${line.slice(0, MAX_LINE)}…<truncated>` : line;
 }
 
+// EGFX capture: when built with VITE_RIG_DUMP_EGFX=1, the wasm client hands
+// every raw server graphics message to this function (see `egfx_capture` in
+// ironrdp-web) and it is posted to the sink as `egfx-<seq>.bin`, replayable
+// offline with the `egfx_replay` example. Seq 0 starts a new capture; the id
+// travels in the URL because the posts can land out of order.
+function installEgfxDump() {
+    let captureId = Date.now();
+    (globalThis as Record<string, unknown>).__ironrdpEgfxDump = (seq: number, bytes: Uint8Array) => {
+        if (seq === 0) {
+            captureId = Date.now();
+        }
+        void fetch(`${SINK}/egfx/${captureId}/${seq}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/octet-stream' },
+            body: bytes,
+        }).catch(() => {
+            // Sink not running is fine — the rig must never depend on it.
+        });
+    };
+    console.warn('[rig] EGFX capture armed: server graphics messages are posted to the sink');
+}
+
 export function installLogForwarding() {
+    if (import.meta.env.VITE_RIG_DUMP_EGFX === '1') {
+        installEgfxDump();
+    }
     for (const level of ['log', 'info', 'warn', 'error', 'debug'] as const) {
         const original = console[level].bind(console);
         console[level] = (...args: unknown[]) => {
