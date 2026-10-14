@@ -7,6 +7,10 @@ use std::sync::Arc;
 use ironrdp_core::{Encode, WriteBuf, decode, encode_vec};
 use ironrdp_pdu::rdp::capability_sets::WindowSupportLevel;
 use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
+use ironrdp_pdu::rdstls::{
+    RDSTLS_AUTHENTICATION_RESPONSE_HINT, RDSTLS_CAPABILITIES_HINT, RdstlsAuthenticationRequest,
+    RdstlsAuthenticationResponse, RdstlsCapabilities, RdstlsResultCode,
+};
 use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::{PduHint, gcc, mcs, nego, rdp};
 use ironrdp_svc::{MAX_STATIC_CHANNELS, StaticChannelKey, StaticChannelSet, StaticVirtualChannel, SvcClientProcessor};
@@ -211,6 +215,16 @@ pub enum ClientConnectorState {
     Credssp {
         selected_protocol: nego::SecurityProtocol,
     },
+    /// RDSTLS authentication, which takes the place of CredSSP on a connection
+    /// that follows a Server Redirection PDU ([MS-RDPBCGR] 5.4.5.3). Waiting for
+    /// the server's RDSTLS Capabilities PDU.
+    RdstlsWaitCapabilities {
+        selected_protocol: nego::SecurityProtocol,
+    },
+    /// RDSTLS Authentication Request sent; waiting for the server's verdict.
+    RdstlsWaitAuthenticationResponse {
+        selected_protocol: nego::SecurityProtocol,
+    },
     BasicSettingsExchangeSendInitial {
         selected_protocol: nego::SecurityProtocol,
     },
@@ -308,6 +322,8 @@ impl State for ClientConnectorState {
             Self::ConnectionInitiationWaitConfirm { .. } => "ConnectionInitiationWaitResponse",
             Self::EnhancedSecurityUpgrade { .. } => "EnhancedSecurityUpgrade",
             Self::Credssp { .. } => "Credssp",
+            Self::RdstlsWaitCapabilities { .. } => "RdstlsWaitCapabilities",
+            Self::RdstlsWaitAuthenticationResponse { .. } => "RdstlsWaitAuthenticationResponse",
             Self::BasicSettingsExchangeSendInitial { .. } => "BasicSettingsExchangeSendInitial",
             Self::BasicSettingsExchangeWaitResponse { .. } => "BasicSettingsExchangeWaitResponse",
             Self::ChannelConnection { .. } => "ChannelConnection",
@@ -350,6 +366,8 @@ pub struct ClientConnector {
     pub message_channel_id: Option<u16>,
     cluster_data: Option<gcc::ClientClusterData>,
     load_balance_info: Option<String>,
+    /// Credentials from a Server Redirection PDU, authenticated with RDSTLS.
+    rdstls: Option<RdstlsAuthenticationRequest>,
     /// X.224 negotiation flags supplied by the server.
     response_flags: nego::ResponseFlags,
     /// Multitransport flags the server advertised in its GCC
@@ -386,6 +404,7 @@ impl ClientConnector {
             message_channel_id: None,
             cluster_data: None,
             load_balance_info: None,
+            rdstls: None,
             response_flags: nego::ResponseFlags::empty(),
             server_multitransport_flags: None,
             auto_reconnect_cookie: None,
@@ -427,6 +446,20 @@ impl ClientConnector {
         self
     }
 
+    /// Authenticate with RDSTLS instead of CredSSP, following a Server Redirection
+    /// PDU whose password is flagged `PASSWORD_IS_PK_ENCRYPTED`.
+    ///
+    /// The connection request then offers `PROTOCOL_RDSTLS` alone: the target
+    /// expects exactly the redirected client, and these credentials are useless
+    /// to any other authentication. Pair with
+    /// [`with_load_balance_info`](Self::with_load_balance_info) carrying the PDU's
+    /// routing token, which is how the target finds the session being handed over.
+    #[must_use]
+    pub fn with_rdstls(mut self, credentials: RdstlsAuthenticationRequest) -> Self {
+        self.rdstls = Some(credentials);
+        self
+    }
+
     /// Send the initial X.224 request with an explicit security protocol set.
     pub fn initiate_with_security_protocol(
         &mut self,
@@ -450,6 +483,10 @@ impl ClientConnector {
     }
 
     fn enabled_security_protocols(&self) -> ConnectorResult<nego::SecurityProtocol> {
+        if self.rdstls.is_some() {
+            return Ok(nego::SecurityProtocol::RDSTLS);
+        }
+
         let mut security_protocol = nego::SecurityProtocol::empty();
 
         if self.config.enable_tls {
@@ -1043,6 +1080,8 @@ impl Sequence for ClientConnector {
             ClientConnectorState::ConnectionInitiationWaitConfirm { .. } => Some(&ironrdp_pdu::X224_HINT),
             ClientConnectorState::EnhancedSecurityUpgrade { .. } => None,
             ClientConnectorState::Credssp { .. } => None,
+            ClientConnectorState::RdstlsWaitCapabilities { .. } => Some(&RDSTLS_CAPABILITIES_HINT),
+            ClientConnectorState::RdstlsWaitAuthenticationResponse { .. } => Some(&RDSTLS_AUTHENTICATION_RESPONSE_HINT),
             ClientConnectorState::BasicSettingsExchangeSendInitial { .. } => None,
             ClientConnectorState::BasicSettingsExchangeWaitResponse { .. } => Some(&ironrdp_pdu::X224_HINT),
             ClientConnectorState::ChannelConnection { channel_connection, .. } => channel_connection.next_pdu_hint(),
@@ -1148,6 +1187,9 @@ impl Sequence for ClientConnector {
                 let next_state = if selected_protocol.is_standard_rdp_security() {
                     debug!("Standard RDP security selected; skipping TLS and CredSSP");
                     ClientConnectorState::BasicSettingsExchangeSendInitial { selected_protocol }
+                } else if selected_protocol.contains(nego::SecurityProtocol::RDSTLS) {
+                    debug!("Begin RDSTLS authentication");
+                    ClientConnectorState::RdstlsWaitCapabilities { selected_protocol }
                 } else if selected_protocol
                     .intersects(nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX)
                 {
@@ -1162,6 +1204,59 @@ impl Sequence for ClientConnector {
             }
 
             //== CredSSP ==//
+            ClientConnectorState::RdstlsWaitCapabilities { selected_protocol } => {
+                let capabilities = decode::<RdstlsCapabilities>(input).map_err(ConnectorError::decode)?;
+
+                debug!(message = ?capabilities, "Received");
+
+                if !capabilities.supports_version_1() {
+                    return Err(reason_err!(
+                        "RDSTLS",
+                        "server does not offer RDSTLS version 1 (supported versions: {:#06x})",
+                        capabilities.supported_versions,
+                    ));
+                }
+
+                let request = self
+                    .rdstls
+                    .as_ref()
+                    .ok_or_else(|| general_err!("RDSTLS selected without RDSTLS credentials"))?;
+
+                debug!(message = ?request, "Send");
+
+                let written = ironrdp_core::encode_buf(request, output).map_err(ConnectorError::encode)?;
+
+                (
+                    Written::from_size(written)?,
+                    ClientConnectorState::RdstlsWaitAuthenticationResponse { selected_protocol },
+                )
+            }
+
+            ClientConnectorState::RdstlsWaitAuthenticationResponse { selected_protocol } => {
+                let response = decode::<RdstlsAuthenticationResponse>(input).map_err(ConnectorError::decode)?;
+
+                debug!(message = ?response, "Received");
+
+                if response.result_code != RdstlsResultCode::SUCCESS {
+                    error!(
+                        result_code = response.result_code.0,
+                        reason = response.result_code.description(),
+                        "RDSTLS authentication rejected"
+                    );
+                    return Err(ConnectorError::new(
+                        "RDSTLS authentication",
+                        ConnectorErrorKind::AccessDenied,
+                    ));
+                }
+
+                info!("RDSTLS authentication succeeded");
+
+                (
+                    Written::Nothing,
+                    ClientConnectorState::BasicSettingsExchangeSendInitial { selected_protocol },
+                )
+            }
+
             ClientConnectorState::Credssp { selected_protocol } => (
                 Written::Nothing,
                 ClientConnectorState::BasicSettingsExchangeSendInitial { selected_protocol },
@@ -1885,8 +1980,162 @@ mod tests {
     use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
     use ironrdp_pdu::{gcc, nego};
 
-    use super::{create_client_info_pdu, create_gcc_blocks};
-    use crate::{Config, Credentials, DesktopSize};
+    use ironrdp_core::{WriteBuf, decode, encode_vec};
+    use ironrdp_pdu::rdstls::{
+        RdstlsAuthenticationRequest, RdstlsAuthenticationResponse, RdstlsCapabilities, RdstlsResultCode,
+    };
+    use ironrdp_pdu::x224::X224;
+
+    use super::{ClientConnector, ClientConnectorState, create_client_info_pdu, create_gcc_blocks};
+    use crate::{Config, Credentials, DesktopSize, Sequence as _};
+
+    fn rdstls_test_config() -> Config {
+        Config {
+            desktop_size: DesktopSize {
+                width: 1024,
+                height: 768,
+            },
+            monitor_layout: None,
+            desktop_scale_factor: 0,
+            enable_tls: false,
+            enable_credssp: true,
+            enable_standard_rdp_security: false,
+            credentials: Credentials::UsernamePassword {
+                username: "gdm-handover".into(),
+                password: "unused".into(),
+            },
+            domain: None,
+            client_build: 0,
+            client_name: "test".into(),
+            keyboard_type: gcc::KeyboardType::IBM_ENHANCED,
+            keyboard_subtype: 0,
+            keyboard_functional_keys_count: 12,
+            keyboard_layout: 0,
+            connection_type: gcc::ConnectionType::Lan,
+            ime_file_name: String::new(),
+            bitmap: None,
+            dig_product_id: String::new(),
+            client_dir: String::new(),
+            alternate_shell: String::new(),
+            work_dir: String::new(),
+            remote_application_mode: false,
+            rail_support_level: RailSupportLevel::empty(),
+            platform: MajorPlatformType::UNIX,
+            hardware_id: None,
+            request_data: None,
+            autologon: false,
+            enable_audio_playback: false,
+            enable_audio_capture: false,
+            performance_flags: Default::default(),
+            license_cache: None,
+            timezone_info: Default::default(),
+            compression_type: None,
+            enable_server_pointer: false,
+            pointer_software_rendering: false,
+            multitransport_flags: None,
+            support_dyn_vc_gfx_protocol: true,
+        }
+    }
+
+    fn rdstls_credentials() -> RdstlsAuthenticationRequest {
+        RdstlsAuthenticationRequest {
+            redirection_guid: vec![0x41, 0x00, 0x00, 0x00],
+            username: "gdm-handover".to_owned(),
+            domain: None,
+            password: vec![0x70, 0x00, 0x00, 0x00],
+        }
+    }
+
+    /// Drives a redirected connector to the point where RDSTLS starts.
+    fn rdstls_connector_at_capabilities() -> (ClientConnector, WriteBuf) {
+        let mut connector = ClientConnector::new(rdstls_test_config(), "127.0.0.1:3389".parse().unwrap())
+            .with_load_balance_info("Cookie: msts=484355192".to_owned())
+            .with_rdstls(rdstls_credentials());
+        let mut buf = WriteBuf::new();
+
+        connector.step(&[], None, &mut buf).unwrap();
+        let request = decode::<X224<nego::ConnectionRequestWithOpaqueRoutingToken>>(buf.filled())
+            .unwrap()
+            .0;
+        assert_eq!(
+            request.request.protocol,
+            nego::SecurityProtocol::RDSTLS,
+            "redirected connections offer RDSTLS alone, even with CredSSP enabled"
+        );
+        assert_eq!(request.routing_token.0, "Cookie: msts=484355192");
+
+        let confirm = X224(nego::ConnectionConfirm::Response {
+            flags: nego::ResponseFlags::empty(),
+            protocol: nego::SecurityProtocol::RDSTLS,
+        });
+        buf.clear();
+        connector.step(&encode_vec(&confirm).unwrap(), None, &mut buf).unwrap();
+        connector.mark_security_upgrade_as_done();
+
+        assert!(!connector.should_perform_credssp());
+        assert!(matches!(
+            connector.state,
+            ClientConnectorState::RdstlsWaitCapabilities { .. }
+        ));
+
+        (connector, buf)
+    }
+
+    #[test]
+    fn rdstls_replaces_credssp_after_redirection() {
+        let (mut connector, mut buf) = rdstls_connector_at_capabilities();
+
+        let capabilities = encode_vec(&RdstlsCapabilities {
+            supported_versions: 0x0003,
+        })
+        .unwrap();
+        buf.clear();
+        connector.step(&capabilities, None, &mut buf).unwrap();
+        assert_eq!(buf.filled(), encode_vec(&rdstls_credentials()).unwrap());
+
+        let response = encode_vec(&RdstlsAuthenticationResponse {
+            result_code: RdstlsResultCode::SUCCESS,
+        })
+        .unwrap();
+        buf.clear();
+        connector.step(&response, None, &mut buf).unwrap();
+
+        assert!(matches!(
+            connector.state,
+            ClientConnectorState::BasicSettingsExchangeSendInitial { selected_protocol }
+                if selected_protocol == nego::SecurityProtocol::RDSTLS
+        ));
+    }
+
+    #[test]
+    fn rdstls_rejection_fails_the_connection() {
+        let (mut connector, mut buf) = rdstls_connector_at_capabilities();
+
+        let capabilities = encode_vec(&RdstlsCapabilities {
+            supported_versions: 0x0001,
+        })
+        .unwrap();
+        connector.step(&capabilities, None, &mut buf).unwrap();
+
+        let response = encode_vec(&RdstlsAuthenticationResponse {
+            result_code: RdstlsResultCode::LOGON_FAILURE,
+        })
+        .unwrap();
+        buf.clear();
+        let error = connector.step(&response, None, &mut buf).unwrap_err();
+        assert!(matches!(error.kind(), crate::ConnectorErrorKind::AccessDenied));
+    }
+
+    #[test]
+    fn rdstls_requires_version_1() {
+        let (mut connector, mut buf) = rdstls_connector_at_capabilities();
+
+        let capabilities = encode_vec(&RdstlsCapabilities {
+            supported_versions: 0x0002,
+        })
+        .unwrap();
+        connector.step(&capabilities, None, &mut buf).unwrap_err();
+    }
 
     #[test]
     fn remote_application_client_info_uses_rail_launch_data() {
