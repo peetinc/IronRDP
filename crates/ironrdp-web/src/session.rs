@@ -21,6 +21,7 @@ use ironrdp::connector::connection_activation::ConnectionActivationState;
 use ironrdp::connector::credssp::KerberosConfig;
 use ironrdp::connector::{self, ClientConnector, Credentials};
 use ironrdp::displaycontrol::client::DisplayControlClient;
+use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
@@ -1073,23 +1074,33 @@ impl Session {
                                 .context("fast path input events processing")?
                         }
                         RdpInputEvent::Resize { width, height, scale_factor, physical_size } => {
-                            // RDPEDISP forbids odd widths. Round down here so the
-                            // request and the remembered size agree, instead of the
-                            // monitor layout encoder warning on every request.
-                            let width = width & !1;
                             debug!(width, height, scale_factor, "Resize event received");
                             if width == 0 || height == 0 {
                                 warn!("Resize event ignored: width or height is zero");
                                 Vec::new()
-                            } else if let Some(response_frame) = active_stage.encode_resize(width, height, scale_factor, physical_size) {
-                                let width = NonZeroU32::new(width).expect("width is guaranteed to be non-zero due to the prior check");
-                                let height = NonZeroU32::new(height).expect("height is guaranteed to be non-zero due to the prior check");
-
-                                requested_resize = Some((width, height));
-                                vec![ActiveStageOutput::ResponseFrame(response_frame?)]
                             } else {
-                                debug!("Resize event ignored");
-                                Vec::new()
+                                // RDPEDISP 2.2.2.2.1: even width, both sides in 200..=8192.
+                                // Adjusting here keeps the request and the remembered size in
+                                // agreement, and a size outside the range (a pane under 200px)
+                                // no longer fails the encode, which used to end the session.
+                                let (width, height) = MonitorLayoutEntry::adjust_display_size(width, height);
+                                match active_stage.encode_resize(width, height, scale_factor, physical_size) {
+                                    Some(Ok(response_frame)) => {
+                                        let width = NonZeroU32::new(width).expect("adjusted width is at least 200");
+                                        let height = NonZeroU32::new(height).expect("adjusted height is at least 200");
+
+                                        requested_resize = Some((width, height));
+                                        vec![ActiveStageOutput::ResponseFrame(response_frame)]
+                                    }
+                                    Some(Err(error)) => {
+                                        warn!(%error, width, height, "Resize request could not be encoded, ignoring");
+                                        Vec::new()
+                                    }
+                                    None => {
+                                        debug!("Resize event ignored");
+                                        Vec::new()
+                                    }
+                                }
                             }
                         },
                         RdpInputEvent::Printer(message) => {
