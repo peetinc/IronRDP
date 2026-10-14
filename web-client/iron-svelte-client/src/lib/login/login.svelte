@@ -26,9 +26,11 @@
     let password = '';
     // 9096, not 9095: the RDPDR rig on the direct-websocket-mode checkout owns
     // 9095 (and vite 5180), and concurrent sessions must not fight over ports.
-    let gatewayAddress = 'ws://localhost:9096';
-    let hostname = '10.10.100.193';
-    let domain = 'peetinc';
+    // VITE_RIG_* let one checkout serve a rig per target, each on its own vite
+    // port, without retyping the form: set them in the environment of `vite dev`.
+    let gatewayAddress: string = import.meta.env.VITE_RIG_GATEWAY ?? 'ws://localhost:9096';
+    let hostname: string = import.meta.env.VITE_RIG_HOSTNAME ?? '10.10.100.193';
+    let domain: string = import.meta.env.VITE_RIG_DOMAIN ?? 'peetinc';
     let kdc_proxy_url = '';
     let desktopSize = { width: 1280, height: 720 };
     let pop_up = false;
