@@ -450,7 +450,10 @@ impl SessionBuilder {
             vmconnect = inner.vmconnect.clone();
             kdc_proxy_url = inner.kdc_proxy_url.clone();
             client_name = inner.client_name.clone();
-            desktop_size = inner.desktop_size;
+            // A redirected connection continues the session at the size it had
+            // reached, not the one requested at connect: nothing on the JS side
+            // re-sends a resize the previous connection already applied.
+            desktop_size = reuse.as_ref().map_or(inner.desktop_size, |reuse| reuse.desktop_size);
 
             render_canvas = inner.render_canvas.clone().context("render_canvas missing")?;
 
@@ -537,6 +540,7 @@ impl SessionBuilder {
                 input_events_tx,
                 input_events_rx,
                 drive_slot,
+                desktop_size: _,
             }) => (input_events_tx, input_events_rx, drive_slot),
             None => {
                 let (tx, rx) = mpsc::unbounded();
@@ -811,6 +815,8 @@ struct Reuse {
     input_events_tx: mpsc::UnboundedSender<RdpInputEvent>,
     input_events_rx: mpsc::UnboundedReceiver<RdpInputEvent>,
     drive_slot: DriveSlot,
+    /// The desktop size the replaced connection last applied.
+    desktop_size: DesktopSize,
 }
 
 /// How one connection of a session ended.
@@ -1224,6 +1230,11 @@ impl Session {
                                 NonZeroU32::new(image_size.1).context("desktop height is zero")?,
                             );
                             requested_resize = None;
+                            // Remembered so a Server Redirection reconnects at this size.
+                            self.desktop_size.set(connector::DesktopSize {
+                                width: image.width(),
+                                height: image.height(),
+                            });
                         }
 
                         let region = extract_partial_image(&image, region, &mut draw_buffer);
@@ -1471,6 +1482,10 @@ impl Session {
                     input_events_tx: self.input_events_tx.clone(),
                     input_events_rx,
                     drive_slot: Rc::clone(&self.drive_slot),
+                    desktop_size: DesktopSize {
+                        width: self.desktop_size.get().width,
+                        height: self.desktop_size.get().height,
+                    },
                 }),
             )
             .await?;
