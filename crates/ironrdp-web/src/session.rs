@@ -1428,9 +1428,11 @@ impl Session {
     async fn follow_redirection(&self, pdu: ServerRedirectionPdu) -> Result<(), IronError> {
         let redirect = Redirect::from_pdu(pdu);
 
+        // The username is a one-time handover credential on g-r-d; keep it
+        // out of logs alongside the password.
         info!(
             routing_token = ?redirect.routing_token,
-            username = ?redirect.username,
+            has_username = redirect.username.is_some(),
             rdstls = redirect.rdstls.is_some(),
             "Following Server Redirection"
         );
