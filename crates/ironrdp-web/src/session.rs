@@ -2443,7 +2443,8 @@ mod egfx_capture {
         let enabled = dump.is_some();
         DUMP.with(|slot| *slot.borrow_mut() = dump);
         SEQ.with(|seq| seq.set(0));
-        ironrdp_egfx::client::set_capture_hook(enabled.then_some(forward as fn(&[u8])));
+        let hook: ironrdp_egfx::client::CaptureHook = forward;
+        ironrdp_egfx::client::set_capture_hook(enabled.then_some(hook));
 
         if enabled {
             tracing::warn!("EGFX capture enabled: every server graphics message goes to {DUMP_FN}");
