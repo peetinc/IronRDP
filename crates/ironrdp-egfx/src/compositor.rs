@@ -162,8 +162,8 @@ impl Compositor {
             .then_some((width, height))
     }
 
-    /// Handle `ResetGraphics`: set the output size and drop all surfaces, cache and
-    /// pending output.
+    /// Handle `ResetGraphics`: set the output size and drop all surfaces and
+    /// pending output. The bitmap cache is kept.
     ///
     /// Per MS-RDPEGFX 2.2.2.14 a reset implicitly destroys every surface and
     /// redefines the graphics output, so deltas produced before it are discarded
@@ -172,15 +172,21 @@ impl Compositor {
     /// `ResetGraphics` together, and those deltas were clipped against the previous
     /// output, so painting them into the new one repaints stale pixels and, after a
     /// shrink, addresses a region the new output no longer contains.
+    ///
+    /// Cache slots are not surfaces, and the server does not forget them: Windows
+    /// keeps issuing `CacheToSurface` for slots it filled before the reset and
+    /// never refills them. Dropping the cache here turned every such draw into a
+    /// no-op, leaving black blocks and stale content on screen. FreeRDP likewise
+    /// evicts cache slots only when the channel closes.
     pub(crate) fn reset(&mut self, width: u32, height: u32) {
         self.output_width = u16::try_from(width).unwrap_or(u16::MAX);
         self.output_height = u16::try_from(height).unwrap_or(u16::MAX);
         self.surfaces.clear();
-        self.cache.clear();
         self.frame.clear();
         self.ready.clear();
-        // Every charged allocation lived in one of those, so the whole charge goes.
-        self.allocated_bytes = 0;
+        // Every other charged allocation lived in one of those, so only the
+        // cache's charge remains.
+        self.allocated_bytes = self.cache.values().map(|tile| tile.data.len()).sum();
     }
 
     /// Reserve `len` pixel bytes, or refuse if that would exceed the budget.
@@ -1125,21 +1131,59 @@ mod tests {
         assert_eq!(c.surfaces.len(), 1);
     }
 
-    /// `ResetGraphics` empties both maps, so it must zero the charge with them.
+    /// `ResetGraphics` drops every surface, so it must release their charge with
+    /// them, and only theirs: the cache survives the reset and keeps its charge.
     #[test]
-    fn reset_releases_the_whole_charge() {
+    fn reset_releases_the_surface_charge_and_keeps_the_cache_charge() {
         const EDGE: u16 = 4096;
         let mut c = Compositor::default();
         c.reset(1920, 1080);
         c.create_surface(1, EDGE, EDGE);
         c.create_surface(2, EDGE, EDGE);
-        assert!(c.allocated_bytes > 0);
+        c.surface_to_cache(1, 7, &rect(0, 0, 64, 64));
+        let cached = c.cache.values().map(|tile| tile.data.len()).sum::<usize>();
+        assert!(cached > 0);
 
         c.reset(1920, 1080);
         assert_eq!(
-            c.allocated_bytes, 0,
-            "reset drops every surface, so it drops the charge"
+            c.allocated_bytes, cached,
+            "reset drops every surface, so it drops their charge, but not the cache's"
         );
+    }
+
+    /// Windows keeps drawing from slots it filled before a `ResetGraphics` (a
+    /// captured Server 2025 session issued 1,322 such `CacheToSurface` commands
+    /// after two resets). The cache is cleared only when the channel closes, as
+    /// in FreeRDP, so a draw from a pre-reset slot must still paint.
+    #[test]
+    fn cache_survives_reset_graphics() {
+        let mut c = Compositor::default();
+        c.reset(16, 16);
+        c.create_surface(1, 16, 16);
+        c.solid_fill(
+            1,
+            &Color {
+                b: 0x30,
+                g: 0x20,
+                r: 0x10,
+                xa: 0,
+            },
+            &[rect(0, 0, 8, 8)],
+        );
+        c.surface_to_cache(1, 7, &rect(0, 0, 8, 8));
+
+        c.reset(16, 16);
+        c.create_surface(1, 16, 16);
+        c.map_surface(1, 0, 0);
+        // map made the (zeroed) surface visible; commit and discard that delta.
+        c.end_frame();
+        let _ = c.drain_output();
+
+        c.cache_to_surface(7, 1, &[Point { x: 8, y: 8 }]);
+        c.end_frame();
+        let updates = c.drain_output();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(&updates[0].data[..4], &[0x10, 0x20, 0x30, 0xFF]);
     }
 
     /// Cache slots are a second allocation pool keyed by `u16`. Charging them against
