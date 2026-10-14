@@ -7,7 +7,7 @@
 // Chrome also hides console.debug behind "Default levels", so debug!() output
 // was invisible for two rounds of debugging.
 //
-// Only the formatted message text is forwarded — never stack traces, never the
+// Only the formatted message text is forwarded: never stack traces, never the
 // bundle URL. Anything longer than MAX_LINE is truncated.
 
 const SINK = 'http://localhost:9097';
@@ -31,7 +31,7 @@ function flush() {
         body: JSON.stringify(batch),
         keepalive: true,
     }).catch(() => {
-        // Sink not running is fine — the rig must never depend on it.
+        // Sink not running is fine; the rig must never depend on it.
     });
 }
 
@@ -74,7 +74,7 @@ function installEgfxDump() {
             headers: { 'content-type': 'application/octet-stream' },
             body: bytes,
         }).catch(() => {
-            // Sink not running is fine — the rig must never depend on it.
+            // Sink not running is fine; the rig must never depend on it.
         });
     };
     console.warn('[rig] EGFX capture armed: server graphics messages are posted to the sink');
