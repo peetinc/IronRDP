@@ -1073,6 +1073,10 @@ impl Session {
                                 .context("fast path input events processing")?
                         }
                         RdpInputEvent::Resize { width, height, scale_factor, physical_size } => {
+                            // RDPEDISP forbids odd widths. Round down here so the
+                            // request and the remembered size agree, instead of the
+                            // monitor layout encoder warning on every request.
+                            let width = width & !1;
                             debug!(width, height, scale_factor, "Resize event received");
                             if width == 0 || height == 0 {
                                 warn!("Resize event ignored: width or height is zero");
