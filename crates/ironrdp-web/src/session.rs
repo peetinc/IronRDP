@@ -31,7 +31,7 @@ use ironrdp::pdu::rdp::server_redirection::{RedirectionFlags, ServerRedirectionP
 use ironrdp::pdu::rdstls::RdstlsAuthenticationRequest;
 use ironrdp::rdpdr::Rdpdr;
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
-use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
+use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd, RdpsndClientHandler};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_core::WriteBuf;
@@ -45,6 +45,7 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{FileSystemDirectoryHandle, HtmlCanvasElement};
 
+use crate::audio::WasmRdpsndBackend;
 use crate::canvas::Canvas;
 use crate::clipboard;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
@@ -129,6 +130,7 @@ struct SessionBuilderInner {
     /// channel and the legacy bitmap path continues untouched. The `egfx`
     /// extension can set this to `false` as a kill-switch.
     use_egfx: bool,
+    enable_audio_playback: bool,
     enable_credssp: bool,
     enable_standard_rdp_security: bool,
     enable_server_pointer: bool,
@@ -178,6 +180,7 @@ impl Default for SessionBuilderInner {
 
             use_display_control: false,
             use_egfx: true,
+            enable_audio_playback: false,
             enable_credssp: true,
             enable_standard_rdp_security: false,
             enable_server_pointer: true,
@@ -300,6 +303,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |kdc_proxy_url: String| { self.0.borrow_mut().kdc_proxy_url = Some(kdc_proxy_url) };
             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
             |egfx: bool| { self.0.borrow_mut().use_egfx = egfx };
+
+            |enable_audio_playback: bool| { self.0.borrow_mut().enable_audio_playback = enable_audio_playback };
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
             |enable_standard_rdp_security: bool| {
                 self.0.borrow_mut().enable_standard_rdp_security = enable_standard_rdp_security;
@@ -551,6 +556,22 @@ impl SessionBuilder {
             }
         };
 
+        // Create the AudioContext as early as possible, while the page's user activation from
+        // the Connect click is freshest (autoplay policy). Audio failing must not fail the
+        // connection: fall back to the no-op backend and keep the server playing locally.
+        let rdpsnd_backend = if self.0.borrow().enable_audio_playback {
+            match WasmRdpsndBackend::new() {
+                Ok(backend) => Some(backend),
+                Err(error) => {
+                    warn!(%error, "Audio playback unavailable; continuing without sound");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        config.enable_audio_playback = rdpsnd_backend.is_some();
+
         let clipboard = remote_clipboard_changed_callback.clone().map(|callback| {
             WasmClipboard::new(
                 clipboard::WasmClipboardMessageProxy::new(input_events_tx.clone()),
@@ -675,6 +696,7 @@ impl SessionBuilder {
             use_display_control,
             use_egfx,
             redirect,
+            rdpsnd_backend,
         })
         .await?;
 
@@ -2126,6 +2148,8 @@ struct ConnectParams {
     use_egfx: bool,
     /// Set when this connection follows a Server Redirection PDU.
     redirect: Option<RedirectConnector>,
+    /// `Some` when the `enable_audio_playback` extension is on and Web Audio is available.
+    rdpsnd_backend: Option<WasmRdpsndBackend>,
 }
 
 fn default_printer_driver_name() -> String {
@@ -2178,6 +2202,7 @@ async fn connect(
         use_display_control,
         use_egfx,
         redirect,
+        rdpsnd_backend,
     }: ConnectParams,
 ) -> Result<(connector::ConnectionResult, RdpStream, bytes::BytesMut), IronError> {
     let framed = ironrdp_futures::LocalFuturesFramed::new(ws);
@@ -2210,9 +2235,13 @@ async fn connect(
     //     DisplayControl), going silent after Font Map and dropping the session
     //     60 seconds later. The identical build with RDPSND announced gets the
     //     DVC caps request immediately after finalization.
-    // We do not play audio in the web client; the no-op processor exists to
-    // satisfy those dependencies.
-    connector.attach_static_channel(Rdpsnd::new(Box::new(NoopRdpsndBackend)));
+    // With audio playback enabled it gets the Web Audio backend; otherwise the no-op
+    // processor exists only to satisfy those dependencies.
+    let rdpsnd_backend: Box<dyn RdpsndClientHandler> = match rdpsnd_backend {
+        Some(backend) => Box::new(backend),
+        None => Box::new(NoopRdpsndBackend),
+    };
+    connector.attach_static_channel(Rdpsnd::new(rdpsnd_backend));
 
     // Drive and printer redirection coexist on the one RDPDR channel `Rdpdr` accepts a single
     // backend for, via `WasmCompositeBackend` — see `drive::composite`'s module doc comment for
