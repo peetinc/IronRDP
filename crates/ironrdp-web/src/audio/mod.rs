@@ -16,7 +16,7 @@ use ironrdp::rdpsnd::client::RdpsndClientHandler;
 use ironrdp::rdpsnd::pdu::{AudioFormat, AudioFormatFlags, PitchPdu, VolumePdu};
 use tracing::{info, trace};
 
-use self::codec::Volume;
+use self::codec::{DecodedAudio, Volume};
 use self::player::Player;
 pub(crate) use self::player::resume as resume_audio;
 
@@ -27,6 +27,8 @@ pub(crate) struct WasmRdpsndBackend {
     volume: Volume,
     /// Last format a block played in; logged on change so the negotiated codec is visible.
     active_format: Option<AudioFormat>,
+    /// Decode target reused across blocks.
+    decoded: DecodedAudio,
 }
 
 // SAFETY: `RdpsndClientHandler: Send` is a supertrait bound required by `Rdpsnd`'s
@@ -42,6 +44,7 @@ impl WasmRdpsndBackend {
             player: Player::new()?,
             volume: Volume::FULL,
             active_format: None,
+            decoded: DecodedAudio::default(),
         })
     }
 
@@ -67,9 +70,10 @@ impl RdpsndClientHandler for WasmRdpsndBackend {
             self.active_format = Some(format.clone());
         }
 
-        match codec::decode(format, &data, self.volume) {
-            Some(audio) => self.player.enqueue(&audio),
-            None => trace!(len = data.len(), "Dropping undecodable RDPSND block"),
+        if codec::decode(format, &data, self.volume, &mut self.decoded) {
+            self.player.enqueue(&self.decoded);
+        } else {
+            trace!(len = data.len(), "Dropping undecodable RDPSND block");
         }
     }
 
