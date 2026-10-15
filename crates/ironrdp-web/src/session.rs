@@ -28,7 +28,7 @@ use ironrdp::pdu::rdp::capability_sets::client_codecs_capabilities;
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp::rdpdr::Rdpdr;
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
-use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
+use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd, RdpsndClientHandler};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_core::WriteBuf;
@@ -40,6 +40,7 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{FileSystemDirectoryHandle, HtmlCanvasElement};
 
+use crate::audio::WasmRdpsndBackend;
 use crate::canvas::Canvas;
 use crate::clipboard;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
@@ -113,6 +114,7 @@ struct SessionBuilderInner {
     drive_share: Option<DriveShareConfig>,
 
     use_display_control: bool,
+    enable_audio_playback: bool,
     enable_credssp: bool,
     outbound_message_size_limit: Option<usize>,
 }
@@ -158,6 +160,7 @@ impl Default for SessionBuilderInner {
             drive_share: None,
 
             use_display_control: false,
+            enable_audio_playback: false,
             enable_credssp: true,
             outbound_message_size_limit: None,
         }
@@ -276,6 +279,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |vmconnect: String| { self.0.borrow_mut().vmconnect = Some(vmconnect) };
             |kdc_proxy_url: String| { self.0.borrow_mut().kdc_proxy_url = Some(kdc_proxy_url) };
             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
+            |enable_audio_playback: bool| { self.0.borrow_mut().enable_audio_playback = enable_audio_playback };
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
             |outbound_message_size_limit: f64| {
                 let limit = if outbound_message_size_limit >= 0.0 && outbound_message_size_limit <= f64::from(u32::MAX) {
@@ -448,6 +452,22 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         let enable_credssp = self.0.borrow().enable_credssp;
         config.enable_credssp = enable_credssp;
 
+        // Create the AudioContext as early as possible, while the page's user activation from
+        // the Connect click is freshest (autoplay policy). Audio failing must not fail the
+        // connection: fall back to the no-op backend and keep the server playing locally.
+        let rdpsnd_backend = if self.0.borrow().enable_audio_playback {
+            match WasmRdpsndBackend::new() {
+                Ok(backend) => Some(backend),
+                Err(error) => {
+                    warn!(%error, "Audio playback unavailable; continuing without sound");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        config.enable_audio_playback = rdpsnd_backend.is_some();
+
         let (input_events_tx, input_events_rx) = mpsc::unbounded();
 
         let clipboard = remote_clipboard_changed_callback.clone().map(|callback| {
@@ -576,6 +596,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             drive_slot: Rc::clone(&drive_slot),
             computer_name: client_name.clone(),
             use_display_control,
+            rdpsnd_backend,
         })
         .await?;
 
@@ -1811,6 +1832,8 @@ struct ConnectParams {
     /// `computer_name` when constructing the `Rdpdr` processor.
     computer_name: String,
     use_display_control: bool,
+    /// `Some` when the `enable_audio_playback` extension is on and Web Audio is available.
+    rdpsnd_backend: Option<WasmRdpsndBackend>,
 }
 
 fn default_printer_driver_name() -> String {
@@ -1861,6 +1884,7 @@ async fn connect(
         drive_slot,
         computer_name,
         use_display_control,
+        rdpsnd_backend,
     }: ConnectParams,
 ) -> Result<(connector::ConnectionResult, RdpStream, bytes::BytesMut), IronError> {
     let framed = ironrdp_futures::LocalFuturesFramed::new(ws);
@@ -1884,9 +1908,13 @@ async fn connect(
     //     DisplayControl), going silent after Font Map and dropping the session
     //     60 seconds later. The identical build with RDPSND announced gets the
     //     DVC caps request immediately after finalization.
-    // We do not play audio in the web client; the no-op processor exists to
-    // satisfy those dependencies.
-    connector.attach_static_channel(Rdpsnd::new(Box::new(NoopRdpsndBackend)));
+    // With audio playback enabled it gets the Web Audio backend; otherwise the no-op
+    // processor exists only to satisfy those dependencies.
+    let rdpsnd_backend: Box<dyn RdpsndClientHandler> = match rdpsnd_backend {
+        Some(backend) => Box::new(backend),
+        None => Box::new(NoopRdpsndBackend),
+    };
+    connector.attach_static_channel(Rdpsnd::new(rdpsnd_backend));
 
     // Drive and printer redirection coexist on the one RDPDR channel `Rdpdr` accepts a single
     // backend for, via `WasmCompositeBackend` — see `drive::composite`'s module doc comment for

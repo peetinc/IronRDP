@@ -164,7 +164,7 @@ mod tests {
         let mut schedule = Schedule::default();
         let first = schedule.place(10.0, 0.02).expect("placed");
         let second = schedule.place(10.001, 0.02).expect("placed");
-        assert_eq!(second, first + 0.02);
+        assert!((second - (first + 0.02)).abs() < 1e-9);
     }
 
     #[test]
