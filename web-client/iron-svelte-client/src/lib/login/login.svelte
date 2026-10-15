@@ -5,6 +5,7 @@
     import type { PrintJobEntry } from '../../models/print-job';
     import {
         displayControl,
+        enableAudioPlayback,
         kdcProxyUrl,
         init,
         driveShare,
@@ -30,6 +31,7 @@
     let desktopSize = { width: 1280, height: 720 };
     let pop_up = false;
     let enable_clipboard = true;
+    let enable_audio = true;
 
     // e2e test-rig hook: RDPDR folder share. Populated via
     // window.showDirectoryPicker(); kept component-scoped (no module-level
@@ -189,6 +191,10 @@
             .withAuthToken('')
             .withDesktopSize(desktopSize)
             .withExtension(displayControl(true));
+
+        if (enable_audio) {
+            configBuilder.withExtension(enableAudioPlayback(true));
+        }
 
         if (kdc_proxy_url !== '') {
             configBuilder.withExtension(kdcProxyUrl(kdc_proxy_url));
@@ -385,6 +391,15 @@
                                     style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
                                 />
                                 <label for="enable_clipboard">Enable Clipboard</label>
+                            </div>
+                            <div class="checkbox-wrapper">
+                                <input
+                                    id="enable_audio"
+                                    type="checkbox"
+                                    bind:checked={enable_audio}
+                                    style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
+                                />
+                                <label for="enable_audio">Play Remote Audio</label>
                             </div>
                         </div>
                     </div>

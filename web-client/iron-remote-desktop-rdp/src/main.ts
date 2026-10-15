@@ -45,6 +45,14 @@ export function displayControl(enable: boolean): Extension {
     return new Extension('display_control', enable);
 }
 
+/**
+ * Play remote session audio (RDPSND) in the browser through Web Audio. Off by default.
+ * Browsers only start audio after a user gesture on the page; connecting from a click satisfies that.
+ */
+export function enableAudioPlayback(enable: boolean): Extension {
+    return new Extension('enable_audio_playback', enable);
+}
+
 export function kdcProxyUrl(url: string): Extension {
     return new Extension('kdc_proxy_url', url);
 }
