@@ -6,9 +6,10 @@
 
 use anyhow::anyhow;
 use tracing::{debug, warn};
-use wasm_bindgen::JsValue;
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{AudioContext, AudioContextState};
+use web_sys::{AudioContext, AudioContextState, AudioDestinationNode, Window};
 
 use super::codec::DecodedAudio;
 
@@ -30,12 +31,15 @@ pub(crate) fn is_resumable(state: AudioContextState) -> bool {
     !matches!(state, AudioContextState::Running | AudioContextState::Closed)
 }
 
-/// Ask a context blocked by the autoplay policy to start. Fire-and-forget: a rejection
-/// only means the browser wants a user gesture first, and the next input event retries.
+/// Events that grant user activation, the only time browsers honor `resume()` for a
+/// context the autoplay policy blocked ([HTML activation-triggering input events]).
 ///
-/// Call from a user input handler where possible; browsers only honor `resume()` within
-/// (or after) user activation.
-pub(crate) fn resume(context: &AudioContext) {
+/// [HTML activation-triggering input events]: https://html.spec.whatwg.org/multipage/interaction.html#activation-triggering-input-event
+const GESTURE_EVENTS: [&str; 4] = ["keydown", "pointerdown", "pointerup", "touchend"];
+
+/// Ask a context blocked by the autoplay policy to start. Fire-and-forget: a rejection
+/// only means the browser wants a user gesture first, and the next gesture retries.
+fn resume(context: &AudioContext) {
     if !is_resumable(context.state()) {
         return;
     }
@@ -92,30 +96,78 @@ impl Schedule {
 #[derive(Debug)]
 pub(crate) struct Player {
     context: AudioContext,
+    destination: AudioDestinationNode,
     schedule: Schedule,
     /// Whether playback already asked a suspended context to start. Later attempts come
-    /// from user input (see [`resume`]), where browsers actually honor them.
+    /// from [`GestureListener`], where browsers actually honor them.
     resume_attempted: bool,
+    _gesture_listener: Option<GestureListener>,
+}
+
+/// Page-wide capture listener resuming the context on any user gesture, including ones
+/// outside the session canvas. Removed on drop.
+#[derive(Debug)]
+struct GestureListener {
+    window: Window,
+    callback: Closure<dyn FnMut()>,
+}
+
+impl Drop for GestureListener {
+    fn drop(&mut self) {
+        for event in GESTURE_EVENTS {
+            if let Err(error) = self.window.remove_event_listener_with_callback_and_bool(
+                event,
+                self.callback.as_ref().unchecked_ref(),
+                true,
+            ) {
+                debug!(?error, event, "Failed to remove audio gesture listener");
+            }
+        }
+    }
 }
 
 impl Player {
     pub(crate) fn new() -> anyhow::Result<Self> {
         let context = AudioContext::new().map_err(|error| anyhow!("create AudioContext: {error:?}"))?;
 
+        let gesture_listener = web_sys::window().map(|window| {
+            let gesture_context = context.clone();
+            let callback = Closure::<dyn FnMut()>::new(move || resume(&gesture_context));
+            for event in GESTURE_EVENTS {
+                // Capture phase, so a canvas handler stopping propagation cannot hide the gesture.
+                if let Err(error) =
+                    window.add_event_listener_with_callback_and_bool(event, callback.as_ref().unchecked_ref(), true)
+                {
+                    warn!(?error, event, "Failed to install audio gesture listener");
+                }
+            }
+            GestureListener { window, callback }
+        });
+
         Ok(Self {
+            destination: context.destination(),
             context,
             schedule: Schedule::default(),
             resume_attempted: false,
+            _gesture_listener: gesture_listener,
         })
     }
 
     pub(crate) fn enqueue(&mut self, audio: &DecodedAudio) {
         // Autoplay policy: a context created without user activation starts suspended.
         // Ask once here (enough when the page already had a gesture, e.g. the Connect
-        // click); the session retries from input handlers otherwise.
+        // click); the gesture listener retries otherwise.
         if !self.resume_attempted {
             self.resume_attempted = true;
             resume(&self.context);
+        }
+
+        // While suspended (or interrupted), the context clock is frozen: scheduling against
+        // it would queue stale audio that plays whenever the context finally starts. Drop
+        // the block and start fresh once it runs.
+        if self.context.state() != AudioContextState::Running {
+            self.schedule.reset();
+            return;
         }
 
         let Ok(frames) = u32::try_from(audio.frames()) else {
@@ -132,11 +184,17 @@ impl Player {
             return;
         };
 
-        if let Err(error) = start_block(&self.context, audio, frames, when) {
+        if let Err(error) = start_block(&self.context, &self.destination, audio, frames, when) {
             warn!(?error, "Failed to schedule RDPSND block");
         }
 
-        fn start_block(context: &AudioContext, audio: &DecodedAudio, frames: u32, when: f64) -> Result<(), JsValue> {
+        fn start_block(
+            context: &AudioContext,
+            destination: &AudioDestinationNode,
+            audio: &DecodedAudio,
+            frames: u32,
+            when: f64,
+        ) -> Result<(), JsValue> {
             let n_channels = u32::try_from(audio.channels.len()).map_err(|_| JsValue::from_str("too many channels"))?;
             #[expect(
                 clippy::as_conversions,
@@ -153,20 +211,10 @@ impl Player {
 
             let source = context.create_buffer_source()?;
             source.set_buffer(Some(&buffer));
-            source.connect_with_audio_node(&context.destination())?;
+            source.connect_with_audio_node(destination)?;
             source.start_with_when(when)?;
             Ok(())
         }
-    }
-
-    pub(crate) fn context(&self) -> &AudioContext {
-        &self.context
-    }
-
-    /// Forget queued timing (format change or server Close). Already-started
-    /// sources play out.
-    pub(crate) fn reset(&mut self) {
-        self.schedule.reset();
     }
 }
 

@@ -62,6 +62,7 @@ web-sys = { version = "0.3", features = [
     "AudioScheduledSourceNode",
     "Blob",
     "CanvasRenderingContext2d",
+    "EventTarget",
     "File",
     "FileSystemCreateWritableOptions",
     "FileSystemDirectoryHandle",
