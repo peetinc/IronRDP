@@ -22,6 +22,7 @@ extern crate rustls_pki_types as _;
 // an implementation on this target — see the Cargo.toml comment.
 extern crate ring as _;
 
+mod audio;
 mod canvas;
 mod clipboard;
 mod drive;
