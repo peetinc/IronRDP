@@ -26,7 +26,8 @@ later without reworking the playback path, because PCM is bandwidth-heavy
 - `ironrdp-web` attaches `Rdpsnd::new(Box::new(NoopRdpsndBackend))`
   unconditionally because Windows only drives RDPDR when RDPSND is present
   (MS-RDPEFS Appendix A<1>). `build_config` sets `enable_audio_playback: false`,
-  so `INFO_NOAUDIOPLAYBACK` is set and the server plays audio locally.
+  so `INFO_NOAUDIOPLAYBACK` is set: the server neither redirects nor plays audio
+  (playing it on the server would be `INFO_REMOTECONSOLEAUDIO`).
 - `ironrdp-rdpsnd-native` (cpal) is the reference backend. It does not build for
   `wasm32-unknown-unknown`; it is a template, not a dependency.
 
@@ -104,7 +105,6 @@ yet). `decode` stays the sync fast path.
 - `enqueue(DecodedAudio)` builds an `AudioBuffer` at the block's own sample
   rate (Web Audio resamples to the device rate) and schedules an
   `AudioBufferSourceNode` at `next_start`.
-- `reset()` forgets the schedule (format change / server Close).
 - Scheduling math lives in a pure `Schedule` struct, unit-tested on the host:
   - `LEAD = 0.05 s`: initial/after-underrun lead so the first block is not
     clipped and small arrival jitter is absorbed.
@@ -116,10 +116,20 @@ yet). `decode` stays the sync fast path.
     without the hysteresis it would pin latency at the cap forever.
   - Underrun: if `next_start < now`, restart at `now + LEAD`.
 - Autoplay policy: the context may start `suspended`. Playback asks `resume()`
-  once; after that, `Session::apply_inputs` (called synchronously from DOM input
-  handlers, i.e. within user activation) resumes it whenever the state is
-  neither `running` nor `closed` — which also covers Safari's `interrupted`,
-  a state web-sys does not model.
+  once; after that, a page-wide capture listener on the activation-triggering
+  events (`keydown`, `pointerdown`, `pointerup`, `touchend`) resumes it whenever
+  the state is neither `running` nor `closed` — which also covers Safari's
+  `interrupted`, a state web-sys does not model. Being page-wide, it catches
+  gestures outside the canvas; being gesture-only, it never piles up pending
+  `resume()` promises the way resuming on every input event would.
+- While the context is not `running` its clock is frozen, so blocks are dropped
+  and the schedule reset rather than queued as stale audio that would play
+  whenever the context finally starts.
+- Format changes and server Close do not touch timing: the queue's end time is
+  in context seconds, valid across formats, and an underrun restarts it anyway.
+  Resetting would overlap new audio with the still-queued tail.
+- Decoding writes into a buffer reused across blocks; the destination node is
+  cached. Per block, only the `AudioBuffer` and source node are created.
 - `Drop` calls `AudioContext::close()`.
 
 **`WasmRdpsndBackend`** (`audio/mod.rs`) — the `RdpsndClientHandler`.
@@ -130,14 +140,15 @@ yet). `decode` stays the sync fast path.
   INFO the first time a format is seen (`Playing RDPSND format`), so we learn
   what the server picked.
 - `set_volume`: store `(left, right)`; applies from the next block.
-- `close`: `player.reset()`.
+- `close`: clear the logged format (timing is left alone, see above).
 - `unsafe impl Send`, with the same single-thread SAFETY argument as
   `WasmDriveBackend`: `RdpsndClientHandler: Send` is a storage bound; this
   backend lives and dies on the wasm event loop.
 
 Construction failure (no `AudioContext`, e.g. a locked-down embed) logs a
-warning and falls back to `NoopRdpsndBackend` — audio failing must never fail
-the connection, and RDPSND must stay attached for RDPDR.
+warning and falls back to `NoopRdpsndBackend` with `INFO_NOAUDIOPLAYBACK` left
+set (no audio anywhere) — audio failing must never fail the connection, and
+RDPSND must stay attached for RDPDR.
 
 ### Configuration surface
 
