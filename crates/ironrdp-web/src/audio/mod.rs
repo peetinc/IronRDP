@@ -18,6 +18,7 @@ use tracing::{info, trace};
 
 use self::codec::Volume;
 use self::player::Player;
+pub(crate) use self::player::resume as resume_audio;
 
 #[derive(Debug)]
 pub(crate) struct WasmRdpsndBackend {
@@ -42,6 +43,11 @@ impl WasmRdpsndBackend {
             volume: Volume::FULL,
             active_format: None,
         })
+    }
+
+    /// The playback context, for resuming it from user input (see [`resume_audio`]).
+    pub(crate) fn audio_context(&self) -> web_sys::AudioContext {
+        self.player.context().clone()
     }
 }
 
