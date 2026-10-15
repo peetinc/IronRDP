@@ -148,6 +148,12 @@ export declare interface DroppedFile {
  */
 export declare function egfx(enable: boolean): Extension;
 
+/**
+ * Play remote session audio (RDPSND) in the browser through Web Audio. Off by default.
+ * Browsers only start audio after a user gesture on the page; connecting from a click satisfies that.
+ */
+export declare function enableAudioPlayback(enable: boolean): Extension;
+
 export declare function enableCredssp(enable: boolean): Extension;
 
 export declare function enableServerPointer(enable: boolean): Extension;
