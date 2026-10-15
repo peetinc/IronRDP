@@ -94,8 +94,9 @@ Rdpsnd (SVC) ──wave(format, data)──▶ WasmRdpsndBackend
 Sync decoders (PCM, A-law/µ-law, ADPCM) fit `decode` directly. Async decoders
 (WebCodecs) cannot return synchronously; phase 3 adds a second path where the
 backend submits the encoded chunk and the decoder's output callback calls
-`Player::enqueue` itself (the player sits behind `Rc<RefCell<_>>` from day one
-so that callback can reach it). `decode` stays the sync fast path.
+`Player::enqueue` itself; phase 3 moves the player behind `Rc<RefCell<_>>` so
+that callback can reach it (phase 1 owns it directly — nothing else needs it
+yet). `decode` stays the sync fast path.
 
 **`player`** — owns the `AudioContext`; the only unit touching Web Audio.
 
@@ -155,8 +156,9 @@ promoted later if a second backend needs it).
 
 - Malformed/short wave payloads: `decode` drops a trailing partial frame; an
   empty result is skipped. Never panic on server data.
-- Unknown format in `wave` (cannot happen unless negotiation and table
-  disagree): `warn!` once per format, drop.
+- Undecodable format in `wave` (cannot happen unless negotiation and table
+  disagree): visible once via the `Playing RDPSND format` line, then each
+  block is dropped at TRACE.
 - `AudioBuffer` creation / `start` errors: `warn!` and drop the block; do not
   tear down the player.
 - All `web-sys` calls return `Result`; nothing `unwrap`s a `JsValue` error.
