@@ -6,6 +6,7 @@
     import {
         displayControl,
         egfx,
+        enableAudioPlayback,
         kdcProxyUrl,
         init,
         driveShare,
@@ -37,6 +38,7 @@
     // EGFX kill-switch for the T4 test matrix: unticking this must fall back to
     // the legacy bitmap path and still render.
     let enable_egfx = true;
+    let enable_audio = true;
 
     // e2e test-rig hook: RDPDR folder share. Populated via
     // window.showDirectoryPicker(); kept component-scoped (no module-level
@@ -197,6 +199,10 @@
             .withDesktopSize(desktopSize)
             .withExtension(displayControl(true))
             .withExtension(egfx(enable_egfx));
+
+        if (enable_audio) {
+            configBuilder.withExtension(enableAudioPlayback(true));
+        }
 
         if (kdc_proxy_url !== '') {
             configBuilder.withExtension(kdcProxyUrl(kdc_proxy_url));
@@ -411,6 +417,15 @@
                                     style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
                                 />
                                 <label for="auto_resize">Auto Resize</label>
+                            </div>
+                            <div class="checkbox-wrapper">
+                                <input
+                                    id="enable_audio"
+                                    type="checkbox"
+                                    bind:checked={enable_audio}
+                                    style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
+                                />
+                                <label for="enable_audio">Play Remote Audio</label>
                             </div>
                         </div>
                     </div>
