@@ -45,7 +45,7 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{FileSystemDirectoryHandle, HtmlCanvasElement};
 
-use crate::audio::{WasmRdpsndBackend, resume_audio};
+use crate::audio::WasmRdpsndBackend;
 use crate::canvas::Canvas;
 use crate::clipboard;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
@@ -571,7 +571,6 @@ impl SessionBuilder {
             None
         };
         config.enable_audio_playback = rdpsnd_backend.is_some();
-        let audio_context = rdpsnd_backend.as_ref().map(WasmRdpsndBackend::audio_context);
 
         let clipboard = remote_clipboard_changed_callback.clone().map(|callback| {
             WasmClipboard::new(
@@ -715,7 +714,6 @@ impl SessionBuilder {
             input_database: RefCell::new(ironrdp::input::Database::new()),
             writer_tx: RefCell::new(writer_tx),
             input_events_tx,
-            audio_context,
 
             render_canvas,
             set_cursor_style_callback,
@@ -857,9 +855,6 @@ pub(crate) struct Session {
     /// Replaced when a Server Redirection moves the session to a new connection.
     writer_tx: RefCell<mpsc::UnboundedSender<Vec<u8>>>,
     input_events_tx: mpsc::UnboundedSender<RdpInputEvent>,
-    /// Playback context when audio is enabled; user input resumes it if the autoplay
-    /// policy left it suspended.
-    audio_context: Option<web_sys::AudioContext>,
 
     render_canvas: HtmlCanvasElement,
     set_cursor_style_callback: js_sys::Function,
@@ -1595,12 +1590,6 @@ impl iron_remote_desktop::Session for Session {
     }
 
     fn apply_inputs(&self, transaction: Self::InputTransaction) -> Result<(), Self::Error> {
-        // Called synchronously from DOM input handlers, i.e. within user activation: the one
-        // place a `resume()` blocked by the autoplay policy is honored.
-        if let Some(audio_context) = &self.audio_context {
-            resume_audio(audio_context);
-        }
-
         let inputs = self.input_database.borrow_mut().apply(transaction);
         self.h_send_inputs(inputs)
     }

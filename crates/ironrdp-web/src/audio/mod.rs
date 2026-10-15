@@ -18,7 +18,6 @@ use tracing::{info, trace};
 
 use self::codec::{DecodedAudio, Volume};
 use self::player::Player;
-pub(crate) use self::player::resume as resume_audio;
 
 #[derive(Debug)]
 pub(crate) struct WasmRdpsndBackend {
@@ -46,11 +45,6 @@ impl WasmRdpsndBackend {
             active_format: None,
             decoded: DecodedAudio::default(),
         })
-    }
-
-    /// The playback context, for resuming it from user input (see [`resume_audio`]).
-    pub(crate) fn audio_context(&self) -> web_sys::AudioContext {
-        self.player.context().clone()
     }
 }
 
@@ -84,8 +78,9 @@ impl RdpsndClientHandler for WasmRdpsndBackend {
     fn set_pitch(&mut self, _pitch: PitchPdu) {}
 
     fn close(&mut self) {
+        // Timing is left alone: the queue's end time is in context seconds, valid across
+        // formats, and resetting it would overlap new audio with the still-queued tail.
         self.active_format = None;
-        self.player.reset();
     }
 }
 
