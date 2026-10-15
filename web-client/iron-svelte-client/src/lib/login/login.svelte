@@ -171,6 +171,8 @@
                 desktopSize,
                 kdc_proxy_url,
                 enable_clipboard,
+                enable_audio,
+                enable_nla,
             });
             const base64Data = btoa(data);
             window.open(

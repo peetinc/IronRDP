@@ -3,7 +3,14 @@
     import { userInteractionService } from '../../services/session.service';
     import type { UserInteraction } from '../../../static/iron-remote-desktop';
     import { Backend } from '../../../static/iron-remote-desktop-rdp';
-    import { preConnectionBlob, displayControl, kdcProxyUrl, vmConnect } from '../../../static/iron-remote-desktop-rdp';
+    import {
+        preConnectionBlob,
+        displayControl,
+        enableAudioPlayback,
+        enableCredssp,
+        kdcProxyUrl,
+        vmConnect,
+    } from '../../../static/iron-remote-desktop-rdp';
 
     let userInteraction: UserInteraction;
     let cursorOverrideActive = false;
@@ -33,6 +40,8 @@
                 vmconnectId,
                 vmconnectMode,
                 desktopSize,
+                enable_audio,
+                enable_nla,
             } = parsedData;
 
             const configBuilder = userInteraction
@@ -56,6 +65,14 @@
 
             if (typeof kdc_proxy_url === 'string' && kdc_proxy_url !== '') {
                 configBuilder.withExtension(kdcProxyUrl(kdc_proxy_url));
+            }
+
+            if (enable_audio === true) {
+                configBuilder.withExtension(enableAudioPlayback(true));
+            }
+
+            if (enable_nla === false) {
+                configBuilder.withExtension(enableCredssp(false));
             }
 
             const config = configBuilder.build();
