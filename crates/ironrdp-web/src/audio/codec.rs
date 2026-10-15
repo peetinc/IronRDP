@@ -9,7 +9,9 @@ use ironrdp::rdpsnd::pdu::{AudioFormat, WaveFormat};
 
 /// Decoded audio, planar (one `Vec` per channel, equal lengths), the shape
 /// `AudioBuffer::copy_to_channel` takes.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Reused across blocks (see [`decode`]) so the audio hot path does not allocate.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct DecodedAudio {
     pub(crate) sample_rate: u32,
     pub(crate) channels: Vec<Vec<f32>>,
@@ -70,40 +72,42 @@ pub(crate) fn supported_formats() -> Vec<AudioFormat> {
         .collect()
 }
 
-/// Decode one wave block, applying `volume`.
+/// Decode one wave block into `out`, applying `volume`, reusing `out`'s allocations.
 ///
-/// Returns `None` for formats this player does not handle, and for blocks too
-/// short to hold a single frame. A trailing partial frame is dropped.
-pub(crate) fn decode(format: &AudioFormat, data: &[u8], volume: Volume) -> Option<DecodedAudio> {
+/// Returns `false` for formats this player does not handle, and for blocks too
+/// short to hold a single frame; `out` is then unspecified. A trailing partial
+/// frame is dropped.
+pub(crate) fn decode(format: &AudioFormat, data: &[u8], volume: Volume, out: &mut DecodedAudio) -> bool {
     match (format.format, format.bits_per_sample) {
         (WaveFormat::PCM, 16) if (1..=2).contains(&format.n_channels) => {
             let n_channels = usize::from(format.n_channels);
             let frame_len = n_channels * 2 /* bytes per 16-bit sample */;
             let frames = data.len() / frame_len;
             if frames == 0 {
-                return None;
+                return false;
             }
 
             // Same lane mapping as the native backend: left on even lanes, right on odd;
             // mono takes the left level. Linear amplitude scale.
             let gains = [volume.left, volume.right].map(|level| f32::from(level) / f32::from(u16::MAX));
 
-            let mut channels: Vec<Vec<f32>> = core::iter::repeat_with(|| Vec::with_capacity(frames))
-                .take(n_channels)
-                .collect();
+            out.sample_rate = format.n_samples_per_sec;
+            out.channels.resize_with(n_channels, Vec::new);
+            for channel in &mut out.channels {
+                channel.clear();
+                channel.reserve(frames);
+            }
+
             for frame in data.chunks_exact(frame_len) {
-                for ((sample, out), gain) in frame.chunks_exact(2).zip(channels.iter_mut()).zip(gains) {
+                for ((sample, channel), gain) in frame.chunks_exact(2).zip(out.channels.iter_mut()).zip(gains) {
                     let sample = i16::from_le_bytes([sample[0], sample[1]]);
-                    out.push(f32::from(sample) / 32768.0 * gain);
+                    channel.push(f32::from(sample) / 32768.0 * gain);
                 }
             }
 
-            Some(DecodedAudio {
-                sample_rate: format.n_samples_per_sec,
-                channels,
-            })
+            true
         }
-        _ => None,
+        _ => false,
     }
 }
 
@@ -118,13 +122,18 @@ mod tests {
             .expect("table has this channel count")
     }
 
+    fn decode_fresh(format: &AudioFormat, data: &[u8], volume: Volume) -> Option<DecodedAudio> {
+        let mut out = DecodedAudio::default();
+        decode(format, data, volume, &mut out).then_some(out)
+    }
+
     fn le(samples: &[i16]) -> Vec<u8> {
         samples.iter().flat_map(|sample| sample.to_le_bytes()).collect()
     }
 
     #[test]
     fn stereo_is_split_into_planar_channels() {
-        let audio = decode(&pcm(2), &le(&[0, i16::MAX, i16::MIN, 16384]), Volume::FULL).expect("decodes");
+        let audio = decode_fresh(&pcm(2), &le(&[0, i16::MAX, i16::MIN, 16384]), Volume::FULL).expect("decodes");
         assert_eq!(audio.sample_rate, 48000);
         assert_eq!(audio.channels.len(), 2);
         assert_eq!(audio.channels[0], vec![0.0, -1.0]);
@@ -135,14 +144,14 @@ mod tests {
     #[test]
     fn mono_uses_left_volume() {
         let volume = Volume { left: 0, right: 0xFFFF };
-        let audio = decode(&pcm(1), &le(&[16384, -16384]), volume).expect("decodes");
+        let audio = decode_fresh(&pcm(1), &le(&[16384, -16384]), volume).expect("decodes");
         assert_eq!(audio.channels, vec![vec![0.0, 0.0]]);
     }
 
     #[test]
     fn volume_scales_each_lane() {
         let volume = Volume { left: 0xFFFF, right: 0 };
-        let audio = decode(&pcm(2), &le(&[16384, 16384]), volume).expect("decodes");
+        let audio = decode_fresh(&pcm(2), &le(&[16384, 16384]), volume).expect("decodes");
         assert_eq!(audio.channels[0], vec![0.5]);
         assert_eq!(audio.channels[1], vec![0.0]);
     }
@@ -151,14 +160,14 @@ mod tests {
     fn trailing_partial_frame_is_dropped() {
         let mut data = le(&[100, 200, 300]);
         data.push(0x7F);
-        let audio = decode(&pcm(2), &data, Volume::FULL).expect("decodes");
+        let audio = decode_fresh(&pcm(2), &data, Volume::FULL).expect("decodes");
         assert_eq!(audio.frames(), 1);
     }
 
     #[test]
     fn short_or_empty_block_yields_nothing() {
-        assert_eq!(decode(&pcm(2), &[], Volume::FULL), None);
-        assert_eq!(decode(&pcm(2), &[1, 2, 3], Volume::FULL), None);
+        assert_eq!(decode_fresh(&pcm(2), &[], Volume::FULL), None);
+        assert_eq!(decode_fresh(&pcm(2), &[1, 2, 3], Volume::FULL), None);
     }
 
     #[test]
@@ -167,15 +176,29 @@ mod tests {
 
         let mut eight_bit = pcm(2);
         eight_bit.bits_per_sample = 8;
-        assert_eq!(decode(&eight_bit, &data, Volume::FULL), None);
+        assert_eq!(decode_fresh(&eight_bit, &data, Volume::FULL), None);
 
         let mut six_channel = pcm(2);
         six_channel.n_channels = 6;
-        assert_eq!(decode(&six_channel, &data, Volume::FULL), None);
+        assert_eq!(decode_fresh(&six_channel, &data, Volume::FULL), None);
 
         let mut adpcm = pcm(2);
         adpcm.format = WaveFormat::ADPCM;
-        assert_eq!(decode(&adpcm, &data, Volume::FULL), None);
+        assert_eq!(decode_fresh(&adpcm, &data, Volume::FULL), None);
+    }
+
+    #[test]
+    fn decoding_reuses_the_output_buffers() {
+        let mut out = DecodedAudio::default();
+        assert!(decode(&pcm(2), &le(&[1; 2 * 480]), Volume::FULL, &mut out));
+        let capacity = out.channels[0].capacity();
+
+        // A smaller mono block after a larger stereo one: no stale samples or channels,
+        // and the first channel keeps its allocation.
+        assert!(decode(&pcm(1), &le(&[16384]), Volume::FULL, &mut out));
+        assert_eq!(out.channels, vec![vec![0.5]]);
+        assert_eq!(out.sample_rate, 44100);
+        assert!(capacity <= out.channels[0].capacity());
     }
 
     #[test]
