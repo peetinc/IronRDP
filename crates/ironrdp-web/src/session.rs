@@ -1994,11 +1994,13 @@ fn build_config(
         }
     };
 
+    let enable_credssp = security.enable_credssp && !security.enable_standard_rdp_security;
+
     connector::Config {
         credentials: Credentials::UsernamePassword { username, password },
         domain,
         enable_tls: !security.enable_standard_rdp_security,
-        enable_credssp: security.enable_credssp && !security.enable_standard_rdp_security,
+        enable_credssp,
         enable_standard_rdp_security: security.enable_standard_rdp_security,
         keyboard_type: ironrdp::pdu::gcc::KeyboardType::IBM_ENHANCED,
         keyboard_subtype: 0,
@@ -2028,7 +2030,11 @@ fn build_config(
         platform: ironrdp::pdu::rdp::capability_sets::MajorPlatformType::UNSPECIFIED,
         compression_type: None,
         enable_server_pointer: true,
-        autologon: false,
+        // Without CredSSP the Client Info PDU is the only place the credentials travel, and
+        // Windows ignores its password unless auto-logon is requested, showing its own sign-in
+        // screen instead. Entra ID accounts (`AzureAD\user@domain`) depend on this: they cannot
+        // authenticate over NLA from a client that is not Entra-joined.
+        autologon: !enable_credssp,
         enable_audio_playback: false,
         enable_audio_capture: false,
         request_data: None,
@@ -2634,10 +2640,10 @@ mod tests {
 
     #[test]
     fn standard_rdp_security_overrides_enhanced_security() {
-        for (case, enable_credssp, enable_standard_rdp_security, expected_tls, expected_credssp) in [
-            ("secure defaults", true, false, true, true),
-            ("credssp disabled", false, false, true, false),
-            ("standard RDP security", true, true, false, false),
+        for (case, enable_credssp, enable_standard_rdp_security, expected_tls, expected_credssp, expected_autologon) in [
+            ("secure defaults", true, false, true, true, false),
+            ("credssp disabled", false, false, true, false, true),
+            ("standard RDP security", true, true, false, false, true),
         ] {
             let config = connector_config(SecurityConfig {
                 enable_credssp,
@@ -2646,6 +2652,7 @@ mod tests {
 
             assert_eq!(config.enable_tls, expected_tls, "{case}");
             assert_eq!(config.enable_credssp, expected_credssp, "{case}");
+            assert_eq!(config.autologon, expected_autologon, "{case}");
         }
     }
 
