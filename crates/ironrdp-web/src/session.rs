@@ -454,7 +454,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
         // Create the AudioContext as early as possible, while the page's user activation from
         // the Connect click is freshest (autoplay policy). Audio failing must not fail the
-        // connection: fall back to the no-op backend and keep the server playing locally.
+        // connection: fall back to the no-op backend and leave `INFO_NOAUDIOPLAYBACK` set, so the
+        // server neither redirects audio nor plays it (MS-RDPBCGR 2.2.1.11.1.1).
         let rdpsnd_backend = if self.0.borrow().enable_audio_playback {
             match WasmRdpsndBackend::new() {
                 Ok(backend) => Some(backend),
