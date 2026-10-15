@@ -6,6 +6,7 @@
     import {
         displayControl,
         enableAudioPlayback,
+        enableCredssp,
         kdcProxyUrl,
         init,
         driveShare,
@@ -32,6 +33,7 @@
     let pop_up = false;
     let enable_clipboard = true;
     let enable_audio = true;
+    let enable_nla = true;
 
     // e2e test-rig hook: RDPDR folder share. Populated via
     // window.showDirectoryPicker(); kept component-scoped (no module-level
@@ -194,6 +196,10 @@
 
         if (enable_audio) {
             configBuilder.withExtension(enableAudioPlayback(true));
+        }
+
+        if (!enable_nla) {
+            configBuilder.withExtension(enableCredssp(false));
         }
 
         if (kdc_proxy_url !== '') {
@@ -400,6 +406,15 @@
                                     style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
                                 />
                                 <label for="enable_audio">Play Remote Audio</label>
+                            </div>
+                            <div class="checkbox-wrapper">
+                                <input
+                                    id="enable_nla"
+                                    type="checkbox"
+                                    bind:checked={enable_nla}
+                                    style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
+                                />
+                                <label for="enable_nla">Use NLA (CredSSP)</label>
                             </div>
                         </div>
                     </div>
