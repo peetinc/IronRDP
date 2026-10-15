@@ -4,9 +4,6 @@
 //! time, so blocks play gapless. [`Schedule`] holds the timing policy; it is
 //! pure so it is unit-testable on the host.
 
-use core::cell::Cell;
-use std::rc::Rc;
-
 use anyhow::anyhow;
 use tracing::{debug, warn};
 use wasm_bindgen::JsValue;
@@ -23,11 +20,43 @@ pub(crate) const LEAD_SECS: f64 = 0.05;
 /// tab, GC pause, network burst) would turn into permanent latency.
 pub(crate) const MAX_QUEUED_SECS: f64 = 0.5;
 
+/// Once the cap is hit, arrivals are dropped until the queue drains below this, so a
+/// stall costs one dropped stretch of audio instead of permanent latency at the cap.
+pub(crate) const LOW_WATERMARK_SECS: f64 = 2.0 * LEAD_SECS;
+
+/// Whether `resume()` can still start this context. Anything but running or closed
+/// (`suspended`, or a state web-sys does not model such as Safari's `interrupted`).
+pub(crate) fn is_resumable(state: AudioContextState) -> bool {
+    !matches!(state, AudioContextState::Running | AudioContextState::Closed)
+}
+
+/// Ask a context blocked by the autoplay policy to start. Fire-and-forget: a rejection
+/// only means the browser wants a user gesture first, and the next input event retries.
+///
+/// Call from a user input handler where possible; browsers only honor `resume()` within
+/// (or after) user activation.
+pub(crate) fn resume(context: &AudioContext) {
+    if !is_resumable(context.state()) {
+        return;
+    }
+
+    match context.resume() {
+        Ok(promise) => wasm_bindgen_futures::spawn_local(async move {
+            if let Err(error) = JsFuture::from(promise).await {
+                debug!(?error, "AudioContext resume rejected");
+            }
+        }),
+        Err(error) => debug!(?error, "AudioContext resume failed"),
+    }
+}
+
 /// Gapless block timing on the `AudioContext` clock.
 #[derive(Debug, Default)]
 pub(crate) struct Schedule {
     /// Context time at which the queued audio runs out.
     next_start: Option<f64>,
+    /// Set when the cap was hit; cleared once the queue is back under [`LOW_WATERMARK_SECS`].
+    draining: bool,
 }
 
 impl Schedule {
@@ -40,9 +69,15 @@ impl Schedule {
             _ => now + LEAD_SECS,
         };
 
-        if MAX_QUEUED_SECS < start - now {
+        let queued = start - now;
+        if self.draining && LOW_WATERMARK_SECS < queued {
             return None;
         }
+        if MAX_QUEUED_SECS < queued {
+            self.draining = true;
+            return None;
+        }
+        self.draining = false;
 
         self.next_start = Some(start + duration);
         Some(start)
@@ -50,6 +85,7 @@ impl Schedule {
 
     pub(crate) fn reset(&mut self) {
         self.next_start = None;
+        self.draining = false;
     }
 }
 
@@ -57,8 +93,9 @@ impl Schedule {
 pub(crate) struct Player {
     context: AudioContext,
     schedule: Schedule,
-    /// Set while an `AudioContext::resume()` promise is outstanding.
-    resume_pending: Rc<Cell<bool>>,
+    /// Whether playback already asked a suspended context to start. Later attempts come
+    /// from user input (see [`resume`]), where browsers actually honor them.
+    resume_attempted: bool,
 }
 
 impl Player {
@@ -68,28 +105,17 @@ impl Player {
         Ok(Self {
             context,
             schedule: Schedule::default(),
-            resume_pending: Rc::new(Cell::new(false)),
+            resume_attempted: false,
         })
     }
 
     pub(crate) fn enqueue(&mut self, audio: &DecodedAudio) {
-        // Autoplay policy: a context created without a fresh user gesture starts
-        // suspended. `resume()` succeeds once the page has had any user activation
-        // (the Connect click); until then the promise stays pending, so ask once.
-        if self.context.state() == AudioContextState::Suspended && !self.resume_pending.get() {
-            match self.context.resume() {
-                Ok(promise) => {
-                    self.resume_pending.set(true);
-                    let resume_pending = Rc::clone(&self.resume_pending);
-                    wasm_bindgen_futures::spawn_local(async move {
-                        if let Err(error) = JsFuture::from(promise).await {
-                            debug!(?error, "AudioContext resume rejected");
-                        }
-                        resume_pending.set(false);
-                    });
-                }
-                Err(error) => debug!(?error, "AudioContext resume failed"),
-            }
+        // Autoplay policy: a context created without user activation starts suspended.
+        // Ask once here (enough when the page already had a gesture, e.g. the Connect
+        // click); the session retries from input handlers otherwise.
+        if !self.resume_attempted {
+            self.resume_attempted = true;
+            resume(&self.context);
         }
 
         let Ok(frames) = u32::try_from(audio.frames()) else {
@@ -111,8 +137,7 @@ impl Player {
         }
 
         fn start_block(context: &AudioContext, audio: &DecodedAudio, frames: u32, when: f64) -> Result<(), JsValue> {
-            let n_channels =
-                u32::try_from(audio.channels.len()).map_err(|_| JsValue::from_str("too many channels"))?;
+            let n_channels = u32::try_from(audio.channels.len()).map_err(|_| JsValue::from_str("too many channels"))?;
             #[expect(
                 clippy::as_conversions,
                 clippy::cast_precision_loss,
@@ -132,6 +157,10 @@ impl Player {
             source.start_with_when(when)?;
             Ok(())
         }
+    }
+
+    pub(crate) fn context(&self) -> &AudioContext {
+        &self.context
     }
 
     /// Forget queued timing (format change or server Close). Already-started
@@ -192,6 +221,32 @@ mod tests {
         }
         assert!(0 < placed);
         assert!(0 < dropped);
+    }
+
+    #[test]
+    fn after_cap_queue_drains_to_low_watermark() {
+        let mut schedule = Schedule::default();
+        let mut now = 10.0;
+        // Burst after a stall: fill the queue to the cap.
+        while schedule.place(now, 0.02).is_some() {}
+        // Blocks now arrive in real time. Without hysteresis the queue would sit at the cap forever.
+        let mut accepted_lag = None;
+        for _ in 0..100 {
+            now += 0.02;
+            if let Some(start) = schedule.place(now, 0.02) {
+                accepted_lag = Some(start - now);
+                break;
+            }
+        }
+        let lag = accepted_lag.expect("queue drains and playback resumes");
+        assert!(lag <= LOW_WATERMARK_SECS);
+    }
+
+    #[test]
+    fn resumable_states() {
+        assert!(is_resumable(AudioContextState::Suspended));
+        assert!(!is_resumable(AudioContextState::Running));
+        assert!(!is_resumable(AudioContextState::Closed));
     }
 
     #[test]
