@@ -1,6 +1,6 @@
 # Web client audio playback (RDPSND) — design
 
-Status: phase 1 (PCM) in progress; phases 2–3 planned.
+Status: phase 1 (PCM) implemented; phases 2–4 planned.
 
 ## Goal
 
@@ -109,15 +109,17 @@ yet). `decode` stays the sync fast path.
   - `LEAD = 0.05 s`: initial/after-underrun lead so the first block is not
     clipped and small arrival jitter is absorbed.
   - `MAX_QUEUED = 0.5 s`: if `next_start - now` already exceeds this, the block
-    is **dropped**. `Rdpsnd` confirms immediately, so the server is not
-    throttled by playback; without a cap, latency would grow unbounded after a
-    stall (tab backgrounded, GC pause, network burst).
+    is **dropped**, and arrivals keep being dropped until the queue drains below
+    `LOW_WATERMARK = 2 × LEAD` (hysteresis). `Rdpsnd` confirms immediately, so the
+    server is not throttled by playback; without the cap a stall (tab
+    backgrounded, GC pause, network burst) would grow latency unbounded, and
+    without the hysteresis it would pin latency at the cap forever.
   - Underrun: if `next_start < now`, restart at `now + LEAD`.
-- Autoplay policy: the context may start `suspended`. On each `enqueue` while
-  suspended, call `resume()` once (tracked by a pending flag, cleared when the
-  promise settles). Chrome/Edge/Firefox grant this after any prior user
-  activation on the page (the Connect click); blocks scheduled while suspended
-  are still queued and the cap keeps that bounded.
+- Autoplay policy: the context may start `suspended`. Playback asks `resume()`
+  once; after that, `Session::apply_inputs` (called synchronously from DOM input
+  handlers, i.e. within user activation) resumes it whenever the state is
+  neither `running` nor `closed` — which also covers Safari's `interrupted`,
+  a state web-sys does not model.
 - `Drop` calls `AudioContext::close()`.
 
 **`WasmRdpsndBackend`** (`audio/mod.rs`) — the `RdpsndClientHandler`.
