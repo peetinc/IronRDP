@@ -1,6 +1,7 @@
 # Web client audio playback (RDPSND) — design
 
-Status: phase 1 (PCM) implemented; phases 2–4 planned.
+Status: phase 1 (PCM), phase 2 (ADPCM) and phase 3 (AAC) implemented; see
+"Compressed codecs (as built)". G.711, Opus and phase 4 not done.
 
 ## Goal
 
@@ -50,6 +51,53 @@ ADPCM is the cheap, dependency-free ~4× step. Phase 1 logs the negotiated
 format so phase 2 can confirm the real server offer before committing to a
 codec order.
 
+## Compressed codecs (as built)
+
+**Negotiation echoes the server's entries.** A compressed format's
+`nAvgBytesPerSec`, `nBlockAlign` and extra data are the server's encoder
+settings, and `matches_for_negotiation` compares them exactly, so a fixed client
+table cannot match them reliably. `RdpsndClientHandler::negotiate_formats` (new,
+defaulting to `get_formats`) receives the server's list; the web backend returns
+the server's own entries for every format `codec::classify` accepts, which is
+what FreeRDP's client does. `Rdpsnd` still drops anything the server did not
+offer. Order, best first: AAC, IMA ADPCM, MS ADPCM, PCM 16-bit; within a codec,
+higher sample rate then more channels. One INFO line per negotiation lists what
+the server offered and what was advertised.
+
+**ADPCM** (`audio/adpcm.rs`, sync path). IMA (`0x0011`) and MS (`0x0002`) block
+decoders, 4 bits per sample, mono or stereo. MS ADPCM takes its predictor
+coefficients from the format's `ADPCMWAVEFORMAT` extra data, or the standard
+seven when absent. Blocks with too little room for their headers, a ragged IMA
+layout, a short or empty coefficient table, or an unknown predictor index are
+rejected or skipped, and the MS delta saturates like FFmpeg's, so hostile data
+cannot panic or overflow. Tests decode FFmpeg-encoded fixtures
+(`audio/testdata/`) and compare sample for sample with FFmpeg's own decode.
+
+**AAC** (`audio/aac.rs`, async path). `WAVE_FORMAT_AAC_MS` (`0xA106`) through
+WebCodecs `AudioDecoder` (`mp4a.40.2`), via hand-written bindings because
+`web-sys` gates WebCodecs behind `web_sys_unstable_apis`.
+- Support is probed with `AudioDecoder.isConfigSupported` when the backend is
+  created (at connect time, well before the server sends its formats); AAC is
+  advertised only if the probe said yes.
+- The Windows bitstream framing is not documented, so the first block decides:
+  an ADTS sync word means frames are split on ADTS headers and fed with no
+  decoder `description`; otherwise each block is one raw AAC-LC access unit,
+  described by an `AudioSpecificConfig` built from the format's rate and
+  channel count. (The WebCodecs AAC registration: `description` present means
+  raw, absent means ADTS.)
+- The decoder's output callback copies `AudioData` planes as `f32-planar`,
+  applies volume and enqueues on the shared `Output` (player + volume + decode
+  buffer, behind `Rc<RefCell<_>>`).
+- A decoder that errors is replaced on the next block; after three failures AAC
+  is given up for the session with one WARN, rather than rebuilding a decoder
+  per block.
+- AAC adds decoder delay (about one 1024-sample frame plus priming, ~50 ms).
+
+Still to confirm against a live Windows host: which of the advertised formats
+Windows picks (the negotiation log shows the offer; the `Playing RDPSND format`
+line shows the pick), and whether its AAC blocks are raw access
+units or ADTS (visible from whether playback works on the first block).
+
 ## Architecture
 
 New module tree in `crates/ironrdp-web/src/audio/`:
@@ -58,7 +106,9 @@ New module tree in `crates/ironrdp-web/src/audio/`:
 audio/
   mod.rs      WasmRdpsndBackend: RdpsndClientHandler impl; owns Player + volume;
               routes wave blocks to the decoder for the block's format
-  codec.rs    advertised format table + decoders: bytes → DecodedAudio
+  codec.rs    format classification + negotiation; sync decode dispatch (PCM, ADPCM)
+  adpcm.rs    IMA and MS ADPCM block decoders
+  aac.rs      WebCodecs AudioDecoder wrapper, ADTS framing, AudioSpecificConfig
   player.rs   AudioContext + jitter-buffer scheduler: DecodedAudio → speakers
 ```
 
@@ -199,15 +249,10 @@ JS). Not touched by this work.
 ## Phases
 
 1. **PCM** (this change): everything above.
-2. **ADPCM / G.711**: add IMA ADPCM, MS ADPCM, A-law, µ-law decoders to
-   `codec` (pure Rust, sync path, ~4× / 2×). Order the advertised list
-   compressed-first only after confirming from phase-1 logs what Windows
-   offers. Add an extension to prefer bandwidth over fidelity if useful.
-3. **WebCodecs (AAC, Opus)**: feature-detect `AudioDecoder.isConfigSupported`
-   at backend construction and advertise only supported configs; async decode
-   path feeding `Player::enqueue` from the output callback; AAC needs the
-   `AudioSpecificConfig` from the format's `data` (`cbSize` extra bytes) as the
-   decoder `description`.
+2. **ADPCM** (done): IMA and MS ADPCM, sync path, ~4×. G.711 (A-law, µ-law,
+   ~2×) skipped: ADPCM beats it at similar cost.
+3. **WebCodecs AAC** (done): see "Compressed codecs (as built)". Opus not done:
+   Windows does not offer it.
 4. **AudioWorklet player** (optional): replace per-block source nodes with a
    ring buffer in a worklet if per-block scheduling shows glitches at small
    block sizes or drift over long sessions. `Player`'s interface stays.
