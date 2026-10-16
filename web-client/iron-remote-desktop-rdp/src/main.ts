@@ -98,6 +98,15 @@ export function performanceFlags(flags: number): Extension {
     return new Extension('performance_flags', flags);
 }
 
+/**
+ * Desktop scale factor sent at connect, in percent (100 to 500; MS-RDPBCGR 2.2.1.3.2),
+ * e.g. 200 for a desktop sized in device pixels on a 2x HiDPI screen. Later scale
+ * changes travel with each `resize` call. Out-of-range values are ignored.
+ */
+export function desktopScaleFactor(percent: number): Extension {
+    return new Extension('desktop_scale_factor', percent);
+}
+
 export function kdcProxyUrl(url: string): Extension {
     return new Extension('kdc_proxy_url', url);
 }

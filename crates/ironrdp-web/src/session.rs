@@ -139,6 +139,9 @@ struct SessionBuilderInner {
     /// Client Info `performanceFlags` (MS-RDPBCGR 2.2.1.11.1.1.1); `None` keeps
     /// [`PerformanceFlags::default`].
     performance_flags: Option<PerformanceFlags>,
+    /// Client core data `desktopScaleFactor` (MS-RDPBCGR 2.2.1.3.2), in percent; `None`
+    /// sends none. Later scale changes travel with each resize request.
+    desktop_scale_factor: Option<u32>,
 }
 
 impl Default for SessionBuilderInner {
@@ -185,6 +188,7 @@ impl Default for SessionBuilderInner {
             use_egfx: true,
             enable_audio_playback: false,
             performance_flags: None,
+            desktop_scale_factor: None,
             enable_credssp: true,
             enable_standard_rdp_security: false,
             enable_server_pointer: true,
@@ -321,6 +325,13 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                     warn!(performance_flags, "Invalid performance flags; keeping the defaults");
                 }
                 self.0.borrow_mut().performance_flags = flags;
+            };
+            |desktop_scale_factor: f64| {
+                let scale = desktop_scale_factor_from_js(desktop_scale_factor);
+                if scale.is_none() {
+                    warn!(desktop_scale_factor, "Invalid desktop scale factor; sending none");
+                }
+                self.0.borrow_mut().desktop_scale_factor = scale;
             };
             |outbound_message_size_limit: f64| {
                 let limit = if outbound_message_size_limit >= 0.0 && outbound_message_size_limit <= f64::from(u32::MAX) {
@@ -552,6 +563,9 @@ impl SessionBuilder {
         config.enable_server_pointer = enable_server_pointer;
         if let Some(performance_flags) = self.0.borrow().performance_flags {
             config.performance_flags = performance_flags;
+        }
+        if let Some(desktop_scale_factor) = self.0.borrow().desktop_scale_factor {
+            config.desktop_scale_factor = desktop_scale_factor;
         }
 
         let (input_events_tx, input_events_rx, drive_slot) = match reuse {
@@ -2026,6 +2040,26 @@ fn performance_flags_from_js(value: f64) -> Option<PerformanceFlags> {
     Some(PerformanceFlags::from_bits_retain(bits))
 }
 
+/// Client core data `desktopScaleFactor` from a JS number of percent, rounded, or
+/// `None` outside the 100..=500 range MS-RDPBCGR 2.2.1.3.2 allows.
+///
+/// A named function rather than an inline block in `extension` so the conversion is
+/// unit-testable.
+fn desktop_scale_factor_from_js(percent: f64) -> Option<u32> {
+    let percent = percent.round();
+    if !(100.0..=500.0).contains(&percent) {
+        return None;
+    }
+
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked above: a whole number between 100 and 500"
+    )]
+    Some(percent as u32)
+}
+
 fn build_config(
     username: String,
     password: String,
@@ -2045,7 +2079,9 @@ fn build_config(
         }
     } else {
         connector::BitmapConfig {
-            color_depth: 16,
+            // 32 bpp, as mstsc asks, so the session runs in full color; with 16 the
+            // connector does not request WANT_32_BPP_SESSION.
+            color_depth: 32,
             lossy_compression: true,
             codecs: client_codecs_capabilities(&[]).expect("can't panic for &[]"),
         }
@@ -2637,6 +2673,28 @@ fn f64_to_u16_saturating_cast(value: f64) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codec_sessions_ask_for_32_bit_color() {
+        // mstsc asks for 32 bpp; 16 bpp left Windows free to run the session in 65,536 colors.
+        let config = connector_config(SecurityConfig {
+            enable_credssp: true,
+            enable_standard_rdp_security: false,
+        });
+        assert_eq!(config.bitmap.map(|bitmap| bitmap.color_depth), Some(32));
+    }
+
+    #[test]
+    fn desktop_scale_factor_from_js_accepts_the_rdp_range() {
+        assert_eq!(desktop_scale_factor_from_js(200.0), Some(200));
+        assert_eq!(desktop_scale_factor_from_js(100.0), Some(100));
+        assert_eq!(desktop_scale_factor_from_js(500.0), Some(500));
+        // Fractional device pixel ratios round to whole percents.
+        assert_eq!(desktop_scale_factor_from_js(149.6), Some(150));
+        for value in [99.0, 501.0, 0.0, -200.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(desktop_scale_factor_from_js(value), None, "{value}");
+        }
+    }
 
     #[test]
     fn performance_flags_from_js_takes_any_u32_bit_set() {
