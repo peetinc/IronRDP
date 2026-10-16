@@ -22,7 +22,7 @@ export const autoResizeEnabled = writable(import.meta.env.VITE_RIG_AUTO_RESIZE !
 // HiDPI: size the desktop in device pixels and ask Windows to scale to match
 // (200% on a 2x screen), for sharp text. Latched at connect; remote-screen.svelte
 // reads it for every auto-resize so the desktop keeps the same density.
-export const hidpiEnabled = writable(false);
+export const hidpiEnabled = writable(import.meta.env.VITE_RIG_HIDPI === 'true');
 
 /** Device pixels per CSS pixel for a HiDPI desktop, clamped to what RDP scaling covers. */
 export function hidpiRatio(): number {

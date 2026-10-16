@@ -50,7 +50,7 @@
     let enable_egfx = true;
     let enable_h264 = import.meta.env.VITE_RIG_H264 === 'true';
     let enable_audio = true;
-    let visual_effects = false;
+    let visual_effects = import.meta.env.VITE_RIG_VISUAL_EFFECTS === 'true';
     let enable_nla = true;
 
     // e2e test-rig hook: RDPDR folder share. Populated via
@@ -340,7 +340,7 @@
         // Bump to 'DEBUG' when diagnosing the drive share — every IRP logs at debug!, and the
         // DevTools level filter cannot reveal lines the wasm tracing level never emits. Left at
         // INFO normally: DEBUG floods the console hard enough to stall the tab on big transfers.
-        await init('INFO');
+        await init(import.meta.env.VITE_RIG_LOG_LEVEL ?? 'INFO');
         // Zero-click share restore when Chrome granted persistent permission
         // ("Allow on every visit"); otherwise the Share Folder button re-arms
         // the stored handle with a one-click prompt instead of a picker.
@@ -356,7 +356,8 @@
                 <article class="primary-container">
                     <h5>Login</h5>
                     <div class="medium-space" />
-                    <div>
+                    <!-- A form, so Enter in any field logs in. -->
+                    <form on:submit|preventDefault={StartSession}>
                         <div class="field label border">
                             <input id="hostname" type="text" bind:value={hostname} />
                             <label for="hostname">Hostname</label>
@@ -495,10 +496,10 @@
                                 <label for="enable_nla">Use NLA (CredSSP)</label>
                             </div>
                         </div>
-                    </div>
-                    <nav class="center-align">
-                        <button on:click={StartSession}>Login</button>
-                    </nav>
+                        <nav class="center-align">
+                            <button type="submit">Login</button>
+                        </nav>
+                    </form>
                 </article>
             </div>
             <div class="s2" />
