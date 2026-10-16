@@ -20,6 +20,8 @@
 
 use core::fmt;
 
+use ironrdp_pdu::geometry::ExclusiveRectangle;
+
 // ============================================================================
 // Decoded Frame
 // ============================================================================
@@ -134,6 +136,15 @@ impl core::error::Error for DecoderError {
 /// Result type for decoder operations
 pub type DecoderResult<T> = Result<T, DecoderError>;
 
+/// Outcome of [`H264Decoder::submit`]
+#[derive(Debug)]
+pub enum H264Decode {
+    /// The frame decoded synchronously.
+    Frame(DecodedFrame),
+    /// The decoder finishes asynchronously; the frame comes from [`H264Decoder::poll_frame`].
+    Pending,
+}
+
 // ============================================================================
 // H.264 Decoder Trait
 // ============================================================================
@@ -171,6 +182,29 @@ pub trait H264Decoder: Send {
     /// Frame dimensions may exceed the destination rectangle due to
     /// macroblock alignment (16x16). The caller crops to fit.
     fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame>;
+
+    /// Submit one `RFX_AVC420_BITMAP_STREAM` payload for decoding.
+    ///
+    /// `regions` are the stream's `regionRects`: the parts of the frame that changed, in
+    /// frame coordinates (which are also surface coordinates). The client copies only
+    /// these from the decoded frame, so a decoder may leave the rest of the frame unset.
+    /// An empty list means the whole frame, cropped to the destination rectangle.
+    ///
+    /// The default decodes synchronously with [`Self::decode`]. A decoder that finishes
+    /// asynchronously (a browser's WebCodecs, for example) returns [`H264Decode::Pending`]:
+    /// the client then holds every later command until [`Self::poll_frame`] yields the
+    /// frame, so commands still apply in order.
+    fn submit(&mut self, data: &[u8], regions: &[ExclusiveRectangle]) -> DecoderResult<H264Decode> {
+        let _ = regions;
+        self.decode(data).map(H264Decode::Frame)
+    }
+
+    /// The frame for the last [`H264Decode::Pending`] submission, once it has decoded.
+    ///
+    /// `None` while it is still decoding. Called by `GraphicsPipelineClient::resume`.
+    fn poll_frame(&mut self) -> Option<DecoderResult<DecodedFrame>> {
+        None
+    }
 
     /// Reset the decoder state
     ///
