@@ -94,10 +94,28 @@ New module `h264` with a `WebCodecsH264Decoder: H264Decoder`.
 - Enabled by a new `h264` extension, off by default (`h264(true)` in
   `iron-remote-desktop-rdp`). The Svelte test client gets a checkbox.
 
-### Capabilities
+### Capabilities (revised after the first live test)
 
-With a decoder present, the web handler keeps advertising `V8_1 { AVC420_ENABLED | SMALL_CACHE }`
-plus `V8`, so Windows can choose AVC420. AVC444 stays unadvertised.
+Windows 11 confirmed `V8_1` with `AVC420_ENABLED` cleared: it only enables H.264 for 10.x
+clients. With a decoder present the web handler now leads with
+`V10_7 { SMALL_CACHE | AVC_THIN_CLIENT }`, which Windows confirms, but it then sends AVC444
+(not AVC420) regardless of `AVC_THIN_CLIENT`.
+
+AVC444 is therefore decoded as its 4:2:0 main view (MS-RDPEGFX 2.2.4.5, 2.2.4.6). The luma
+sub-stream is a complete YUV420 picture, and it is shown. The chroma sub-stream belongs to the
+same H.264 sequence, so it goes through `H264Decoder::submit_reference`: it is decoded to keep
+the reference pictures intact, and its output is discarded. Full 4:4:4 reconstruction is
+out of scope.
+
+### Readback (revised)
+
+Drawing a 4K `VideoFrame` onto a `willReadFrequently` (CPU) canvas cost ~28 ms per frame, which
+capped the pipeline near 20 fps. The readback canvas is GPU-backed instead. The frame is drawn
+on the GPU (0.1 ms), and the bounding box of the region rects is read back with a single
+`getImageData`, since Windows sends ~100 small regions per frame.
+
+Measured at 4K with video, against the CPU codecs (88% busy, 17 fps, 7.6 updates/s, 15 Mbit/s):
+8.6% busy, 40 fps page, 29 updates/s (the video's frame rate) and 2.9 Mbit/s.
 
 ## Risks
 

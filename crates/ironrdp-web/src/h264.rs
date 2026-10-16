@@ -10,7 +10,7 @@
 
 use core::cell::{Cell, RefCell};
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
 use ironrdp::pdu::geometry::ExclusiveRectangle;
@@ -174,6 +174,17 @@ impl H264Decoder for WebCodecsH264Decoder {
         Ok(H264Decode::Pending)
     }
 
+    /// Decodes an AVC444 chroma view into the same `VideoDecoder`, discarding its picture. A
+    /// view that cannot be decoded yet (before the first key frame) is skipped.
+    fn submit_reference(&mut self, data: &[u8]) -> DecoderResult<()> {
+        self.with_slot(|slot| {
+            if let Err(error) = slot.decode_chunk(data, false) {
+                debug!(%error, "Skipping an H.264 reference picture");
+            }
+        })
+        .ok_or_else(|| DecoderError::msg("H.264 decoder slot is gone"))
+    }
+
     fn poll_frame(&mut self) -> Option<DecoderResult<DecodedFrame>> {
         self.with_slot(|slot| slot.shared.borrow_mut().finished.take())
             .flatten()
@@ -201,6 +212,9 @@ struct Shared {
     finished: Option<DecoderResult<DecodedFrame>>,
     readback: Option<Readback>,
     submitted_at: f64,
+    /// Per decoded chunk, oldest first: whether its picture is shown (`false` for AVC444
+    /// chroma views). WebCodecs outputs pictures in decode order.
+    shown: VecDeque<bool>,
 }
 
 struct ActiveDecoder {
@@ -230,14 +244,20 @@ impl Slot {
     }
 
     fn submit(&mut self, data: &[u8], regions: &[ExclusiveRectangle]) {
-        self.shared.borrow_mut().finished = None;
-        if let Err(error) = self.try_submit(data, regions) {
+        {
+            let mut shared = self.shared.borrow_mut();
+            shared.finished = None;
+            shared.regions.clear();
+            shared.regions.extend_from_slice(regions);
+        }
+        if let Err(error) = self.decode_chunk(data, true) {
             self.shared.borrow_mut().finished = Some(Err(error));
             (self.wake)();
         }
     }
 
-    fn try_submit(&mut self, data: &[u8], regions: &[ExclusiveRectangle]) -> DecoderResult<()> {
+    /// Queues one access unit; `shown` says whether its picture is read back when it decodes.
+    fn decode_chunk(&mut self, data: &[u8], shown: bool) -> DecoderResult<()> {
         let stream = to_annex_b(data);
         let key = is_key(&stream);
 
@@ -278,22 +298,25 @@ impl Slot {
         set(&init, "data", &Uint8Array::from(stream.as_ref()))?;
         let chunk = EncodedVideoChunk::new(&init).map_err(|error| js_error("create EncodedVideoChunk", &error))?;
 
-        {
-            let mut shared = self.shared.borrow_mut();
-            shared.regions.clear();
-            shared.regions.extend_from_slice(regions);
-            shared.submitted_at = js_sys::Date::now();
-        }
         active
             .decoder
             .decode(&chunk)
             .map_err(|error| js_error("decode H.264 chunk", &error))?;
+        {
+            let mut shared = self.shared.borrow_mut();
+            shared.shown.push_back(shown);
+            if shown {
+                shared.submitted_at = js_sys::Date::now();
+            }
+        }
         active.awaiting_key = false;
         self.timestamp += 1.0;
         Ok(())
     }
 
     fn close(&mut self) {
+        // A closed decoder outputs nothing more.
+        self.shared.borrow_mut().shown.clear();
         if let Some(active) = self.decoder.take()
             && active.decoder.state() != "closed"
             && let Err(error) = active.decoder.close()
@@ -309,6 +332,10 @@ impl ActiveDecoder {
             let shared = Rc::clone(shared);
             let wake = Rc::clone(wake);
             Closure::<dyn FnMut(VideoFrame)>::new(move |frame: VideoFrame| {
+                if !shared.borrow_mut().shown.pop_front().unwrap_or(true) {
+                    frame.close();
+                    return;
+                }
                 {
                     let mut shared = shared.borrow_mut();
                     let latency = js_sys::Date::now() - shared.submitted_at;
@@ -376,8 +403,10 @@ impl Readback {
     fn new(width: u32, height: u32) -> DecoderResult<Self> {
         let canvas = OffscreenCanvas::new(width, height).map_err(|error| js_error("create OffscreenCanvas", &error))?;
         let options = Object::new();
-        // The pixels are read back on every frame: keep the canvas in CPU memory.
-        set(&options, "willReadFrequently", &JsValue::TRUE)?;
+        // GPU-backed (no `willReadFrequently`): drawing the frame stays on the GPU, and only the
+        // changed area is read back. A CPU canvas costs a full-frame readback and colour
+        // conversion per draw, ~28 ms at 4K.
+        set(&options, "willReadFrequently", &JsValue::FALSE)?;
         let context = canvas
             .get_context("2d", &options)
             .map_err(|error| js_error("get OffscreenCanvas 2d context", &error))?;
@@ -414,29 +443,52 @@ fn read_regions(
     }];
     let regions = if regions.is_empty() { &whole[..] } else { regions };
 
-    for region in regions {
-        let right = u32::from(region.right).min(width);
-        let bottom = u32::from(region.bottom).min(height);
-        let (left, top) = (u32::from(region.left), u32::from(region.top));
-        if right <= left || bottom <= top {
-            continue;
-        }
-        let image = context
-            .get_image_data(
-                f64::from(left),
-                f64::from(top),
-                f64::from(right - left),
-                f64::from(bottom - top),
+    // Clipped to the frame, as (left, top, right, bottom).
+    let clipped: Vec<(u32, u32, u32, u32)> = regions
+        .iter()
+        .map(|region| {
+            (
+                u32::from(region.left),
+                u32::from(region.top),
+                u32::from(region.right).min(width),
+                u32::from(region.bottom).min(height),
             )
-            .map_err(|error| js_error("read back VideoFrame", &error))?;
-        let pixels = image.data();
+        })
+        .filter(|&(left, top, right, bottom)| left < right && top < bottom)
+        .collect();
+    let Some(bounds) = clipped
+        .iter()
+        .copied()
+        .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))
+    else {
+        return Ok(DecodedFrame::new(rgba, width, height));
+    };
 
-        let row_bytes = usize::try_from(right - left).map_err(|_| DecoderError::msg("region too wide"))? * 4;
-        let left_bytes = usize::try_from(left).map_err(|_| DecoderError::msg("region too wide"))? * 4;
-        let top = usize::try_from(top).map_err(|_| DecoderError::msg("region too tall"))?;
-        for (row, source) in pixels.chunks_exact(row_bytes).enumerate() {
-            let start = (top + row) * stride + left_bytes;
-            if let Some(destination) = rgba.get_mut(start..start + row_bytes) {
+    // One readback of the regions' bounding box: each `getImageData` on a GPU canvas is a
+    // separate GPU sync, and Windows sends ~100 small regions per frame.
+    let image = context
+        .get_image_data(
+            f64::from(bounds.0),
+            f64::from(bounds.1),
+            f64::from(bounds.2 - bounds.0),
+            f64::from(bounds.3 - bounds.1),
+        )
+        .map_err(|error| js_error("read back VideoFrame", &error))?;
+    let pixels = image.data();
+    let to_usize = |value: u32| usize::try_from(value).map_err(|_| DecoderError::msg("frame too large"));
+    let bounds_stride = to_usize(bounds.2 - bounds.0)? * 4;
+
+    for (left, top, right, bottom) in clipped {
+        let row_bytes = to_usize(right - left)? * 4;
+        let (left, top, bottom) = (to_usize(left)?, to_usize(top)?, to_usize(bottom)?);
+        let (bounds_left, bounds_top) = (to_usize(bounds.0)?, to_usize(bounds.1)?);
+        for y in top..bottom {
+            let source_start = (y - bounds_top) * bounds_stride + (left - bounds_left) * 4;
+            let destination_start = y * stride + left * 4;
+            if let (Some(source), Some(destination)) = (
+                pixels.get(source_start..source_start + row_bytes),
+                rgba.get_mut(destination_start..destination_start + row_bytes),
+            ) {
                 destination.copy_from_slice(source);
             }
         }

@@ -37,7 +37,7 @@ use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnect
 use ironrdp_core::WriteBuf;
 use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp_egfx::decode::H264Decoder;
-use ironrdp_egfx::pdu::{CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitySet};
+use ironrdp_egfx::pdu::{CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet};
 use ironrdp_futures::{FramedWrite as _, single_sequence_step, single_sequence_step_read};
 use rgb::AsPixels as _;
 use tap::prelude::*;
@@ -2421,8 +2421,9 @@ async fn connect(
             // Without an H.264 decoder `start()` drops every AVC capability set,
             // leaving only codecs decodable in wasm. With the WebCodecs one, V8_1's
             // AVC420 goes out and Windows may encode the desktop as H.264.
-            #[derive(Default)]
             struct WebEgfxHandler {
+                /// An H.264 decoder is attached, so offer the 10.x set Windows needs for AVC.
+                h264: bool,
                 logged_first_frame: bool,
             }
 
@@ -2436,7 +2437,7 @@ async fn connect(
                     // AVC420_ENABLED stays on V8_1 exactly as upstream has it;
                     // `start()` filters that set out when no H.264 decoder is
                     // configured, leaving V8 as what actually goes on the wire.
-                    let caps = vec![
+                    let mut caps = vec![
                         CapabilitySet::V8_1 {
                             flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
                         },
@@ -2444,6 +2445,17 @@ async fn connect(
                             flags: CapabilitiesV8Flags::SMALL_CACHE,
                         },
                     ];
+                    // Windows 11 confirms V8_1 with AVC420_ENABLED cleared: it only enables
+                    // H.264 for 10.x clients. AVC_THIN_CLIENT asks for plain AVC420, which is
+                    // all the WebCodecs decoder handles (no AVC444 auxiliary chroma view).
+                    if self.h264 {
+                        caps.insert(
+                            0,
+                            CapabilitySet::V10_7 {
+                                flags: CapabilitiesV107Flags::SMALL_CACHE | CapabilitiesV107Flags::AVC_THIN_CLIENT,
+                            },
+                        );
+                    }
                     info!(?caps, "EGFX channel OPENED — advertising capabilities");
                     caps
                 }
@@ -2478,10 +2490,11 @@ async fn connect(
             egfx_capture::install_if_requested();
 
             info!(h264 = h264_decoder.is_some(), "Attaching EGFX graphics pipeline");
-            drdynvc = drdynvc.with_dynamic_channel(GraphicsPipelineClient::new(
-                Box::new(WebEgfxHandler::default()),
-                h264_decoder,
-            ));
+            let handler = WebEgfxHandler {
+                h264: h264_decoder.is_some(),
+                logged_first_frame: false,
+            };
+            drdynvc = drdynvc.with_dynamic_channel(GraphicsPipelineClient::new(Box::new(handler), h264_decoder));
         }
 
         connector.attach_static_channel(drdynvc);
