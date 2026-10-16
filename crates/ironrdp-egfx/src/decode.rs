@@ -199,6 +199,13 @@ pub trait H264Decoder: Send {
         self.decode(data).map(H264Decode::Frame)
     }
 
+    /// Decode H.264 data whose picture is not shown but that later pictures may reference:
+    /// the auxiliary (chroma) view of an AVC444 stream, which shares the main view's H.264
+    /// sequence. The default decodes it with [`Self::decode`] and discards the frame.
+    fn submit_reference(&mut self, data: &[u8]) -> DecoderResult<()> {
+        self.decode(data).map(drop)
+    }
+
     /// The frame for the last [`H264Decode::Pending`] submission, once it has decoded.
     ///
     /// `None` while it is still decoding. Called by `GraphicsPipelineClient::resume`.

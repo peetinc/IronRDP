@@ -91,11 +91,11 @@ fn capture_hook() -> Option<CaptureHook> {
 }
 use crate::decode::{DecodedFrame, H264Decode, H264Decoder};
 use crate::pdu::{
-    Avc420BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu, CapabilitiesV8Flags,
-    CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type, DeleteEncodingContextPdu,
-    EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu, MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu,
-    MapSurfaceToWindowPdu, PixelFormat, QueueDepth, RawCapabilitySet, SolidFillPdu, SurfaceToCachePdu,
-    SurfaceToSurfacePdu, WireToSurface2Pdu,
+    Avc420BitmapStream, Avc444BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu,
+    CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type,
+    DeleteEncodingContextPdu, Encoding, EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu, MapSurfaceToScaledOutputPdu,
+    MapSurfaceToScaledWindowPdu, MapSurfaceToWindowPdu, PixelFormat, QueueDepth, RawCapabilitySet, SolidFillPdu,
+    SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface2Pdu,
 };
 
 /// Max capacity to keep for decompressed buffer when cleared.
@@ -943,8 +943,11 @@ impl GraphicsPipelineClient {
             Codec1Type::Avc420 => {
                 self.decode_avc420(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
             }
+            Codec1Type::Avc444 | Codec1Type::Avc444v2 if self.h264_decoder.is_some() => {
+                self.decode_avc444(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
+            }
             Codec1Type::Avc444 | Codec1Type::Avc444v2 => {
-                debug!("AVC444 codec not yet implemented, forwarding to handler");
+                debug!("No H.264 decoder configured, forwarding AVC444 to handler");
                 self.handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(pdu));
             }
             Codec1Type::ClearCodec => {
@@ -1098,7 +1101,46 @@ impl GraphicsPipelineClient {
     fn decode_avc420(&mut self, surface_id: u16, dest_rect: &ExclusiveRectangle, bitmap_data: &[u8]) -> PduResult<()> {
         let mut cursor = ReadCursor::new(bitmap_data);
         let stream = Avc420BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
+        self.submit_avc420(surface_id, dest_rect, stream)
+    }
 
+    /// Decode an AVC444 or AVC444v2 update as 4:2:0.
+    ///
+    /// MS-RDPEGFX 2.2.4.5 and 2.2.4.6: the luma sub-stream is a complete YUV420 picture of the
+    /// surface (the main view); the chroma sub-stream only carries the extra chroma that
+    /// upgrades it to 4:4:4. Both are pictures of one H.264 sequence, so the chroma view is still
+    /// decoded to keep the decoder's reference pictures intact, but only the main view is shown.
+    fn decode_avc444(&mut self, surface_id: u16, dest_rect: &ExclusiveRectangle, bitmap_data: &[u8]) -> PduResult<()> {
+        let mut cursor = ReadCursor::new(bitmap_data);
+        let stream = Avc444BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
+
+        let (main_view, auxiliary_view) = if stream.encoding == Encoding::LUMA_AND_CHROMA {
+            (Some(stream.stream1), stream.stream2)
+        } else if stream.encoding == Encoding::LUMA {
+            (Some(stream.stream1), None)
+        } else {
+            (None, Some(stream.stream1))
+        };
+
+        if let Some(main_view) = main_view {
+            self.submit_avc420(surface_id, dest_rect, main_view)?;
+        }
+        if let (Some(auxiliary_view), Some(decoder)) = (auxiliary_view, self.h264_decoder.as_mut()) {
+            decoder
+                .submit_reference(auxiliary_view.data)
+                .map_err(|e| pdu_other_err!("H.264 decode", source: e))?;
+        }
+        Ok(())
+    }
+
+    /// Decode one YUV420 H.264 picture and paint its region rects, now or, for an asynchronous
+    /// decoder, once [`Self::resume`] has the frame.
+    fn submit_avc420(
+        &mut self,
+        surface_id: u16,
+        dest_rect: &ExclusiveRectangle,
+        stream: Avc420BitmapStream<'_>,
+    ) -> PduResult<()> {
         let Some(ref mut decoder) = self.h264_decoder else {
             debug!("No H.264 decoder configured, skipping AVC420 frame");
             return Ok(());
@@ -2882,6 +2924,7 @@ mod tests {
     #[derive(Default)]
     struct DeferredState {
         submitted: usize,
+        references: usize,
         ready: Option<crate::decode::DecoderResult<DecodedFrame>>,
     }
 
@@ -2903,6 +2946,11 @@ mod tests {
         ) -> crate::decode::DecoderResult<H264Decode> {
             self.state.lock().expect("state lock").submitted += 1;
             Ok(H264Decode::Pending)
+        }
+
+        fn submit_reference(&mut self, _data: &[u8]) -> crate::decode::DecoderResult<()> {
+            self.state.lock().expect("state lock").references += 1;
+            Ok(())
         }
 
         fn poll_frame(&mut self) -> Option<crate::decode::DecoderResult<DecodedFrame>> {
@@ -3125,5 +3173,86 @@ mod tests {
         DvcProcessor::close(&mut client, 0);
 
         assert!(!client.is_awaiting_decoder());
+    }
+
+    fn avc444_update(rect: &ExclusiveRectangle, encoding: Encoding) -> GfxPdu {
+        use ironrdp_core::{Encode as _, WriteCursor};
+
+        use crate::pdu::QuantQuality;
+
+        let sub_stream = || Avc420BitmapStream {
+            rectangles: vec![rect.clone()],
+            quant_qual_vals: vec![QuantQuality {
+                quantization_parameter: 22,
+                progressive: false,
+                quality: 100,
+            }],
+            data: &[0u8],
+        };
+        let stream = Avc444BitmapStream {
+            encoding,
+            stream1: sub_stream(),
+            stream2: (encoding == Encoding::LUMA_AND_CHROMA).then(sub_stream),
+        };
+        let mut bitmap_data = vec![0u8; stream.size()];
+        stream
+            .encode(&mut WriteCursor::new(&mut bitmap_data))
+            .expect("encode avc444 stream");
+        GfxPdu::WireToSurface1(crate::pdu::WireToSurface1Pdu {
+            surface_id: DEFERRED_SURFACE,
+            codec_id: Codec1Type::Avc444,
+            pixel_format: PixelFormat::XRgb,
+            destination_rectangle: rect.clone(),
+            bitmap_data,
+        })
+    }
+
+    #[test]
+    fn avc444_shows_the_main_view_and_decodes_the_chroma_view_for_reference() {
+        let (mut client, state) = deferred_client();
+
+        for pdu in [
+            deferred_start_frame(1),
+            avc444_update(&deferred_rect(0, 0, 16, 16), Encoding::LUMA_AND_CHROMA),
+            GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: 1 }),
+        ] {
+            client.dispatch_pdu(pdu).expect("dispatch");
+        }
+
+        {
+            let state = state.lock().expect("state lock");
+            assert_eq!(state.submitted, 1, "the main (luma) view is the shown picture");
+            assert_eq!(state.references, 1, "the chroma view is decoded but not shown");
+        }
+        assert!(client.is_awaiting_decoder());
+
+        state.lock().expect("state lock").ready = Some(Ok(coordinate_frame()));
+        assert_eq!(client.resume().expect("resume").len(), 1);
+        let updates = client.drain_output();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(pixel_at(&updates[0], 7, 3), [7, 3, 0, 0xFF]);
+    }
+
+    #[test]
+    fn chroma_only_avc444_is_decoded_but_not_shown() {
+        let (mut client, state) = deferred_client();
+
+        let mut replies = Vec::new();
+        for pdu in [
+            deferred_start_frame(1),
+            avc444_update(&deferred_rect(0, 0, 16, 16), Encoding::CHROMA),
+            GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: 1 }),
+        ] {
+            replies.extend(client.dispatch_pdu(pdu).expect("dispatch"));
+        }
+
+        let state = state.lock().expect("state lock");
+        assert_eq!((state.submitted, state.references), (0, 1));
+        assert!(!client.is_awaiting_decoder());
+        assert_eq!(
+            replies.len(),
+            1,
+            "nothing to wait for: the frame is acknowledged at once"
+        );
     }
 }
