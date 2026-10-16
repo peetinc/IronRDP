@@ -528,3 +528,75 @@ fn stop_ignores_all_pdus(#[case] payload: Vec<u8>) {
     let responses = client.process(&payload).unwrap();
     assert!(responses.is_empty(), "Stop state should ignore all PDUs");
 }
+
+/// Handler that picks from the server's own list, like a codec-capable client that
+/// cannot know a compressed format's exact parameters up front.
+#[derive(Debug)]
+struct EchoBackend {
+    waves: RecordedWaves,
+}
+
+impl RdpsndClientHandler for EchoBackend {
+    fn get_formats(&self) -> &[AudioFormat] {
+        &[]
+    }
+
+    fn negotiate_formats(&mut self, server_formats: &[AudioFormat]) -> Vec<AudioFormat> {
+        let mut chosen: Vec<AudioFormat> = server_formats
+            .iter()
+            .filter(|format| format.format == WaveFormat::AAC_MS)
+            .cloned()
+            .collect();
+        // A format the server never offered must not reach the wire.
+        chosen.push(pcm(8000, 1));
+        chosen
+    }
+
+    fn wave(&mut self, format: &AudioFormat, ts: u32, data: Cow<'_, [u8]>) {
+        self.waves.lock().unwrap().push((format.clone(), ts, data.into_owned()));
+    }
+
+    fn set_volume(&mut self, _volume: VolumePdu) {}
+
+    fn set_pitch(&mut self, _pitch: PitchPdu) {}
+
+    fn close(&mut self) {}
+}
+
+#[test]
+fn client_format_negotiation_can_echo_server_formats() {
+    let aac = AudioFormat {
+        format: WaveFormat::AAC_MS,
+        n_channels: 2,
+        n_samples_per_sec: 44100,
+        n_avg_bytes_per_sec: 24000,
+        n_block_align: 4,
+        bits_per_sample: 16,
+        data: Some(vec![0x12, 0x10]),
+    };
+    let waves: RecordedWaves = Arc::new(Mutex::new(Vec::new()));
+    let backend = EchoBackend {
+        waves: Arc::clone(&waves),
+    };
+
+    let mut client = Rdpsnd::new(Box::new(backend));
+    let responses = client
+        .process(&encoded_server_formats_with(
+            pdu::Version::V8,
+            vec![pcm(44100, 2), aac.clone()],
+        ))
+        .unwrap();
+
+    let encoded = responses[0].encode_unframed_pdu().unwrap();
+    let pdu::ClientAudioOutputPdu::AudioFormat(client_fmt) = decode(&encoded).unwrap() else {
+        panic!("expected ClientAudioFormat");
+    };
+    assert_eq!(client_fmt.formats, vec![aac.clone()]);
+
+    client.process(&encoded_training()).unwrap();
+    client.process(&encoded_wave2_with(1, 0)).unwrap();
+
+    let recorded = waves.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].0, aac);
+}

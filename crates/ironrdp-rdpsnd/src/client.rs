@@ -16,6 +16,18 @@ pub trait RdpsndClientHandler: Send + core::fmt::Debug {
 
     fn get_formats(&self) -> &[AudioFormat];
 
+    /// Formats to advertise in reply to the server's list, best first.
+    ///
+    /// The default returns [`get_formats`](Self::get_formats). Override it to pick
+    /// from `server_formats` directly, for compressed formats whose exact parameters
+    /// (bitrate, block layout, codec extra data) are only known from the server.
+    /// Either way, entries matching no server format are dropped before the reply is
+    /// sent, and Wave `wFormatNo` indexes the list that remains.
+    fn negotiate_formats(&mut self, server_formats: &[AudioFormat]) -> Vec<AudioFormat> {
+        let _ = server_formats;
+        self.get_formats().to_vec()
+    }
+
     /// Play a wave block for the given negotiated format.
     ///
     /// `format` is the entry from the client format list advertised during
@@ -130,14 +142,13 @@ impl Rdpsnd {
 
         let formats: Vec<AudioFormat> = self
             .handler
-            .get_formats()
-            .iter()
+            .negotiate_formats(server_formats)
+            .into_iter()
             .filter(|client_fmt| {
                 server_formats
                     .iter()
                     .any(|server_fmt| client_fmt.matches_for_negotiation(server_fmt))
             })
-            .cloned()
             .collect();
 
         self.client_formats = formats.clone();
