@@ -178,6 +178,29 @@ pub fn decode_upgrade_pass(
     assert!(coefficients.len() >= COEFFICIENTS_PER_COMPONENT);
     assert!(sign.len() >= COEFFICIENTS_PER_COMPONENT);
 
+    let srl_values = decode_upgrade_srl(srl_data, prev_prog_quant, curr_prog_quant, use_reduce_extrapolate, sign)?;
+    apply_upgrade_pass(
+        raw_data,
+        prev_prog_quant,
+        curr_prog_quant,
+        use_reduce_extrapolate,
+        &srl_values,
+        coefficients,
+        sign,
+    );
+    Ok(())
+}
+
+/// The fallible half of an upgrade pass: decodes, per band, the SRL values for the
+/// coefficients whose DAS is still zero. Reads `sign` only, so a malformed stream leaves the
+/// tile untouched.
+fn decode_upgrade_srl(
+    srl_data: &[u8],
+    prev_prog_quant: &ComponentCodecQuant,
+    curr_prog_quant: &ComponentCodecQuant,
+    use_reduce_extrapolate: bool,
+    sign: &[i8],
+) -> Result<Vec<Vec<i16>>, SrlError> {
     let bands = get_band_layout(use_reduce_extrapolate);
     let zero_counts: [usize; NUM_BANDS] = core::array::from_fn(|band_idx| band_zero_count(sign, &bands[band_idx]));
     let has_srl_values = bands.iter().enumerate().any(|(band_idx, _)| {
@@ -213,6 +236,22 @@ pub fn decode_upgrade_pass(
         };
         srl_values.push(values);
     }
+
+    Ok(srl_values)
+}
+
+/// The infallible half of an upgrade pass: accumulates the SRL values from
+/// [`decode_upgrade_srl`] and the raw magnitude bits into the coefficients, in place.
+fn apply_upgrade_pass(
+    raw_data: &[u8],
+    prev_prog_quant: &ComponentCodecQuant,
+    curr_prog_quant: &ComponentCodecQuant,
+    use_reduce_extrapolate: bool,
+    srl_values: &[Vec<i16>],
+    coefficients: &mut [i16],
+    sign: &mut [i8],
+) {
+    let bands = get_band_layout(use_reduce_extrapolate);
 
     let mut raw_reader = RawBitReader::new(raw_data);
     for (band_idx, band) in bands.iter().enumerate() {
@@ -259,8 +298,6 @@ pub fn decode_upgrade_pass(
             }
         }
     }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -970,23 +1007,31 @@ impl TileState {
         quality: u8,
     ) -> Result<(), SrlError> {
         let prev_prog_quant = self.prog_quant;
-        let mut coefficients = self.coefficients;
-        let mut sign = self.sign;
 
-        for c in 0..3 {
-            decode_upgrade_pass(
+        // Every component's SRL stream decodes before any coefficient changes, so a malformed
+        // pass leaves the tile as it was, without copying its 36 KiB of state to stage the update.
+        let mut srl_values: [Vec<Vec<i16>>; 3] = Default::default();
+        for (c, values) in srl_values.iter_mut().enumerate() {
+            *values = decode_upgrade_srl(
                 srl_data[c],
+                &prev_prog_quant[c],
+                &prog_quants[c],
+                self.use_reduce_extrapolate,
+                &self.sign[c],
+            )?;
+        }
+        for (c, values) in srl_values.iter().enumerate() {
+            apply_upgrade_pass(
                 raw_data[c],
                 &prev_prog_quant[c],
                 &prog_quants[c],
                 self.use_reduce_extrapolate,
-                &mut coefficients[c],
-                &mut sign[c],
-            )?;
+                values,
+                &mut self.coefficients[c],
+                &mut self.sign[c],
+            );
         }
 
-        self.coefficients = coefficients;
-        self.sign = sign;
         self.prog_quant = prog_quants;
         self.quality = quality;
         self.pass = self.pass.saturating_add(1);
@@ -1295,7 +1340,8 @@ enum FrameTile {
 /// ```
 pub struct ProgressiveDecoder {
     contexts: BTreeMap<(u16, u32), ProgressiveContext>,
-    references: BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
+    /// Boxed: a `DecDwtQ` is 24 KiB, and a B-tree shifts its values within a node on insert.
+    references: BTreeMap<SubBandDiffingTileKey, Box<DecDwtQ>>,
     /// Tiles updated in the current RDPGFX frame, per surface. Per surface rather
     /// than per context: Windows spreads one frame's tiles over several contexts,
     /// deletes contexts mid-frame, and clips the tiles with REGION rectangles sent
@@ -1637,7 +1683,7 @@ fn progressive_quant_for(
 fn decode_tile_block(
     surface_id: u16,
     surface: &mut SurfaceTiles,
-    references: &mut BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
+    references: &mut BTreeMap<SubBandDiffingTileKey, Box<DecDwtQ>>,
     tile_block: &ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>,
     quant_vals: &[ComponentCodecQuant],
     prog_quant_vals: &[ProgressiveCodecQuant],
@@ -1659,6 +1705,7 @@ fn decode_tile_block(
                 Some(
                     references
                         .get(&reference_key)
+                        .map(|reference| &**reference)
                         .ok_or(ProgressiveDecodeError::MissingTileReference { x_idx, y_idx })?,
                 )
             } else {
@@ -1693,7 +1740,7 @@ fn decode_tile_block(
                     use_reduce_extrapolate,
                 },
             )?;
-            references.insert(reference_key, tile_state.coefficients);
+            store_reference(references, reference_key, &tile_state.coefficients);
 
             let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
             tile_state.reconstruct_to_rgba(&mut pixels);
@@ -1719,6 +1766,7 @@ fn decode_tile_block(
                 Some(
                     references
                         .get(&reference_key)
+                        .map(|reference| &**reference)
                         .ok_or(ProgressiveDecodeError::MissingTileReference { x_idx, y_idx })?,
                 )
             } else {
@@ -1752,7 +1800,7 @@ fn decode_tile_block(
                     use_reduce_extrapolate,
                 },
             )?;
-            references.insert(reference_key, tile_state.coefficients);
+            store_reference(references, reference_key, &tile_state.coefficients);
 
             let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
             tile_state.reconstruct_to_rgba(&mut pixels);
@@ -1786,7 +1834,7 @@ fn decode_tile_block(
                 [pq.y_quant, pq.cb_quant, pq.cr_quant],
                 tile.quality,
             )?;
-            references.insert((surface_id, x_idx, y_idx), tile_state.coefficients);
+            store_reference(references, (surface_id, x_idx, y_idx), &tile_state.coefficients);
 
             let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
             tile_state.reconstruct_to_rgba(&mut pixels);
@@ -1810,6 +1858,21 @@ impl Default for ProgressiveDecoder {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Records a tile's coefficients as the reference for its next difference pass, overwriting the
+/// previous reference in place: no allocation, and no 24 KiB value moved through the map.
+fn store_reference(
+    references: &mut BTreeMap<SubBandDiffingTileKey, Box<DecDwtQ>>,
+    key: SubBandDiffingTileKey,
+    coefficients: &DecDwtQ,
+) {
+    match references.entry(key) {
+        Entry::Occupied(mut entry) => **entry.get_mut() = *coefficients,
+        Entry::Vacant(entry) => {
+            entry.insert(Box::new(*coefficients));
+        }
+    }
+}
 
 #[cfg(test)]
 #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -2252,11 +2315,15 @@ mod tests {
         let reference = *decoder
             .references
             .get(&(1, 0, 0))
+            .map(|reference| &**reference)
             .expect("original tile reference should be retained");
 
         decoder.reset();
         assert!(decoder.contexts.is_empty());
-        assert_eq!(decoder.references.get(&(1, 0, 0)), Some(&reference));
+        assert_eq!(
+            decoder.references.get(&(1, 0, 0)).map(|reference| &**reference),
+            Some(&reference)
+        );
 
         assert!(
             decoder
@@ -3690,8 +3757,8 @@ mod tests {
 
         assert_eq!(accumulated[0].pixels, summed[0].pixels);
         assert_eq!(
-            decoder.references.get(&(1, 0, 0)),
-            summed_decoder.references.get(&(1, 0, 0))
+            decoder.references.get(&(1, 0, 0)).map(|reference| &**reference),
+            summed_decoder.references.get(&(1, 0, 0)).map(|reference| &**reference)
         );
         assert!(
             decoder
@@ -3733,8 +3800,11 @@ mod tests {
 
         assert_eq!(replacement[0].pixels, standalone[0].pixels);
         assert_eq!(
-            decoder.references.get(&(1, 0, 0)),
-            standalone_decoder.references.get(&(1, 0, 0))
+            decoder.references.get(&(1, 0, 0)).map(|reference| &**reference),
+            standalone_decoder
+                .references
+                .get(&(1, 0, 0))
+                .map(|reference| &**reference)
         );
         assert!(
             !decoder
@@ -3795,6 +3865,7 @@ mod tests {
         let initial_reference = *decoder
             .references
             .get(&(1, 0, 0))
+            .map(|reference| &**reference)
             .expect("original tile should retain a reference");
         let raw_data = [0xFF; 8];
         decoder
@@ -3815,6 +3886,7 @@ mod tests {
         let upgraded_reference = *decoder
             .references
             .get(&(1, 0, 0))
+            .map(|reference| &**reference)
             .expect("upgrade should update the retained reference");
         assert_ne!(upgraded_reference[0][4032], initial_reference[0][4032]);
 
@@ -3836,6 +3908,7 @@ mod tests {
         let updated_reference = decoder
             .references
             .get(&(1, 0, 0))
+            .map(|reference| &**reference)
             .expect("difference tile should update the retained reference");
 
         let mut delta = TileState::new();
@@ -3877,6 +3950,7 @@ mod tests {
         let reference = *decoder
             .references
             .get(&(1, 0, 0))
+            .map(|reference| &**reference)
             .expect("original tile reference should be retained");
 
         decoder.delete_context(1, 7);
@@ -3911,7 +3985,10 @@ mod tests {
             }
         }
 
-        assert_eq!(decoder.references.get(&(1, 0, 0)), Some(&updated));
+        assert_eq!(
+            decoder.references.get(&(1, 0, 0)).map(|reference| &**reference),
+            Some(&updated)
+        );
 
         decoder.delete_surface(1);
         assert!(!decoder.references.contains_key(&(1, 0, 0)));
@@ -3939,12 +4016,16 @@ mod tests {
         let reference = *decoder
             .references
             .get(&(1, 0, 0))
+            .map(|reference| &**reference)
             .expect("original tile reference should be retained");
 
         decoder
             .decode_bitmap(1, 7, 128, 64, &minimal_progressive_stream(true))
             .expect("resized surface should decode");
-        assert_eq!(decoder.references.get(&(1, 0, 0)), Some(&reference));
+        assert_eq!(
+            decoder.references.get(&(1, 0, 0)).map(|reference| &**reference),
+            Some(&reference)
+        );
 
         decoder
             .decode_bitmap(
@@ -3960,6 +4041,7 @@ mod tests {
         let updated = decoder
             .references
             .get(&(1, 0, 0))
+            .map(|reference| &**reference)
             .expect("difference tile should update the retained reference");
         for ((updated_component, reference_component), delta_component) in
             updated.iter().zip(reference.iter()).zip(expected_delta.iter())
