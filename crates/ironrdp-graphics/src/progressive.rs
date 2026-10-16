@@ -37,7 +37,6 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
-use alloc::collections::BTreeSet;
 use alloc::collections::btree_map::Entry;
 
 use ironrdp_core::invalid_field_err;
@@ -1254,6 +1253,16 @@ struct ProgressiveContext {
     surface: SurfaceTiles,
 }
 
+/// Where a tile updated in the current frame gets its pixels from.
+#[derive(Debug, Clone)]
+enum FrameTile {
+    /// The tile state of this live codec context.
+    Context(u32),
+    /// RGBA8888 pixels reconstructed when the context holding the tile was deleted
+    /// mid-frame. No larger than the tile state the deletion freed.
+    Pixels(Vec<u8>),
+}
+
 /// High-level progressive bitmap decoder for EGFX WireToSurface2 processing.
 ///
 /// Maintains per-context progressive state and surface-scoped sub-band
@@ -1287,7 +1296,11 @@ struct ProgressiveContext {
 pub struct ProgressiveDecoder {
     contexts: BTreeMap<(u16, u32), ProgressiveContext>,
     references: BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
-    frame_tiles: BTreeMap<(u16, u32), BTreeSet<(u16, u16)>>,
+    /// Tiles updated in the current RDPGFX frame, per surface. Per surface rather
+    /// than per context: Windows spreads one frame's tiles over several contexts,
+    /// deletes contexts mid-frame, and clips the tiles with REGION rectangles sent
+    /// under another.
+    frame_tiles: BTreeMap<u16, BTreeMap<(u16, u16), FrameTile>>,
     frame_active: bool,
     surface_context_flags: BTreeMap<u16, bool>,
 }
@@ -1380,7 +1393,8 @@ impl ProgressiveDecoder {
         let (contexts, references, all_frame_tiles) = (&mut self.contexts, &mut self.references, &mut self.frame_tiles);
 
         // Get or create the context for this (surface_id, codec_context_id).
-        let context = match contexts.entry((surface_id, codec_context_id)) {
+        let context_key = (surface_id, codec_context_id);
+        let context = match contexts.entry(context_key) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
                 let surface = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate)?;
@@ -1398,7 +1412,7 @@ impl ProgressiveDecoder {
         }
         context.surface.use_reduce_extrapolate = use_reduce_extrapolate;
 
-        let frame_tiles = all_frame_tiles.entry((surface_id, codec_context_id)).or_default();
+        let frame_tiles = all_frame_tiles.entry(surface_id).or_default();
         if surface_resized {
             frame_tiles.clear();
         }
@@ -1426,6 +1440,11 @@ impl ProgressiveDecoder {
                 _ => continue,
             };
 
+            // Looked up per REGION, not held across the loop: clipping below reads other
+            // contexts' tile state. The context was inserted above, so this always finds it.
+            let Some(context) = contexts.get_mut(&context_key) else {
+                continue;
+            };
             let mut region_tiles = BTreeMap::new();
             for tile_block in &region.tiles {
                 let tiles = decode_tile_block(
@@ -1439,7 +1458,7 @@ impl ProgressiveDecoder {
                 )?;
                 for tile in tiles {
                     let key = (tile.x_idx, tile.y_idx);
-                    frame_tiles.insert(key);
+                    frame_tiles.insert(key, FrameTile::Context(codec_context_id));
                     region_tiles.insert(key, tile);
                 }
             }
@@ -1465,9 +1484,10 @@ impl ProgressiveDecoder {
             }
 
             // REGION rectangles may be covered by tiles sent in an earlier REGION
-            // within the same frame, so clip them against every tile currently
-            // available for this frame rather than only the newly decoded tiles.
-            for &(x_idx, y_idx) in frame_tiles.iter() {
+            // within the same frame, under this codec context or another, so clip them
+            // against every tile updated in this frame rather than only the newly
+            // decoded tiles.
+            for (&(x_idx, y_idx), frame_tile) in frame_tiles.iter() {
                 charge_region_clipping_work(&mut region_clipping_work, clipping_region.rectangles.len().max(1))?;
                 let left = x_idx.saturating_mul(TILE_DIM);
                 let top = y_idx.saturating_mul(TILE_DIM);
@@ -1500,11 +1520,21 @@ impl ProgressiveDecoder {
                 let mut tile = if let Some(tile) = region_tiles.remove(&(x_idx, y_idx)) {
                     tile
                 } else {
-                    let Some(tile_state) = context.surface.get(x_idx, y_idx) else {
-                        continue;
+                    let pixels = match frame_tile {
+                        FrameTile::Context(tile_context_id) => {
+                            let Some(tile_state) = contexts
+                                .get(&(surface_id, *tile_context_id))
+                                .and_then(|context| context.surface.get(x_idx, y_idx))
+                            else {
+                                continue;
+                            };
+                            let mut pixels =
+                                vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
+                            tile_state.reconstruct_to_rgba(&mut pixels);
+                            pixels
+                        }
+                        FrameTile::Pixels(pixels) => pixels.clone(),
                     };
-                    let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
-                    tile_state.reconstruct_to_rgba(&mut pixels);
                     DecodedTile {
                         x_idx,
                         y_idx,
@@ -1528,9 +1558,26 @@ impl ProgressiveDecoder {
     ///
     /// Called when the server sends RDPGFX_DELETE_ENCODING_CONTEXT, which
     /// identifies both the surface and codec context.
+    ///
+    /// Tiles the context updated in the current frame keep their pixels: a later REGION
+    /// of the same frame, under another context, may still clip them.
     pub fn delete_context(&mut self, surface_id: u16, codec_context_id: u32) {
-        self.contexts.remove(&(surface_id, codec_context_id));
-        self.frame_tiles.remove(&(surface_id, codec_context_id));
+        let context = self.contexts.remove(&(surface_id, codec_context_id));
+        let Some(frame_tiles) = self.frame_tiles.get_mut(&surface_id) else {
+            return;
+        };
+        frame_tiles.retain(|&(x_idx, y_idx), frame_tile| {
+            if !matches!(frame_tile, FrameTile::Context(id) if *id == codec_context_id) {
+                return true;
+            }
+            let Some(tile_state) = context.as_ref().and_then(|context| context.surface.get(x_idx, y_idx)) else {
+                return false;
+            };
+            let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
+            tile_state.reconstruct_to_rgba(&mut pixels);
+            *frame_tile = FrameTile::Pixels(pixels);
+            true
+        });
     }
 
     /// Delete every codec context associated with a surface.
@@ -1542,8 +1589,7 @@ impl ProgressiveDecoder {
             .retain(|(context_surface_id, _), _| *context_surface_id != surface_id);
         self.references
             .retain(|(reference_surface_id, _, _), _| *reference_surface_id != surface_id);
-        self.frame_tiles
-            .retain(|(context_surface_id, _), _| *context_surface_id != surface_id);
+        self.frame_tiles.remove(&surface_id);
         self.surface_context_flags.remove(&surface_id);
     }
 
@@ -2325,15 +2371,108 @@ mod tests {
         // Intersecting a moderately fragmented region with an attacker-sized
         // accumulated tile set is charged to the same per-payload budget.
         let rects = (0..100u16).map(|x| rect(x.saturating_mul(3), 0, 2, 2)).collect();
-        let frame_tiles = (0..11_000u16).map(|index| (index % 128, index / 128)).collect();
+        let frame_tiles = (0..11_000u16)
+            .map(|index| ((index % 128, index / 128), FrameTile::Context(1)))
+            .collect();
         let mut decoder = ProgressiveDecoder::new();
         decoder.begin_frame();
-        decoder.frame_tiles.insert((1, 1), frame_tiles);
+        decoder.frame_tiles.insert(1, frame_tiles);
         let error = match decoder.decode_bitmap(1, 1, 8192, 8192, &stream_with_rects(rects)) {
             Err(error) => error,
             Ok(_) => panic!("tile intersections must share the clipping work budget"),
         };
         assert!(error.to_string().contains("clipping work limit exceeded"));
+    }
+
+    /// A REGION repaints the tiles its rectangles cover that were updated earlier in the
+    /// same RDPGFX frame, whichever codec context carried them: Windows spreads one
+    /// frame's tiles over several contexts and clips them with rectangles sent under
+    /// another. Tracking the frame's tiles per context left those areas unpainted, so
+    /// whatever was there before (a closed menu, a moved window) stayed on screen.
+    #[test]
+    fn region_repaints_frame_tiles_from_another_codec_context() {
+        use ironrdp_pdu::codecs::rfx::progressive::{
+            ProgressiveBlock, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu, ProgressiveRegion,
+            encode_progressive_stream,
+        };
+
+        let clip_only = |rects| {
+            encode_progressive_stream(&[
+                ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                    frame_index: 0,
+                    region_count: 1,
+                }),
+                ProgressiveBlock::Region(ProgressiveRegion {
+                    tile_size: 0x40,
+                    rects,
+                    quant_vals: vec![ComponentCodecQuant::LOSSLESS],
+                    quant_prog_vals: vec![],
+                    flags: 0,
+                    tiles: vec![],
+                }),
+                ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+            ])
+            .expect("synthetic progressive stream should encode")
+        };
+
+        let mut decoder = ProgressiveDecoder::new();
+        decoder.begin_frame();
+        let sent = decoder
+            .decode_bitmap(1, 21, 64, 64, &simple_tile_stream(0, [64, -16, 24], true))
+            .expect("tile decodes");
+        let [sent] = sent.as_slice() else {
+            panic!("one tile expected, got {}", sent.len());
+        };
+
+        let repainted = decoder
+            .decode_bitmap(1, 22, 64, 64, &clip_only(vec![rect(0, 0, 32, 64)]))
+            .expect("clip-only region decodes");
+        let [repainted] = repainted.as_slice() else {
+            panic!(
+                "the other context's tile must be repainted, got {} tiles",
+                repainted.len()
+            );
+        };
+        assert_eq!((repainted.x_idx, repainted.y_idx), (0, 0));
+        assert_eq!(
+            repainted.update_rectangles,
+            vec![ExclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: 32,
+                bottom: 64
+            }]
+        );
+        assert_eq!(repainted.pixels, sent.pixels);
+        decoder.end_frame();
+
+        // Windows deletes a context mid-frame and then clips its tiles with a REGION sent
+        // under the next one: the tiles must survive the deletion.
+        decoder.begin_frame();
+        let sent = decoder
+            .decode_bitmap(1, 23, 64, 64, &simple_tile_stream(0, [-40, 8, -12], true))
+            .expect("tile decodes");
+        decoder.delete_context(1, 23);
+        let repainted = decoder
+            .decode_bitmap(1, 24, 64, 64, &clip_only(vec![rect(32, 0, 32, 64)]))
+            .expect("clip-only region decodes");
+        let [repainted] = repainted.as_slice() else {
+            panic!(
+                "a deleted context's frame tile must be repainted, got {} tiles",
+                repainted.len()
+            );
+        };
+        assert_eq!(repainted.pixels, sent[0].pixels);
+        decoder.end_frame();
+
+        // Only tiles of the current frame are repainted: a later frame's clip-only region
+        // leaves the surface alone, as in FreeRDP.
+        decoder.begin_frame();
+        let later = decoder
+            .decode_bitmap(1, 22, 64, 64, &clip_only(vec![rect(0, 0, 64, 64)]))
+            .expect("clip-only region decodes");
+        assert!(later.is_empty());
+        decoder.end_frame();
     }
 
     #[test]
