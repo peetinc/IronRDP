@@ -67,6 +67,37 @@ export function enableAudioPlayback(enable: boolean): Extension {
     return new Extension('enable_audio_playback', enable);
 }
 
+/**
+ * Client Info `performanceFlags` bits (MS-RDPBCGR 2.2.1.11.1.1.1): which desktop
+ * effects the server may render. `DISABLE_*` bits turn an effect off, `ENABLE_*`
+ * bits turn one on.
+ */
+export const PerformanceFlag = {
+    DISABLE_WALLPAPER: 0x0000_0001,
+    DISABLE_FULLWINDOWDRAG: 0x0000_0002,
+    DISABLE_MENUANIMATIONS: 0x0000_0004,
+    DISABLE_THEMING: 0x0000_0008,
+    DISABLE_CURSOR_SHADOW: 0x0000_0020,
+    DISABLE_CURSORSETTINGS: 0x0000_0040,
+    ENABLE_FONT_SMOOTHING: 0x0000_0080,
+    ENABLE_DESKTOP_COMPOSITION: 0x0000_0100,
+} as const;
+
+/** What is sent when no `performanceFlags` extension is given: no window contents while dragging, no menu animations, font smoothing on. */
+export const DEFAULT_PERFORMANCE_FLAGS =
+    PerformanceFlag.DISABLE_FULLWINDOWDRAG |
+    PerformanceFlag.DISABLE_MENUANIMATIONS |
+    PerformanceFlag.ENABLE_FONT_SMOOTHING;
+
+/**
+ * Replace the Client Info performance flags, a bitwise OR of {@link PerformanceFlag}
+ * values. Applies at connect. A value that is not an integer in the u32 range is
+ * ignored and the defaults ({@link DEFAULT_PERFORMANCE_FLAGS}) are sent.
+ */
+export function performanceFlags(flags: number): Extension {
+    return new Extension('performance_flags', flags);
+}
+
 export function kdcProxyUrl(url: string): Extension {
     return new Extension('kdc_proxy_url', url);
 }

@@ -136,6 +136,9 @@ struct SessionBuilderInner {
     enable_server_pointer: bool,
     legacy_graphics: bool,
     outbound_message_size_limit: Option<usize>,
+    /// Client Info `performanceFlags` (MS-RDPBCGR 2.2.1.11.1.1.1); `None` keeps
+    /// [`PerformanceFlags::default`].
+    performance_flags: Option<PerformanceFlags>,
 }
 
 impl Default for SessionBuilderInner {
@@ -181,6 +184,7 @@ impl Default for SessionBuilderInner {
             use_display_control: false,
             use_egfx: true,
             enable_audio_playback: false,
+            performance_flags: None,
             enable_credssp: true,
             enable_standard_rdp_security: false,
             enable_server_pointer: true,
@@ -311,6 +315,13 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             };
             |enable_server_pointer: bool| { self.0.borrow_mut().enable_server_pointer = enable_server_pointer };
             |legacy_graphics: bool| { self.0.borrow_mut().legacy_graphics = legacy_graphics };
+            |performance_flags: f64| {
+                let flags = performance_flags_from_js(performance_flags);
+                if flags.is_none() {
+                    warn!(performance_flags, "Invalid performance flags; keeping the defaults");
+                }
+                self.0.borrow_mut().performance_flags = flags;
+            };
             |outbound_message_size_limit: f64| {
                 let limit = if outbound_message_size_limit >= 0.0 && outbound_message_size_limit <= f64::from(u32::MAX) {
                     #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -539,6 +550,9 @@ impl SessionBuilder {
 
         let enable_server_pointer = self.0.borrow().enable_server_pointer;
         config.enable_server_pointer = enable_server_pointer;
+        if let Some(performance_flags) = self.0.borrow().performance_flags {
+            config.performance_flags = performance_flags;
+        }
 
         let (input_events_tx, input_events_rx, drive_slot) = match reuse {
             Some(Reuse {
@@ -1992,6 +2006,26 @@ fn parse_file_metadata_array(files: JsValue) -> Result<Vec<FileMetadata>, IronEr
     Ok(file_list)
 }
 
+/// Client Info `performanceFlags` from a JS number, or `None` unless it is an integer
+/// in `0..=u32::MAX`. Unknown bits are retained.
+///
+/// A named function rather than an inline block in `extension` so the conversion is
+/// unit-testable.
+fn performance_flags_from_js(value: f64) -> Option<PerformanceFlags> {
+    if !(0.0..=f64::from(u32::MAX)).contains(&value) || value.fract() != 0.0 {
+        return None;
+    }
+
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked above: a non-negative integer no larger than u32::MAX"
+    )]
+    let bits = value as u32;
+    Some(PerformanceFlags::from_bits_retain(bits))
+}
+
 fn build_config(
     username: String,
     password: String,
@@ -2603,6 +2637,27 @@ fn f64_to_u16_saturating_cast(value: f64) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn performance_flags_from_js_takes_any_u32_bit_set() {
+        assert_eq!(
+            performance_flags_from_js(f64::from(0x0000_0180u32)),
+            Some(PerformanceFlags::ENABLE_FONT_SMOOTHING | PerformanceFlags::ENABLE_DESKTOP_COMPOSITION)
+        );
+        assert_eq!(performance_flags_from_js(0.0), Some(PerformanceFlags::empty()));
+        // Unknown bits are kept, not dropped (STYLE.md "Decoding unknown values").
+        assert_eq!(
+            performance_flags_from_js(f64::from(u32::MAX)).map(|flags| flags.bits()),
+            Some(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn performance_flags_from_js_rejects_values_that_are_not_a_u32() {
+        for value in [-1.0, 1.5, f64::from(u32::MAX) + 1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(performance_flags_from_js(value), None, "{value}");
+        }
+    }
 
     // Test helpers
     fn create_test_input_channel() -> (
