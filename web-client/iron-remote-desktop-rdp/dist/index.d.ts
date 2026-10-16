@@ -42,6 +42,9 @@ declare class ClipboardItem_2 {
     value(): any;
 }
 
+/** What is sent when no `performanceFlags` extension is given: no window contents while dragging, no menu animations, font smoothing on. */
+export declare const DEFAULT_PERFORMANCE_FLAGS: number;
+
 declare class DesktopSize {
     free(): void;
     [Symbol.dispose](): void;
@@ -512,6 +515,29 @@ export declare class OpfsStorageBackend implements FileStorageBackend {
 }
 
 export declare function outboundMessageSizeLimit(limit: number): Extension;
+
+/**
+ * Client Info `performanceFlags` bits (MS-RDPBCGR 2.2.1.11.1.1.1): which desktop
+ * effects the server may render. `DISABLE_*` bits turn an effect off, `ENABLE_*`
+ * bits turn one on.
+ */
+export declare const PerformanceFlag: {
+    readonly DISABLE_WALLPAPER: 1;
+    readonly DISABLE_FULLWINDOWDRAG: 2;
+    readonly DISABLE_MENUANIMATIONS: 4;
+    readonly DISABLE_THEMING: 8;
+    readonly DISABLE_CURSOR_SHADOW: 32;
+    readonly DISABLE_CURSORSETTINGS: 64;
+    readonly ENABLE_FONT_SMOOTHING: 128;
+    readonly ENABLE_DESKTOP_COMPOSITION: 256;
+};
+
+/**
+ * Replace the Client Info performance flags, a bitwise OR of {@link PerformanceFlag}
+ * values. Applies at connect. A value that is not an integer in the u32 range is
+ * ignored and the defaults ({@link DEFAULT_PERFORMANCE_FLAGS}) are sent.
+ */
+export declare function performanceFlags(flags: number): Extension;
 
 export declare function preConnectionBlob(pcb: string): Extension;
 
