@@ -190,6 +190,23 @@ impl ActiveStage {
         action: Action,
         frame: &[u8],
     ) -> SessionResult<Vec<ActiveStageOutput>> {
+        self.process_received(image, action, frame, None)
+    }
+
+    /// [`Self::process`], told when `frame` arrived (for example from the driver's
+    /// `Framed::last_read_at`): the arrival times time the server's in-session bandwidth
+    /// measurements ([MS-RDPBCGR] 3.2.5.14), which Windows uses to pick its encoding quality.
+    /// Without them a measurement is still answered, as the shortest interval.
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/5073f4ed-1e93-45e1-b039-6e30c385867c
+    pub fn process_received(
+        &mut self,
+        image: &mut DecodedImage,
+        action: Action,
+        frame: &[u8],
+        received_at: Option<ironrdp_core::MonotonicInstant>,
+    ) -> SessionResult<Vec<ActiveStageOutput>> {
+        self.x224_processor.note_received(frame.len(), received_at);
         self.damage_regions.clear();
         let (mut stage_outputs, processor_updates) = match action {
             Action::FastPath => {

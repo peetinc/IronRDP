@@ -1010,7 +1010,7 @@ impl Session {
                     let (action, payload) = frame.context("read frame")?;
                     trace!(?action, frame_length = payload.len(), "Frame received");
 
-                    active_stage.process(&mut image, action, &payload)?
+                    active_stage.process_received(&mut image, action, &payload, framed.last_read_at())?
                 }
                 input_events = input_events.next() => {
                     let event = input_events.context("read next input events")?;
@@ -2446,13 +2446,14 @@ async fn connect(
                         },
                     ];
                     // Windows 11 confirms V8_1 with AVC420_ENABLED cleared: it only enables
-                    // H.264 for 10.x clients. AVC_THIN_CLIENT asks for plain AVC420, which is
-                    // all the WebCodecs decoder handles (no AVC444 auxiliary chroma view).
+                    // H.264 for 10.x clients, and then sends AVC444, shown as its 4:2:0 main
+                    // view. AVC_THIN_CLIENT is left off: with it Windows sent luma only but at
+                    // the same heavy quantization.
                     if self.h264 {
                         caps.insert(
                             0,
                             CapabilitySet::V10_7 {
-                                flags: CapabilitiesV107Flags::SMALL_CACHE | CapabilitiesV107Flags::AVC_THIN_CLIENT,
+                                flags: CapabilitiesV107Flags::SMALL_CACHE,
                             },
                         );
                     }
