@@ -92,10 +92,10 @@ function Di(t, e = false) {
 }
 // @__NO_SIDE_EFFECTS__
 function Lr(t) {
-  return k !== null && !Z && (k.f & Q) !== 0 && (se === null ? Ur([t]) : se.push(t)), t;
+  return S !== null && !Z && (S.f & Q) !== 0 && (se === null ? Ur([t]) : se.push(t)), t;
 }
 function H(t, e) {
-  return k !== null && !Z && Xi() && (k.f & (Q | Gt)) !== 0 && // If the source was created locally within the current derived, then
+  return S !== null && !Z && Xi() && (S.f & (Q | Gt)) !== 0 && // If the source was created locally within the current derived, then
   // we allow the mutation.
   (se === null || !se.includes(t)) && Or(), Mr(t, e);
 }
@@ -119,9 +119,9 @@ function Ti(t, e) {
 }
 // @__NO_SIDE_EFFECTS__
 function Ri(t) {
-  var e = Q | Ce, i = k !== null && (k.f & Q) !== 0 ? (
+  var e = Q | Ce, i = S !== null && (S.f & Q) !== 0 ? (
     /** @type {Derived} */
-    k
+    S
   ) : null;
   return T === null || i !== null && (i.f & G) !== 0 ? e |= G : T.f |= _i, {
     ctx: z,
@@ -358,9 +358,9 @@ function li(t) {
   Zt = t;
 }
 let et = [];
-let k = null, Z = false;
+let S = null, Z = false;
 function ge(t) {
-  k = t;
+  S = t;
 }
 let T = null;
 function _e(t) {
@@ -456,9 +456,9 @@ function Bi(t, e, i = true) {
 }
 function zi(t) {
   var _a2;
-  var e = U, i = q, r = le, n = k, o = me, c = se, f = z, h = Z, d = t.f;
+  var e = U, i = q, r = le, n = S, o = me, c = se, f = z, h = Z, d = t.f;
   U = /** @type {null | Value[]} */
-  null, q = 0, le = null, me = (d & G) !== 0 && (Z || !ht || k === null), k = (d & (ye | Ke)) === 0 ? t : null, se = null, ui(t.ctx), Z = false, Et++;
+  null, q = 0, le = null, me = (d & G) !== 0 && (Z || !ht || S === null), S = (d & (ye | Ke)) === 0 ? t : null, se = null, ui(t.ctx), Z = false, Et++;
   try {
     var p = (
       /** @type {Function} */
@@ -485,7 +485,7 @@ function zi(t) {
         );
     return n !== null && Et++, p;
   } finally {
-    U = e, q = i, le = r, k = n, me = o, se = c, ui(f), Z = h;
+    U = e, q = i, le = r, S = n, me = o, se = c, ui(f), Z = h;
   }
 }
 function Kr(t, e) {
@@ -595,13 +595,13 @@ function qr(t) {
       else if (n)
         i.f ^= j;
       else {
-        var c = k;
+        var c = S;
         try {
-          k = i, Rt(i) && Qt(i);
+          S = i, Rt(i) && Qt(i);
         } catch (d) {
           $t(d, i, null, i.ctx);
         } finally {
-          k = c;
+          S = c;
         }
       }
       var f = i.first;
@@ -627,9 +627,9 @@ function Ye(t) {
 }
 function B(t) {
   var e = t.f, i = (e & Q) !== 0;
-  if (k !== null && !Z) {
+  if (S !== null && !Z) {
     se !== null && se.includes(t) && $r();
-    var r = k.deps;
+    var r = S.deps;
     t.rv < Et && (t.rv = Et, U === null && r !== null && r[q] === t ? q++ : U === null ? U = [t] : (!me || !U.includes(t)) && U.push(t));
   } else if (i && /** @type {Derived} */
   t.deps === null && /** @type {Derived} */
@@ -656,7 +656,7 @@ function ce(t, e) {
   t.f = t.f & Hr | e;
 }
 function jr(t) {
-  T === null && k === null && kr(), k !== null && (k.f & G) !== 0 && T === null && Er(), Zt && Cr();
+  T === null && S === null && kr(), S !== null && (S.f & G) !== 0 && T === null && Er(), Zt && Cr();
 }
 function Gr(t, e) {
   var i = e.last;
@@ -687,10 +687,10 @@ function Te(t, e, i, r = true) {
     }
   else e !== null && Jt(c);
   var f = i && c.deps === null && c.first === null && c.nodes_start === null && c.teardown === null && (c.f & (_i | pt)) === 0;
-  if (!f && !n && r && (o !== null && Gr(c, o), k !== null && (k.f & Q) !== 0)) {
+  if (!f && !n && r && (o !== null && Gr(c, o), S !== null && (S.f & Q) !== 0)) {
     var h = (
       /** @type {Derived} */
-      k
+      S
     );
     (h.effects ?? (h.effects = [])).push(c);
   }
@@ -711,7 +711,7 @@ function Xr(t) {
     (i.e ?? (i.e = [])).push({
       fn: t,
       effect: T,
-      reaction: k
+      reaction: S
     });
   } else {
     var r = ei(t);
@@ -751,7 +751,7 @@ function tn(t, e = true) {
 function Wi(t) {
   var e = t.teardown;
   if (e !== null) {
-    const i = Zt, r = k;
+    const i = Zt, r = S;
     li(true), ge(null);
     try {
       e.call(null);
@@ -848,7 +848,7 @@ function Yi(t) {
     t !== void 0 && (e.x = t);
     const c = e.e;
     if (c !== null) {
-      var i = T, r = k;
+      var i = T, r = S;
       e.e = null;
       try {
         for (var n = 0; n < c.length; n++) {
@@ -872,7 +872,7 @@ function an(t) {
   return on.includes(t);
 }
 function ln(t) {
-  var e = k, i = T;
+  var e = S, i = T;
   ge(null), _e(null);
   try {
     return t();
@@ -931,7 +931,7 @@ function Xe(t) {
         return o || i;
       }
     });
-    var p = k, w = T;
+    var p = S, w = T;
     ge(null), _e(null);
     try {
       for (var s, l = []; o !== null; ) {
@@ -1570,7 +1570,7 @@ var Ze = { exports: {} }, Tn = Ze.exports, bi;
 function Rn() {
   return bi || (bi = 1, (function(t, e) {
     (function(i, r) {
-      var n = "1.0.41", o = "", c = "?", f = "function", h = "undefined", d = "object", p = "string", w = "major", s = "model", l = "name", a = "type", u = "vendor", b = "version", $ = "architecture", O = "console", g = "mobile", _ = "tablet", L = "smarttv", M = "wearable", Y = "embedded", Re = 500, $e = "Amazon", de = "Apple", rt = "ASUS", fe = "BlackBerry", Oe = "Browser", Ae = "Chrome", Ot = "Edge", Le = "Firefox", Ee = "Google", nt = "Honor", st = "Huawei", At = "Lenovo", Me = "LG", ke = "Microsoft", Ve = "Motorola", qe = "Nvidia", He = "OnePlus", he = "Opera", Fe = "OPPO", ee = "Samsung", be = "Sharp", pe = "Sony", Se = "Xiaomi", K = "Zebra", v = "Facebook", S = "Chromium OS", A = "Mac OS", R = " Browser", N = function(y, C) {
+      var n = "1.0.41", o = "", c = "?", f = "function", h = "undefined", d = "object", p = "string", w = "major", s = "model", l = "name", a = "type", u = "vendor", b = "version", $ = "architecture", O = "console", g = "mobile", _ = "tablet", L = "smarttv", M = "wearable", Y = "embedded", Re = 500, $e = "Amazon", de = "Apple", rt = "ASUS", fe = "BlackBerry", Oe = "Browser", Ae = "Chrome", Ot = "Edge", Le = "Firefox", Ee = "Google", nt = "Honor", st = "Huawei", At = "Lenovo", Me = "LG", ke = "Microsoft", Ve = "Motorola", qe = "Nvidia", He = "OnePlus", he = "Opera", Fe = "OPPO", ee = "Samsung", be = "Sharp", pe = "Sony", Se = "Xiaomi", K = "Zebra", v = "Facebook", E = "Chromium OS", A = "Mac OS", R = " Browser", N = function(y, C) {
         var x = {};
         for (var D in y)
           C[D] && C[D].length % 2 === 0 ? x[D] = C[D].concat(y[D]) : x[D] = y[D];
@@ -1589,12 +1589,12 @@ function Rn() {
         if (typeof y === p)
           return y = y.replace(/^\s\s*/, o), typeof C === h ? y : y.substring(0, Re);
       }, je = function(y, C) {
-        for (var x = 0, D, ae, te, E, m, ie; x < C.length && !m; ) {
+        for (var x = 0, D, ae, te, k, m, ie; x < C.length && !m; ) {
           var Mt = C[x], ri = C[x + 1];
           for (D = ae = 0; D < Mt.length && !m && Mt[D]; )
             if (m = Mt[D++].exec(y), m)
               for (te = 0; te < ri.length; te++)
-                ie = m[++ae], E = ri[te], typeof E === d && E.length > 0 ? E.length === 2 ? typeof E[1] == f ? this[E[0]] = E[1].call(this, ie) : this[E[0]] = E[1] : E.length === 3 ? typeof E[1] === f && !(E[1].exec && E[1].test) ? this[E[0]] = ie ? E[1].call(this, ie, E[2]) : r : this[E[0]] = ie ? ie.replace(E[1], E[2]) : r : E.length === 4 && (this[E[0]] = ie ? E[3].call(this, ie.replace(E[1], E[2])) : r) : this[E] = ie || r;
+                ie = m[++ae], k = ri[te], typeof k === d && k.length > 0 ? k.length === 2 ? typeof k[1] == f ? this[k[0]] = k[1].call(this, ie) : this[k[0]] = k[1] : k.length === 3 ? typeof k[1] === f && !(k[1].exec && k[1].test) ? this[k[0]] = ie ? k[1].call(this, ie, k[2]) : r : this[k[0]] = ie ? ie.replace(k[1], k[2]) : r : k.length === 4 && (this[k[0]] = ie ? k[3].call(this, ie.replace(k[1], k[2])) : r) : this[k] = ie || r;
           x += 2;
         }
       }, Ge = function(y, C) {
@@ -2792,7 +2792,7 @@ function Rn() {
             /(cros) [\w]+(?:\)| ([\w\.]+)\b)/i
             // Chromium OS
           ],
-          [[l, S], b],
+          [[l, E], b],
           [
             // Smart TVs
             /panasonic;(viera)/i,
@@ -2845,22 +2845,22 @@ function Rn() {
       }, X = function(y, C) {
         if (typeof y === d && (C = y, y = r), !(this instanceof X))
           return new X(y, C).getResult();
-        var x = typeof i !== h && i.navigator ? i.navigator : r, D = y || (x && x.userAgent ? x.userAgent : o), ae = x && x.userAgentData ? x.userAgentData : r, te = C ? N(ii, C) : ii, E = x && x.userAgent == D;
+        var x = typeof i !== h && i.navigator ? i.navigator : r, D = y || (x && x.userAgent ? x.userAgent : o), ae = x && x.userAgentData ? x.userAgentData : r, te = C ? N(ii, C) : ii, k = x && x.userAgent == D;
         return this.getBrowser = function() {
           var m = {};
-          return m[l] = r, m[b] = r, je.call(m, D, te.browser), m[w] = ar(m[b]), E && x && x.brave && typeof x.brave.isBrave == f && (m[l] = "Brave"), m;
+          return m[l] = r, m[b] = r, je.call(m, D, te.browser), m[w] = ar(m[b]), k && x && x.brave && typeof x.brave.isBrave == f && (m[l] = "Brave"), m;
         }, this.getCPU = function() {
           var m = {};
           return m[$] = r, je.call(m, D, te.cpu), m;
         }, this.getDevice = function() {
           var m = {};
-          return m[u] = r, m[s] = r, m[a] = r, je.call(m, D, te.device), E && !m[a] && ae && ae.mobile && (m[a] = g), E && m[s] == "Macintosh" && x && typeof x.standalone !== h && x.maxTouchPoints && x.maxTouchPoints > 2 && (m[s] = "iPad", m[a] = _), m;
+          return m[u] = r, m[s] = r, m[a] = r, je.call(m, D, te.device), k && !m[a] && ae && ae.mobile && (m[a] = g), k && m[s] == "Macintosh" && x && typeof x.standalone !== h && x.maxTouchPoints && x.maxTouchPoints > 2 && (m[s] = "iPad", m[a] = _), m;
         }, this.getEngine = function() {
           var m = {};
           return m[l] = r, m[b] = r, je.call(m, D, te.engine), m;
         }, this.getOS = function() {
           var m = {};
-          return m[l] = r, m[b] = r, je.call(m, D, te.os), E && !m[l] && ae && ae.platform && ae.platform != "Unknown" && (m[l] = ae.platform.replace(/chrome os/i, S).replace(/macos/i, A)), m;
+          return m[l] = r, m[b] = r, je.call(m, D, te.os), k && !m[l] && ae && ae.platform && ae.platform != "Unknown" && (m[l] = ae.platform.replace(/chrome os/i, E).replace(/macos/i, A)), m;
         }, this.getResult = function() {
           return {
             ua: this.getUA(),
@@ -3421,7 +3421,7 @@ class Un {
   }
   resizeDynamic(e, i, r) {
     var _a2;
-    this.dynamicResizeObservable.publish({ width: e, height: i }), (_a2 = this.session) == null ? void 0 : _a2.resize(e, i, r);
+    this.dynamicResizeObservable.publish({ width: e, height: i, scale: r }), (_a2 = this.session) == null ? void 0 : _a2.resize(e, i, r);
   }
   /// Triggered by the browser when local clipboard is updated. Clipboard backend should
   /// cache the content and send it to the server when it is requested.
@@ -3964,12 +3964,12 @@ function or(t, e) {
   function L(v) {
     n() === "true" && (h.style.flexGrow = "1", h.style.display = "flex", h.style.justifyContent = "center", h.style.alignItems = "center");
   }
-  function M(v, S, A) {
-    let R = `height: ${v}; width: ${S}`;
-    R = `${R}; max-height: ${v}; max-width: ${S}; min-height: ${v}; min-width: ${S}`, H(w, De(R));
+  function M(v, E, A) {
+    let R = `height: ${v}; width: ${E}`;
+    R = `${R}; max-height: ${v}; max-width: ${E}; min-height: ${v}; min-width: ${E}`, H(w, De(R));
   }
-  function Y(v, S, A) {
-    H(s, `height: ${v}; width: ${S}; overflow: ${A}`);
+  function Y(v, E, A) {
+    H(s, `height: ${v}; width: ${E}; overflow: ${A}`);
   }
   const Re = (v) => {
     fe(i());
@@ -3983,7 +3983,9 @@ function or(t, e) {
     window.addEventListener("resize", Re), l.scaleObservable.subscribe((v) => {
       F.info("Change scale!"), fe(v);
     }), l.dynamicResizeObservable.subscribe((v) => {
-      F.info(`Dynamic resize!, width: ${v.width}, height: ${v.height}`), M(v.height.toString() + "px", v.width.toString() + "px");
+      F.info(`Dynamic resize!, width: ${v.width}, height: ${v.height}, scale: ${v.scale}`);
+      const E = v.scale !== void 0 && v.scale > 0 ? 100 / v.scale : 1;
+      M(`${v.height * E}px`, `${v.width * E}px`);
     }), l.changeVisibilityObservable.subscribe((v) => {
       H(c, De(v)), v && (Y("100%", "100%", "hidden"), setTimeout(() => fe(i()), 150));
     });
@@ -4009,13 +4011,13 @@ function or(t, e) {
       }
   }
   function Oe() {
-    const v = ke(), S = v.x, A = v.y;
+    const v = ke(), E = v.x, A = v.y;
     let R = p.width, N = p.height;
-    const P = Math.min(S / p.width, A / p.height);
-    R = R * P, N = N * P, Y(`${A}px`, `${S}px`, "hidden"), R = R > 0 ? R : 0, N = N > 0 ? N : 0, M(`${N}px`, `${R}px`);
+    const P = Math.min(E / p.width, A / p.height);
+    R = R * P, N = N * P, Y(`${A}px`, `${E}px`, "hidden"), R = R > 0 ? R : 0, N = N > 0 ? N : 0, M(`${N}px`, `${R}px`);
   }
   function Ae(v = false) {
-    const S = ke(), A = d.getBoundingClientRect(), R = S.x - A.x, N = S.y - A.y;
+    const E = ke(), A = d.getBoundingClientRect(), R = E.x - A.x, N = E.y - A.y;
     let P = p.width, oe = p.height;
     if (!v || R < p.width || N < p.height) {
       const ve = Math.min(R / p.width, N / p.height);
@@ -4024,18 +4026,18 @@ function or(t, e) {
     P = P > 0 ? P : 0, oe = oe > 0 ? oe : 0, Y("initial", "initial", "hidden"), M(`${oe}px`, `${P}px`), L();
   }
   function Ot() {
-    const v = ke(), S = d.getBoundingClientRect(), A = v.x - S.x, R = v.y - S.y;
+    const v = ke(), E = d.getBoundingClientRect(), A = v.x - E.x, R = v.y - E.y;
     A < p.width || R < p.height ? Y(`${Math.min(R, p.height)}px`, `${Math.min(A, p.width)}px`, "auto") : Y("initial", "initial", "initial"), M(`${p.height}px`, `${p.width}px`), L();
   }
   function Le(v) {
-    const S = p == null ? void 0 : p.getBoundingClientRect(), A = (p == null ? void 0 : p.width) / S.width, R = (p == null ? void 0 : p.height) / S.height, N = {
-      x: Math.round((v.clientX - S.left) * A),
-      y: Math.round((v.clientY - S.top) * R)
+    const E = p == null ? void 0 : p.getBoundingClientRect(), A = (p == null ? void 0 : p.width) / E.width, R = (p == null ? void 0 : p.height) / E.height, N = {
+      x: Math.round((v.clientX - E.left) * A),
+      y: Math.round((v.clientY - E.top) * R)
     };
     l.updateMousePosition(N);
   }
-  function Ee(v, S) {
-    l.mouseButtonState(v, S, true);
+  function Ee(v, E) {
+    l.mouseButtonState(v, E, true);
   }
   function nt(v) {
     l.mouseWheel(v);
@@ -4050,7 +4052,7 @@ function or(t, e) {
     return l.sendKeyboardEvent(v), true;
   }
   function ke() {
-    const v = window, S = document, A = S.documentElement, R = S.getElementsByTagName("body")[0], N = v.innerWidth ?? A.clientWidth ?? R.clientWidth, P = v.innerHeight ?? A.clientHeight ?? R.clientHeight;
+    const v = window, E = document, A = E.documentElement, R = E.getElementsByTagName("body")[0], N = v.innerWidth ?? A.clientWidth ?? R.clientWidth, P = v.innerHeight ?? A.clientHeight ?? R.clientHeight;
     return { x: N, y: P };
   }
   async function Ve() {
