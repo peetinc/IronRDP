@@ -145,8 +145,10 @@
         });
 
         remoteDesktopService.dynamicResizeObservable.subscribe((evt) => {
-            loggingService.info(`Dynamic resize!, width: ${evt.width}, height: ${evt.height}`);
-            setViewerStyle(evt.height.toString() + 'px', evt.width.toString() + 'px', true);
+            loggingService.info(`Dynamic resize!, width: ${evt.width}, height: ${evt.height}, scale: ${evt.scale}`);
+            // A scale factor (percent) means the desktop is sized in device pixels: show it in CSS pixels.
+            const cssPerDesktop = evt.scale !== undefined && evt.scale > 0 ? 100 / evt.scale : 1;
+            setViewerStyle(`${evt.height * cssPerDesktop}px`, `${evt.width * cssPerDesktop}px`, true);
         });
 
         remoteDesktopService.changeVisibilityObservable.subscribe((val) => {

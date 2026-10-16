@@ -52,7 +52,7 @@ export class RemoteDesktopService {
     changeVisibilityObservable: Observable<boolean> = new Observable();
     scaleObservable: Observable<ScreenScale> = new Observable();
 
-    dynamicResizeObservable: Observable<{ width: number; height: number }> = new Observable();
+    dynamicResizeObservable: Observable<{ width: number; height: number; scale?: number }> = new Observable();
 
     constructor(module: RemoteDesktopModule) {
         this.module = module;
@@ -327,7 +327,7 @@ export class RemoteDesktopService {
     }
 
     resizeDynamic(width: number, height: number, scale?: number) {
-        this.dynamicResizeObservable.publish({ width, height });
+        this.dynamicResizeObservable.publish({ width, height, scale });
         this.session?.resize(width, height, scale);
     }
 
