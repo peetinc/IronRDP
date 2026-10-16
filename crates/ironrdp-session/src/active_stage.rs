@@ -299,6 +299,35 @@ impl ActiveStage {
         Ok(region)
     }
 
+    /// Continues an EGFX pipeline that paused on an asynchronous H.264 decode, once the decoder
+    /// has the frame: applies it and the commands held behind it (see
+    /// [`GraphicsPipelineClient::resume`]).
+    ///
+    /// Returns the replies to send and the region to repaint, as [`Self::process`] does. Empty
+    /// while the decoder is still busy.
+    pub fn resume_graphics_pipeline(&mut self, image: &mut DecodedImage) -> SessionResult<Vec<ActiveStageOutput>> {
+        let Some((channel_id, replies)) = self.get_dvc_mut::<GraphicsPipelineClient>().map(|mut gfx| {
+            let channel_id = gfx.channel_id();
+            (channel_id, gfx.processor_mut().resume())
+        }) else {
+            return Ok(Vec::new());
+        };
+        let replies = replies.map_err(SessionError::pdu)?;
+
+        let mut outputs = Vec::new();
+        if !replies.is_empty() {
+            let messages = ironrdp_dvc::encode_dvc_messages(channel_id, replies, ironrdp_svc::ChannelFlags::empty())
+                .map_err(SessionError::encode)?;
+            let batch = DvcMessageBatch::try_new(channel_id, messages).map_err(SessionError::pdu)?;
+            outputs.push(ActiveStageOutput::ResponseFrame(self.encode_dvc_batch_over_tcp(batch)?));
+        }
+        if let Some(region) = self.drain_graphics_pipeline(image)? {
+            outputs.push(ActiveStageOutput::GraphicsUpdate(region));
+        }
+        self.widen_to_full_refresh(image, &mut outputs);
+        Ok(outputs)
+    }
+
     /// After a graphics output reset, widens the first graphics update to the whole image so
     /// the caller repaints everything the reset cleared.
     fn widen_to_full_refresh(&mut self, image: &DecodedImage, stage_outputs: &mut [ActiveStageOutput]) {
@@ -1587,6 +1616,171 @@ mod tests {
             pointer_software_rendering: false,
         }
         .build()
+    }
+
+    /// H.264 decoder that finishes asynchronously, like WebCodecs: the frame shows up once
+    /// the test puts it in `ready`.
+    struct DeferredDecoder {
+        ready: Arc<std::sync::Mutex<Option<ironrdp_egfx::decode::DecodedFrame>>>,
+    }
+
+    impl ironrdp_egfx::decode::H264Decoder for DeferredDecoder {
+        fn decode(&mut self, _data: &[u8]) -> ironrdp_egfx::decode::DecoderResult<ironrdp_egfx::decode::DecodedFrame> {
+            Err(ironrdp_egfx::decode::DecoderError::msg(
+                "synchronous decode is not supported",
+            ))
+        }
+
+        fn submit(
+            &mut self,
+            _data: &[u8],
+            _regions: &[ExclusiveRectangle],
+        ) -> ironrdp_egfx::decode::DecoderResult<ironrdp_egfx::decode::H264Decode> {
+            Ok(ironrdp_egfx::decode::H264Decode::Pending)
+        }
+
+        fn poll_frame(&mut self) -> Option<ironrdp_egfx::decode::DecoderResult<ironrdp_egfx::decode::DecodedFrame>> {
+            self.ready.lock().expect("ready lock").take().map(Ok)
+        }
+    }
+
+    #[test]
+    fn resuming_the_graphics_pipeline_acknowledges_and_paints_a_deferred_frame() {
+        use ironrdp_core::{Encode as _, WriteCursor};
+        use ironrdp_egfx::pdu::{
+            Avc420BitmapStream, Codec1Type, CreateSurfacePdu, EndFramePdu, GfxPdu, MapSurfaceToOutputPdu,
+            PixelFormat as GfxPixelFormat, QuantQuality, ResetGraphicsPdu, StartFramePdu, Timestamp, WireToSurface1Pdu,
+        };
+
+        const EGFX_CHANNEL: u32 = 3;
+        const SIZE: u16 = 32;
+
+        struct Handler;
+        impl ironrdp_egfx::client::GraphicsPipelineHandler for Handler {}
+
+        let ready = Arc::new(std::sync::Mutex::new(None));
+        let mut drdynvc = DrdynvcClient::new().with_dynamic_channel(GraphicsPipelineClient::new(
+            Box::new(Handler),
+            Some(Box::new(DeferredDecoder {
+                ready: Arc::clone(&ready),
+            })),
+        ));
+        process_drdynvc_pdu(
+            &mut drdynvc,
+            DrdynvcServerPdu::Create(CreateRequestPdu::new(
+                EGFX_CHANNEL,
+                ironrdp_egfx::CHANNEL_NAME.to_owned(),
+            )),
+        );
+
+        let region = ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: SIZE,
+            bottom: SIZE,
+        };
+        let stream = Avc420BitmapStream {
+            rectangles: vec![region.clone()],
+            quant_qual_vals: vec![QuantQuality {
+                quantization_parameter: 22,
+                progressive: false,
+                quality: 100,
+            }],
+            data: &[0],
+        };
+        let mut bitmap_data = vec![0; stream.size()];
+        stream.encode(&mut WriteCursor::new(&mut bitmap_data)).unwrap();
+
+        let mut egfx = Vec::new();
+        for pdu in [
+            GfxPdu::ResetGraphics(ResetGraphicsPdu {
+                width: u32::from(SIZE),
+                height: u32::from(SIZE),
+                monitors: vec![],
+            }),
+            GfxPdu::CreateSurface(CreateSurfacePdu {
+                surface_id: 1,
+                width: SIZE,
+                height: SIZE,
+                pixel_format: GfxPixelFormat::XRgb,
+            }),
+            GfxPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu {
+                surface_id: 1,
+                output_origin_x: 0,
+                output_origin_y: 0,
+            }),
+            GfxPdu::StartFrame(StartFramePdu {
+                timestamp: Timestamp {
+                    milliseconds: 0,
+                    seconds: 0,
+                    minutes: 0,
+                    hours: 0,
+                },
+                frame_id: 1,
+            }),
+            GfxPdu::WireToSurface1(WireToSurface1Pdu {
+                surface_id: 1,
+                codec_id: Codec1Type::Avc420,
+                pixel_format: GfxPixelFormat::XRgb,
+                destination_rectangle: region,
+                bitmap_data,
+            }),
+            GfxPdu::EndFrame(EndFramePdu { frame_id: 1 }),
+        ] {
+            egfx.extend(encode_vec(&pdu).unwrap());
+        }
+        process_drdynvc_pdu(
+            &mut drdynvc,
+            DrdynvcServerPdu::Data(DrdynvcDataPdu::Data(DataPdu::new(
+                EGFX_CHANNEL,
+                ironrdp_graphics::zgfx::wrap_uncompressed(&egfx),
+            ))),
+        );
+
+        let mut static_channels = StaticChannelSet::new();
+        assert!(static_channels.insert(drdynvc).is_none());
+        assert!(
+            static_channels
+                .attach_channel_id(TypeId::of::<DrdynvcClient>(), 1004)
+                .is_none()
+        );
+        let mut stage = ActiveStageBuilder {
+            static_channels,
+            user_channel_id: 1001,
+            io_channel_id: 1003,
+            message_channel_id: None,
+            share_id: 1,
+            compression_type: None,
+            enable_server_pointer: false,
+            pointer_software_rendering: false,
+        }
+        .build();
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, SIZE, SIZE);
+
+        // Still decoding: nothing to send or paint.
+        assert!(stage.resume_graphics_pipeline(&mut image).unwrap().is_empty());
+
+        let opaque_blue = [0, 0, 0xFF, 0xFF].repeat(usize::from(SIZE) * usize::from(SIZE));
+        *ready.lock().unwrap() = Some(ironrdp_egfx::decode::DecodedFrame::new(
+            opaque_blue,
+            u32::from(SIZE),
+            u32::from(SIZE),
+        ));
+        let outputs = stage.resume_graphics_pipeline(&mut image).unwrap();
+
+        assert!(
+            outputs
+                .iter()
+                .any(|output| matches!(output, ActiveStageOutput::ResponseFrame(frame) if !frame.is_empty())),
+            "the replayed EndFrame is acknowledged"
+        );
+        assert!(
+            outputs
+                .iter()
+                .any(|output| matches!(output, ActiveStageOutput::GraphicsUpdate(_))),
+            "the decoded frame is painted"
+        );
+        assert_eq!(&image.data()[..4], &[0, 0, 0xFF, 0xFF]);
     }
 
     fn process_drdynvc_pdu(client: &mut DrdynvcClient, pdu: DrdynvcServerPdu) {
