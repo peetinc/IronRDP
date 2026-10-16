@@ -45,6 +45,13 @@ declare class ClipboardItem_2 {
 /** What is sent when no `performanceFlags` extension is given: no window contents while dragging, no menu animations, font smoothing on. */
 export declare const DEFAULT_PERFORMANCE_FLAGS: number;
 
+/**
+ * Desktop scale factor sent at connect, in percent (100 to 500; MS-RDPBCGR 2.2.1.3.2),
+ * e.g. 200 for a desktop sized in device pixels on a 2x HiDPI screen. Later scale
+ * changes travel with each `resize` call. Out-of-range values are ignored.
+ */
+export declare function desktopScaleFactor(percent: number): Extension;
+
 declare class DesktopSize {
     free(): void;
     [Symbol.dispose](): void;
