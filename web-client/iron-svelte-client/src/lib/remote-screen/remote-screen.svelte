@@ -1,7 +1,7 @@
 <script lang="ts">
     import { onMount } from 'svelte';
     import { userInteractionService } from '../../services/session.service';
-    import { autoResizeEnabled, showLogin } from '$lib/login/login-store';
+    import { autoResizeEnabled, hidpiEnabled, hidpiRatio, showLogin } from '$lib/login/login-store';
     import type { UserInteraction } from '../../../static/iron-remote-desktop';
     import { Backend } from '../../../static/iron-remote-desktop-rdp';
     import type { PrintJobEntry } from '../../models/print-job';
@@ -48,8 +48,10 @@
             }
             const parentRect = screenEl.parentElement.getBoundingClientRect();
             const top = screenEl.getBoundingClientRect().top;
-            const width = Math.floor(parentRect.width);
-            const height = Math.floor(parentRect.bottom - top);
+            // HiDPI sizes the desktop in device pixels; the component shows it back in CSS pixels.
+            const ratio = $hidpiEnabled ? hidpiRatio() : 1;
+            const width = Math.floor(parentRect.width * ratio) & ~1;
+            const height = Math.floor((parentRect.bottom - top) * ratio);
             if (width > 0 && height > 0 && (lastRequested?.width !== width || lastRequested?.height !== height)) {
                 lastRequested = { width, height };
                 retriesLeft = 5;
@@ -62,7 +64,11 @@
         if (uiService == null || lastRequested == null) {
             return;
         }
-        uiService.resize(lastRequested.width, lastRequested.height);
+        uiService.resize(
+            lastRequested.width,
+            lastRequested.height,
+            $hidpiEnabled ? Math.round(hidpiRatio() * 100) : undefined,
+        );
         // The request is dropped client-side if the Display Control channel
         // is not ready yet (e.g. right after connect), and there is no
         // feedback either way. Verify the canvas picked up the new size and
@@ -91,6 +97,7 @@
     // matches the canvas instead of the size requested at connect time.
     $: if (!$showLogin) {
         scheduleResize();
+        uiService?.setScale(1); // Fit
     }
 
     function onUnicodeModeChange(e: MouseEvent) {

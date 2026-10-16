@@ -17,4 +17,14 @@ export const showLogin = writable(true);
 // Known loose end: the rig can fire several identical resize requests in the
 // first second (the dedupe in 2f336c09 does not always hold) — harmless to
 // EGFX, which proved out on a fixed surface, but worth tightening.
-export const autoResizeEnabled = writable(true);
+export const autoResizeEnabled = writable(import.meta.env.VITE_RIG_AUTO_RESIZE !== 'false');
+
+// HiDPI: size the desktop in device pixels and ask Windows to scale to match
+// (200% on a 2x screen), for sharp text. Latched at connect; remote-screen.svelte
+// reads it for every auto-resize so the desktop keeps the same density.
+export const hidpiEnabled = writable(false);
+
+/** Device pixels per CSS pixel for a HiDPI desktop, clamped to what RDP scaling covers. */
+export function hidpiRatio(): number {
+    return Math.min(3, Math.max(1, window.devicePixelRatio || 1));
+}

@@ -4,6 +4,9 @@
     import type { Session } from '../../models/session';
     import type { PrintJobEntry } from '../../models/print-job';
     import {
+        DEFAULT_PERFORMANCE_FLAGS,
+        PerformanceFlag,
+        desktopScaleFactor,
         displayControl,
         egfx,
         enableAudioPlayback,
@@ -14,9 +17,10 @@
         printerName,
         printerDriverName,
         printJobStreamCallbacks,
+        performanceFlags,
     } from '../../../static/iron-remote-desktop-rdp';
     import { toast } from '$lib/messages/message-store';
-    import { autoResizeEnabled, showLogin } from '$lib/login/login-store';
+    import { autoResizeEnabled, hidpiEnabled, hidpiRatio, showLogin } from '$lib/login/login-store';
     import { onMount } from 'svelte';
 
     // e2e test-rig hook: reports RDPDR printer job progress up to the
@@ -33,13 +37,18 @@
     let hostname: string = import.meta.env.VITE_RIG_HOSTNAME ?? '';
     let domain: string = import.meta.env.VITE_RIG_DOMAIN ?? '';
     let kdc_proxy_url = '';
-    let desktopSize = { width: 1280, height: 720 };
+    // Desktop resolution in pixels (with HiDPI on, device pixels: 3840x2160 at 200% is a 4K screen).
+    let desktopSize = {
+        width: Number(import.meta.env.VITE_RIG_WIDTH ?? 1280),
+        height: Number(import.meta.env.VITE_RIG_HEIGHT ?? 720),
+    };
     let pop_up = false;
     let enable_clipboard = true;
     // EGFX kill-switch for the T4 test matrix: unticking this must fall back to
     // the legacy bitmap path and still render.
     let enable_egfx = true;
     let enable_audio = true;
+    let visual_effects = false;
     let enable_nla = true;
 
     // e2e test-rig hook: RDPDR folder share. Populated via
@@ -202,7 +211,18 @@
             .withAuthToken('')
             .withDesktopSize(desktopSize)
             .withExtension(displayControl(true))
-            .withExtension(egfx(enable_egfx));
+            .withExtension(egfx(enable_egfx))
+            .withExtension(
+                performanceFlags(
+                    visual_effects
+                        ? PerformanceFlag.ENABLE_FONT_SMOOTHING | PerformanceFlag.ENABLE_DESKTOP_COMPOSITION
+                        : DEFAULT_PERFORMANCE_FLAGS,
+                ),
+            );
+
+        if ($hidpiEnabled) {
+            configBuilder.withExtension(desktopScaleFactor(Math.round(hidpiRatio() * 100)));
+        }
 
         if (enable_audio) {
             configBuilder.withExtension(enableAudioPlayback(true));
@@ -434,6 +454,24 @@
                                     style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
                                 />
                                 <label for="enable_audio">Play Remote Audio</label>
+                            </div>
+                            <div class="checkbox-wrapper">
+                                <input
+                                    id="hidpi"
+                                    type="checkbox"
+                                    bind:checked={$hidpiEnabled}
+                                    style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
+                                />
+                                <label for="hidpi">HiDPI (Retina)</label>
+                            </div>
+                            <div class="checkbox-wrapper">
+                                <input
+                                    id="visual_effects"
+                                    type="checkbox"
+                                    bind:checked={visual_effects}
+                                    style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
+                                />
+                                <label for="visual_effects">Visual Effects</label>
                             </div>
                             <div class="checkbox-wrapper">
                                 <input
