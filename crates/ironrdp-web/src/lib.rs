@@ -27,6 +27,7 @@ mod canvas;
 mod clipboard;
 mod drive;
 mod error;
+mod h264;
 mod image;
 mod input;
 mod network_client;

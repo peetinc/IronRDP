@@ -36,6 +36,7 @@ use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_core::WriteBuf;
 use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
+use ironrdp_egfx::decode::H264Decoder;
 use ironrdp_egfx::pdu::{CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitySet};
 use ironrdp_futures::{FramedWrite as _, single_sequence_step, single_sequence_step_read};
 use rgb::AsPixels as _;
@@ -130,6 +131,10 @@ struct SessionBuilderInner {
     /// channel and the legacy bitmap path continues untouched. The `egfx`
     /// extension can set this to `false` as a kill-switch.
     use_egfx: bool,
+    /// Decode H.264 (AVC420) with the browser's WebCodecs `VideoDecoder`, letting Windows
+    /// encode the desktop as H.264. Off by default; set by the `h264` extension. Ignored
+    /// when EGFX is off or the browser cannot decode H.264.
+    use_h264: bool,
     enable_audio_playback: bool,
     enable_credssp: bool,
     enable_standard_rdp_security: bool,
@@ -186,6 +191,7 @@ impl Default for SessionBuilderInner {
 
             use_display_control: false,
             use_egfx: true,
+            use_h264: false,
             enable_audio_playback: false,
             performance_flags: None,
             desktop_scale_factor: None,
@@ -311,6 +317,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |kdc_proxy_url: String| { self.0.borrow_mut().kdc_proxy_url = Some(kdc_proxy_url) };
             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
             |egfx: bool| { self.0.borrow_mut().use_egfx = egfx };
+            |h264: bool| { self.0.borrow_mut().use_h264 = h264 };
 
             |enable_audio_playback: bool| { self.0.borrow_mut().enable_audio_playback = enable_audio_playback };
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
@@ -601,6 +608,22 @@ impl SessionBuilder {
         };
         config.enable_audio_playback = rdpsnd_backend.is_some();
 
+        // Probed after the AudioContext so audio keeps the Connect click's user activation.
+        let h264_decoder: Option<Box<dyn H264Decoder>> = if use_egfx && self.0.borrow().use_h264 {
+            if crate::h264::probe_support().await {
+                let wake_tx = input_events_tx.clone();
+                Some(Box::new(crate::h264::WebCodecsH264Decoder::new(move || {
+                    // The session loop owns the receiver; a closed channel means the session ended.
+                    let _ = wake_tx.unbounded_send(RdpInputEvent::GraphicsDecoded);
+                })))
+            } else {
+                info!("WebCodecs H.264 unavailable; EGFX stays on the CPU codecs");
+                None
+            }
+        } else {
+            None
+        };
+
         let clipboard = remote_clipboard_changed_callback.clone().map(|callback| {
             WasmClipboard::new(
                 clipboard::WasmClipboardMessageProxy::new(input_events_tx.clone()),
@@ -724,6 +747,7 @@ impl SessionBuilder {
             computer_name: client_name.clone(),
             use_display_control,
             use_egfx,
+            h264_decoder,
             redirect,
             rdpsnd_backend,
         })
@@ -792,6 +816,8 @@ pub(crate) enum RdpInputEvent {
     /// session's [`DriveSlot`], so the loop only has to announce the device.
     DriveHotplug { device_id: u32, share_name: String },
     FastPath(FastPathInputEvents),
+    /// The WebCodecs H.264 decoder finished a frame the EGFX pipeline is waiting on.
+    GraphicsDecoded,
     Resize {
         width: u32,
         height: u32,
@@ -1129,6 +1155,10 @@ impl Session {
                         RdpInputEvent::FastPath(events) => {
                             active_stage.process_fastpath_input(&mut image, &events)
                                 .context("fast path input events processing")?
+                        }
+                        RdpInputEvent::GraphicsDecoded => {
+                            active_stage.resume_graphics_pipeline(&mut image)
+                                .context("resume graphics pipeline")?
                         }
                         RdpInputEvent::Resize { width, height, scale_factor, physical_size } => {
                             debug!(width, height, scale_factor, "Resize event received");
@@ -2217,6 +2247,8 @@ struct ConnectParams {
     /// ride the same DRDYNVC static channel, so either one alone is enough to
     /// warrant attaching it.
     use_egfx: bool,
+    /// WebCodecs H.264 decoder for EGFX; `None` keeps AVC unadvertised.
+    h264_decoder: Option<Box<dyn H264Decoder>>,
     /// Set when this connection follows a Server Redirection PDU.
     redirect: Option<RedirectConnector>,
     /// `Some` when the `enable_audio_playback` extension is on and Web Audio is available.
@@ -2272,6 +2304,7 @@ async fn connect(
         computer_name,
         use_display_control,
         use_egfx,
+        h264_decoder,
         redirect,
         rdpsnd_backend,
     }: ConnectParams,
@@ -2385,8 +2418,9 @@ async fn connect(
             // session actually renders via EGFX or silently fell back to legacy
             // bitmaps is otherwise invisible from the outside.
             //
-            // Passing no H.264 decoder makes `start()` drop every AVC capability
-            // set, leaving only codecs decodable in wasm.
+            // Without an H.264 decoder `start()` drops every AVC capability set,
+            // leaving only codecs decodable in wasm. With the WebCodecs one, V8_1's
+            // AVC420 goes out and Windows may encode the desktop as H.264.
             #[derive(Default)]
             struct WebEgfxHandler {
                 logged_first_frame: bool,
@@ -2400,8 +2434,8 @@ async fn connect(
                     // ironrdp-dvc is debug!, which Chrome hides.
                     //
                     // AVC420_ENABLED stays on V8_1 exactly as upstream has it;
-                    // `start()` then filters that set out because no H.264 decoder
-                    // is configured, leaving V8 as what actually goes on the wire.
+                    // `start()` filters that set out when no H.264 decoder is
+                    // configured, leaving V8 as what actually goes on the wire.
                     let caps = vec![
                         CapabilitySet::V8_1 {
                             flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
@@ -2443,9 +2477,11 @@ async fn connect(
 
             egfx_capture::install_if_requested();
 
-            info!("Attaching EGFX graphics pipeline (no H.264 decoder)");
-            drdynvc = drdynvc
-                .with_dynamic_channel(GraphicsPipelineClient::new(Box::new(WebEgfxHandler::default()), None));
+            info!(h264 = h264_decoder.is_some(), "Attaching EGFX graphics pipeline");
+            drdynvc = drdynvc.with_dynamic_channel(GraphicsPipelineClient::new(
+                Box::new(WebEgfxHandler::default()),
+                h264_decoder,
+            ));
         }
 
         connector.attach_static_channel(drdynvc);

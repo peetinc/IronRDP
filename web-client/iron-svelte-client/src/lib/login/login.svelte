@@ -9,6 +9,7 @@
         desktopScaleFactor,
         displayControl,
         egfx,
+        h264,
         enableAudioPlayback,
         enableCredssp,
         kdcProxyUrl,
@@ -47,6 +48,7 @@
     // EGFX kill-switch for the T4 test matrix: unticking this must fall back to
     // the legacy bitmap path and still render.
     let enable_egfx = true;
+    let enable_h264 = import.meta.env.VITE_RIG_H264 === 'true';
     let enable_audio = true;
     let visual_effects = false;
     let enable_nla = true;
@@ -212,6 +214,7 @@
             .withDesktopSize(desktopSize)
             .withExtension(displayControl(true))
             .withExtension(egfx(enable_egfx))
+            .withExtension(h264(enable_h264))
             .withExtension(
                 performanceFlags(
                     visual_effects
@@ -436,6 +439,15 @@
                                     style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
                                 />
                                 <label for="enable_egfx">Enable EGFX</label>
+                            </div>
+                            <div class="checkbox-wrapper">
+                                <input
+                                    id="enable_h264"
+                                    type="checkbox"
+                                    bind:checked={enable_h264}
+                                    style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
+                                />
+                                <label for="enable_h264">H.264 (WebCodecs)</label>
                             </div>
                             <div class="checkbox-wrapper">
                                 <input

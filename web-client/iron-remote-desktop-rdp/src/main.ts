@@ -60,6 +60,15 @@ export function egfx(enable: boolean): Extension {
 }
 
 /**
+ * Decode H.264 (AVC420) with the browser's WebCodecs `VideoDecoder`, in hardware where
+ * available, so Windows can encode the desktop as H.264. Off by default. Ignored when EGFX
+ * is off or the browser cannot decode H.264, in which case the CPU codecs are used as before.
+ */
+export function h264(enable: boolean): Extension {
+    return new Extension('h264', enable);
+}
+
+/**
  * Play remote session audio (RDPSND) in the browser through Web Audio. Off by default.
  * Browsers only start audio after a user gesture on the page; connecting from a click satisfies that.
  */
