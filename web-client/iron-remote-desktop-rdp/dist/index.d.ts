@@ -431,6 +431,13 @@ export declare interface FileWriteHandle {
     readonly bytesWritten: number;
 }
 
+/**
+ * Decode H.264 (AVC420) with the browser's WebCodecs `VideoDecoder`, in hardware where
+ * available, so Windows can encode the desktop as H.264. Off by default. Ignored when EGFX
+ * is off or the browser cannot decode H.264, in which case the CPU codecs are used as before.
+ */
+export declare function h264(enable: boolean): Extension;
+
 export declare function init(log_level: string): Promise<void>;
 
 export declare function initiateFileCopy(files: FileInfo[]): Extension;
