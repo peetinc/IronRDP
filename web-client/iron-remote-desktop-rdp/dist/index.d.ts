@@ -159,9 +159,26 @@ export declare interface DroppedFile {
 export declare function egfx(enable: boolean): Extension;
 
 /**
- * Play remote session audio (RDPSND) in the browser through Web Audio. Off by default.
- * Browsers only start audio after a user gesture on the page; connecting from a click satisfies that.
+ * Replays a capture through [`GraphicsPipelineClient`] and the session's renderer.
  */
+export declare class EgfxBench {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * A bench drawing to `canvas`. With `h264`, AVC frames decode through WebCodecs, as in a
+     * session with H.264 on; with `gpu`, EGFX renders through the WebGL2 backend.
+     */
+    static create(canvas: HTMLCanvasElement, h264: boolean, gpu: boolean): Promise<EgfxBench>;
+    /**
+     * Replays `capture` as fast as the pipeline allows and returns
+     * `{ messages, errors, frames, ms, fps, frameMsP50, frameMsP95, frameMsMax, decoderWaitMs,
+     * samples }`. With `sample_every` above zero, `samples` holds, after every
+     * `sample_every`th frame, every 8th pixel of every 8th row of the canvas as RGB.
+     */
+    run(capture: Uint8Array, sample_every: number): Promise<any>;
+}
+
 export declare function enableAudioPlayback(enable: boolean): Extension;
 
 export declare function enableCredssp(enable: boolean): Extension;
@@ -430,6 +447,16 @@ export declare interface FileWriteHandle {
     /** Number of bytes successfully written so far. */
     readonly bytesWritten: number;
 }
+
+/**
+ * Play remote session audio (RDPSND) in the browser through Web Audio. Off by default.
+ * Browsers only start audio after a user gesture on the page; connecting from a click satisfies that.
+ */
+/**
+ * Renders EGFX on the GPU (WebGL2): surfaces live in textures and H.264 frames are drawn
+ * without being read back. Off by default; falls back to the 2D canvas without WebGL2.
+ */
+export declare function gpuRendering(enable: boolean): Extension;
 
 /**
  * Decode H.264 (AVC420) with the browser's WebCodecs `VideoDecoder`, in hardware where
