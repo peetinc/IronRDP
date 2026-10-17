@@ -42,10 +42,9 @@ use alloc::collections::btree_map::Entry;
 use ironrdp_core::invalid_field_err;
 use ironrdp_pdu::codecs::rfx::EntropyAlgorithm;
 use ironrdp_pdu::codecs::rfx::progressive::{ComponentCodecQuant, ProgressiveCodecQuant, TILE_FLAG_DIFFERENCE};
-use ironrdp_pdu::geometry::{ExclusiveRectangle, InclusiveRectangle, Rectangle as _};
+use ironrdp_pdu::geometry::ExclusiveRectangle;
 
 use crate::dwt_extrapolate::BandInfo;
-use crate::rectangle_processing::Region;
 use crate::rlgr::RlgrError;
 use crate::srl::{self, SrlError};
 
@@ -1509,82 +1508,48 @@ impl ProgressiveDecoder {
                 }
             }
 
-            let mut clipping_region = Region::new();
-            for rectangle in &region.rects {
-                let left = rectangle.x.min(surface_width);
-                let top = rectangle.y.min(surface_height);
-                let right = rectangle.x.saturating_add(rectangle.width).min(surface_width);
-                let bottom = rectangle.y.saturating_add(rectangle.height).min(surface_height);
-                if left < right && top < bottom {
-                    charge_region_clipping_work(
-                        &mut region_clipping_work,
-                        clipping_region.rectangles.len().saturating_add(1),
-                    )?;
-                    clipping_region.union_rectangle(InclusiveRectangle {
-                        left,
-                        top,
-                        right: right - 1,
-                        bottom: bottom - 1,
-                    });
-                }
-            }
-
             // REGION rectangles may be covered by tiles sent in an earlier REGION
             // within the same frame, under this codec context or another, so clip them
             // against every tile updated in this frame rather than only the newly
             // decoded tiles.
             //
-            // Each normalized rectangle is first assigned to the tiles it overlaps, so clipping
-            // costs the rectangle-tile overlaps instead of every frame tile against every
-            // rectangle: at 4K, Windows sends about 1,000 rectangles in a frame that touched
-            // all 2,040 tiles.
-            let mut rectangles_by_tile: BTreeMap<(u16, u16), Region> = BTreeMap::new();
-            for rectangle in &clipping_region.rectangles {
-                for y_idx in rectangle.top / TILE_DIM..=rectangle.bottom / TILE_DIM {
-                    for x_idx in rectangle.left / TILE_DIM..=rectangle.right / TILE_DIM {
-                        charge_region_clipping_work(&mut region_clipping_work, 1)?;
-                        rectangles_by_tile
-                            .entry((x_idx, y_idx))
-                            .or_default()
-                            .rectangles
-                            .push(rectangle.clone());
+            // Each rectangle is clipped to the tiles it overlaps and marked in those tiles'
+            // coverage masks, so the work is the rows of the rectangle-tile overlaps. One
+            // screen-wide region costs the square of the rectangle count, and checking every
+            // frame tile against all of it costs tiles times rectangles: at 4K Windows sends
+            // REGIONs of over 1,000 rectangles in frames that touch all 2,040 tiles.
+            let mut coverage_by_tile: BTreeMap<(u16, u16), TileCoverage> = BTreeMap::new();
+            for rectangle in &region.rects {
+                let left = rectangle.x.min(surface_width);
+                let top = rectangle.y.min(surface_height);
+                let right = rectangle.x.saturating_add(rectangle.width).min(surface_width);
+                let bottom = rectangle.y.saturating_add(rectangle.height).min(surface_height);
+                if left >= right || top >= bottom {
+                    continue;
+                }
+                for y_idx in top / TILE_DIM..=(bottom - 1) / TILE_DIM {
+                    for x_idx in left / TILE_DIM..=(right - 1) / TILE_DIM {
+                        let tile_left = x_idx.saturating_mul(TILE_DIM);
+                        let tile_top = y_idx.saturating_mul(TILE_DIM);
+                        let (top, bottom) = (top.max(tile_top) - tile_top, (bottom - 1 - tile_top).min(TILE_DIM - 1));
+                        charge_region_clipping_work(&mut region_clipping_work, usize::from(bottom - top) + 1)?;
+                        coverage_by_tile.entry((x_idx, y_idx)).or_default().add(
+                            left.max(tile_left) - tile_left,
+                            top,
+                            (right - 1 - tile_left).min(TILE_DIM - 1),
+                            bottom,
+                        );
                     }
                 }
-            }
-            for tile_region in rectangles_by_tile.values_mut() {
-                tile_region.extents = InclusiveRectangle::union_all(&tile_region.rectangles);
             }
 
             for (&(x_idx, y_idx), frame_tile) in frame_tiles.iter() {
                 charge_region_clipping_work(&mut region_clipping_work, 1)?;
-                let Some(tile_region) = rectangles_by_tile.get(&(x_idx, y_idx)) else {
+                let Some(coverage) = coverage_by_tile.get(&(x_idx, y_idx)) else {
                     continue;
                 };
-                let left = x_idx.saturating_mul(TILE_DIM);
-                let top = y_idx.saturating_mul(TILE_DIM);
-                let right = left.saturating_add(TILE_DIM).min(surface_width);
-                let bottom = top.saturating_add(TILE_DIM).min(surface_height);
-                if left >= right || top >= bottom {
-                    continue;
-                }
-
-                charge_region_clipping_work(&mut region_clipping_work, tile_region.rectangles.len())?;
-                let update_rectangles = tile_region
-                    .intersect_rectangle(&InclusiveRectangle {
-                        left,
-                        top,
-                        right: right - 1,
-                        bottom: bottom - 1,
-                    })
-                    .rectangles
-                    .into_iter()
-                    .map(|rectangle| ExclusiveRectangle {
-                        left: rectangle.left,
-                        top: rectangle.top,
-                        right: rectangle.right + 1,
-                        bottom: rectangle.bottom + 1,
-                    })
-                    .collect::<Vec<_>>();
+                let update_rectangles =
+                    coverage.rectangles(x_idx.saturating_mul(TILE_DIM), y_idx.saturating_mul(TILE_DIM));
                 if update_rectangles.is_empty() {
                     continue;
                 }
@@ -1884,6 +1849,67 @@ impl Default for ProgressiveDecoder {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// The pixels of one tile a REGION's rectangles cover: bit `x` of row `y`.
+///
+/// A tile is 64 pixels wide, so a row is one `u64`. Marking rectangles is exact whatever
+/// their overlap, which `Region::union_rectangle` is not: it can drop a rectangle that
+/// starts on an existing band's last row, leaving that area unpainted.
+struct TileCoverage([u64; 64]);
+
+// One `u64` per row only holds a 64-pixel tile.
+const _: () = assert!(TILE_DIM == 64);
+
+impl Default for TileCoverage {
+    fn default() -> Self {
+        Self([0; 64])
+    }
+}
+
+impl TileCoverage {
+    /// Marks the tile-local inclusive rectangle `left..=right` by `top..=bottom`.
+    fn add(&mut self, left: u16, top: u16, right: u16, bottom: u16) {
+        let width = u32::from(right - left) + 1;
+        let row_mask = u64::MAX.checked_shr(64 - width).unwrap_or(u64::MAX) << left;
+        for row in &mut self.0[usize::from(top)..=usize::from(bottom)] {
+            *row |= row_mask;
+        }
+    }
+
+    /// The covered pixels as rectangles in surface coordinates, for a tile whose top-left is
+    /// (`tile_left`, `tile_top`). Consecutive identical rows share rectangles.
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        reason = "bit positions and rows are below 64"
+    )]
+    fn rectangles(&self, tile_left: u16, tile_top: u16) -> Vec<ExclusiveRectangle> {
+        let mut rectangles = Vec::new();
+        let mut y = 0;
+        while y < self.0.len() {
+            let row = self.0[y];
+            let mut end = y + 1;
+            while end < self.0.len() && self.0[end] == row {
+                end += 1;
+            }
+            let mut bits = row;
+            while bits != 0 {
+                let start = bits.trailing_zeros();
+                let run = (!(bits >> start)).trailing_zeros();
+                let (start16, run16) = (start as u16, run as u16);
+                rectangles.push(ExclusiveRectangle {
+                    left: tile_left + start16,
+                    top: tile_top + y as u16,
+                    right: tile_left + start16 + run16,
+                    bottom: tile_top + end as u16,
+                });
+                bits &= u64::MAX.checked_shl(start + run).unwrap_or(0);
+            }
+            y = end;
+        }
+        rectangles
+    }
+}
 
 /// Records a tile's coefficients as the reference for its next difference pass, overwriting the
 /// previous reference in place: no allocation, and no 24 KiB value moved through the map.
@@ -2440,17 +2466,17 @@ mod tests {
 
     #[test]
     fn decoder_bounds_region_clipping_work() {
-        // Each disjoint rectangle grows the normalized Region by one entry.
-        // 1,500 such inserts exceed the aggregate scan budget long before the
-        // wire-format u16 rectangle count could drive quadratic work unchecked.
-        const RECT_COUNT: u16 = 1_500;
-        let fragmented = (0..RECT_COUNT).map(|x| rect(x.saturating_mul(3), 0, 2, 2)).collect();
+        // Every tile a rectangle overlaps is charged, so rectangles that each span a large
+        // surface exhaust the budget instead of multiplying work per rectangle.
+        let spanning = vec![rect(0, 0, 8192, 8192); 1_000];
         let mut decoder = ProgressiveDecoder::new();
-        let error = match decoder.decode_bitmap(1, 1, 8192, 64, &stream_with_rects(fragmented)) {
+        let error = match decoder.decode_bitmap(1, 1, 8192, 8192, &stream_with_rects(spanning)) {
             Err(error) => error,
-            Ok(_) => panic!("fragmented clipping region must exhaust the work budget"),
+            Ok(_) => panic!("surface-spanning rectangles must exhaust the work budget"),
         };
         assert!(error.to_string().contains("clipping work limit exceeded"));
+
+        const RECT_COUNT: u16 = 1_500;
 
         // The limit tracks actual normalized-region work rather than rejecting
         // the same numRects when all rectangles collapse to one simple region.
@@ -2499,6 +2525,58 @@ mod tests {
         let result = decoder.decode_bitmap(1, 1, WIDTH, HEIGHT, &stream_with_rects(rects));
 
         assert!(result.is_ok(), "busy 4K frame must clip: {:?}", result.err());
+    }
+
+    /// Rectangles that share rows with an earlier rectangle's band must all be covered:
+    /// `Region::union_rectangle` dropped (2, 0), (3, 1) and (2, 2) from this set.
+    #[test]
+    fn tile_coverage_keeps_every_rectangle() {
+        let mut coverage = TileCoverage::default();
+        for (x, y) in [(0u16, 0u16), (2, 0), (1, 1), (3, 1), (0, 2), (2, 2)] {
+            coverage.add(x, y, x, y);
+        }
+
+        let mut covered: Vec<(u16, u16)> = coverage
+            .rectangles(128, 64)
+            .iter()
+            .flat_map(|r| (r.top..r.bottom).flat_map(move |y| (r.left..r.right).map(move |x| (x - 128, y - 64))))
+            .collect();
+        covered.sort_unstable();
+
+        assert_eq!(covered, vec![(0, 0), (0, 2), (1, 1), (2, 0), (2, 2), (3, 1)]);
+    }
+
+    #[test]
+    fn tile_coverage_merges_identical_rows_and_spans_the_full_tile() {
+        let mut coverage = TileCoverage::default();
+        coverage.add(0, 0, 63, 63);
+        coverage.add(10, 10, 20, 20); // inside the first
+
+        let rectangles = coverage.rectangles(0, 0);
+
+        assert_eq!(
+            rectangles,
+            vec![ExclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: 64,
+                bottom: 64
+            }]
+        );
+    }
+
+    /// Windows also sent about 1,300 small rectangles in one REGION at session start. Merging
+    /// them all into one screen-wide region costs the square of their count; each tile only
+    /// needs its own few.
+    #[test]
+    fn many_scattered_rectangles_clip_within_the_work_budget() {
+        let rects = (0..2_000u16)
+            .map(|index| rect((index % 1_200) * 3, (index / 1_200) * 64, 2, 2))
+            .collect();
+
+        let result = ProgressiveDecoder::new().decode_bitmap(1, 1, 3840, 2160, &stream_with_rects(rects));
+
+        assert!(result.is_ok(), "scattered rectangles must clip: {:?}", result.err());
     }
 
     /// A REGION repaints the tiles its rectangles cover that were updated earlier in the
