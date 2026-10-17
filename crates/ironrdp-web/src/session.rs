@@ -612,10 +612,13 @@ impl SessionBuilder {
         let h264_decoder: Option<Box<dyn H264Decoder>> = if use_egfx && self.0.borrow().use_h264 {
             if crate::h264::probe_support().await {
                 let wake_tx = input_events_tx.clone();
-                Some(Box::new(crate::h264::WebCodecsH264Decoder::new(move || {
-                    // The session loop owns the receiver; a closed channel means the session ended.
-                    let _ = wake_tx.unbounded_send(RdpInputEvent::GraphicsDecoded);
-                })))
+                Some(Box::new(crate::h264::WebCodecsH264Decoder::new(
+                    move || {
+                        // The session loop owns the receiver; a closed channel means the session ended.
+                        let _ = wake_tx.unbounded_send(RdpInputEvent::GraphicsDecoded);
+                    },
+                    crate::h264::FrameOutput::Readback,
+                )))
             } else {
                 info!("WebCodecs H.264 unavailable; EGFX stays on the CPU codecs");
                 None

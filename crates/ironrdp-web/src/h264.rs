@@ -130,6 +130,15 @@ thread_local! {
     static NEXT_SLOT: Cell<u32> = const { Cell::new(0) };
 }
 
+/// Where a decoded picture goes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FrameOutput {
+    /// Read back to the CPU as RGBA, for the CPU compositor.
+    Readback,
+    /// Kept on the GPU for the WebGL2 backend, as an external [`DecodedFrame`].
+    Gpu,
+}
+
 /// [`H264Decoder`] backed by a WebCodecs `VideoDecoder`; a handle to its thread-local slot.
 pub(crate) struct WebCodecsH264Decoder {
     slot: u32,
@@ -137,13 +146,13 @@ pub(crate) struct WebCodecsH264Decoder {
 
 impl WebCodecsH264Decoder {
     /// `wake` is called whenever a submitted frame is ready for `poll_frame`.
-    pub(crate) fn new(wake: impl Fn() + 'static) -> Self {
+    pub(crate) fn new(wake: impl Fn() + 'static, output: FrameOutput) -> Self {
         let slot = NEXT_SLOT.with(|next| {
             let slot = next.get();
             next.set(slot.wrapping_add(1));
             slot
         });
-        SLOTS.with(|slots| slots.borrow_mut().insert(slot, Slot::new(Rc::new(wake))));
+        SLOTS.with(|slots| slots.borrow_mut().insert(slot, Slot::new(Rc::new(wake), output)));
         Self { slot }
     }
 
@@ -205,12 +214,12 @@ struct Slot {
 }
 
 /// State the WebCodecs callbacks share with the slot.
-#[derive(Default)]
 struct Shared {
     /// `regionRects` of the frame in flight: the only pixels read back.
     regions: Vec<ExclusiveRectangle>,
     finished: Option<DecoderResult<DecodedFrame>>,
     readback: Option<Readback>,
+    output: FrameOutput,
     submitted_at: f64,
     /// Per decoded chunk, oldest first: whether its picture is shown (`false` for AVC444
     /// chroma views). WebCodecs outputs pictures in decode order.
@@ -234,10 +243,17 @@ struct Readback {
 }
 
 impl Slot {
-    fn new(wake: Rc<dyn Fn()>) -> Self {
+    fn new(wake: Rc<dyn Fn()>, output: FrameOutput) -> Self {
         Self {
             decoder: None,
-            shared: Rc::new(RefCell::new(Shared::default())),
+            shared: Rc::new(RefCell::new(Shared {
+                regions: Vec::new(),
+                finished: None,
+                readback: None,
+                output,
+                submitted_at: 0.0,
+                shown: VecDeque::new(),
+            })),
             wake,
             timestamp: 0.0,
         }
@@ -341,6 +357,14 @@ impl ActiveDecoder {
                     let latency = js_sys::Date::now() - shared.submitted_at;
                     if SLOW_DECODE_MS < latency {
                         warn!(latency, "Slow H.264 decode");
+                    }
+                    if shared.output == FrameOutput::Gpu {
+                        let (width, height) = (frame.display_width(), frame.display_height());
+                        let handle = crate::gpu::hold_frame(frame);
+                        shared.finished = Some(Ok(DecodedFrame::external(handle, width, height)));
+                        drop(shared);
+                        wake();
+                        return;
                     }
                     let result = shared.read_back(&frame);
                     shared.finished = Some(result);
@@ -545,16 +569,16 @@ extern "C" {
     #[wasm_bindgen(constructor, catch)]
     fn new(init: &Object) -> Result<EncodedVideoChunk, JsValue>;
 
-    type VideoFrame;
+    pub(crate) type VideoFrame;
 
     #[wasm_bindgen(method, getter, js_name = displayWidth)]
-    fn display_width(this: &VideoFrame) -> u32;
+    pub(crate) fn display_width(this: &VideoFrame) -> u32;
 
     #[wasm_bindgen(method, getter, js_name = displayHeight)]
-    fn display_height(this: &VideoFrame) -> u32;
+    pub(crate) fn display_height(this: &VideoFrame) -> u32;
 
     #[wasm_bindgen(method)]
-    fn close(this: &VideoFrame);
+    pub(crate) fn close(this: &VideoFrame);
 
     type OffscreenCanvas;
 

@@ -28,6 +28,7 @@ mod canvas;
 mod clipboard;
 mod drive;
 mod error;
+mod gpu;
 mod h264;
 mod image;
 mod input;

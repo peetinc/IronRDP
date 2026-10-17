@@ -79,9 +79,12 @@ impl EgfxBench {
         };
         let (wake_tx, mut wake_rx) = futures_channel::mpsc::unbounded::<()>();
         let decoder: Option<Box<dyn ironrdp_egfx::decode::H264Decoder>> = if self.h264 {
-            Some(Box::new(crate::h264::WebCodecsH264Decoder::new(move || {
-                let _ = wake_tx.unbounded_send(());
-            })))
+            Some(Box::new(crate::h264::WebCodecsH264Decoder::new(
+                move || {
+                    let _ = wake_tx.unbounded_send(());
+                },
+                crate::h264::FrameOutput::Readback,
+            )))
         } else {
             None
         };

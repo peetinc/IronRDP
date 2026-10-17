@@ -81,6 +81,10 @@ web-sys = { version = "0.3", features = [
     "ImageData",
     "Navigator",
     "Performance",
+    "WebGl2RenderingContext",
+    "WebGlContextAttributes",
+    "WebGlFramebuffer",
+    "WebGlTexture",
     "Window",
     "WritableStream",
 ] }
