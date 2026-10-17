@@ -42,6 +42,11 @@ pub(crate) fn clip(rect: &ExclusiveRectangle, width: u16, height: u16) -> Option
     (clipped.left < clipped.right && clipped.top < clipped.bottom).then_some(clipped)
 }
 
+/// Whether a `width` by `height` surface is larger than the GPU's `max_texture_size`.
+pub(crate) fn exceeds_texture_limit(width: u16, height: u16, max_texture_size: u32) -> bool {
+    max_texture_size < u32::from(width.max(height))
+}
+
 /// Clips a copy of `source` to `point` on a surface of `destination_size`, shrinking the
 /// source by what falls off. Returns `(source, destination)`, of equal size.
 pub(crate) fn clip_copy(
@@ -104,6 +109,13 @@ mod tests {
         assert_eq!(clip(&rect(90, 10, 120, 20), 100, 100), Some(rect(90, 10, 100, 20)));
         assert_eq!(clip(&rect(100, 10, 120, 20), 100, 100), None);
         assert_eq!(clip(&rect(5, 5, 5, 9), 100, 100), None);
+    }
+
+    #[test]
+    fn exceeds_texture_limit_rejects_larger_surfaces() {
+        assert!(exceeds_texture_limit(8193, 100, 8192));
+        assert!(!exceeds_texture_limit(3840, 2160, 8192));
+        assert!(exceeds_texture_limit(100, 100, 0), "an unknown limit admits nothing");
     }
 
     #[test]

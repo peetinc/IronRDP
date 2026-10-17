@@ -47,7 +47,7 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{FileSystemDirectoryHandle, HtmlCanvasElement};
 
 use crate::audio::WasmRdpsndBackend;
-use crate::canvas::Canvas;
+use crate::canvas::{Canvas, Presenter};
 use crate::clipboard;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
 use crate::drive::backend::{DriveBackendMessage, WasmDriveBackend, wasm_drive_pair};
@@ -135,6 +135,10 @@ struct SessionBuilderInner {
     /// encode the desktop as H.264. Off by default; set by the `h264` extension. Ignored
     /// when EGFX is off or the browser cannot decode H.264.
     use_h264: bool,
+    /// Render EGFX on the GPU (WebGL2), so H.264 frames are never read back to the CPU. Off
+    /// by default; set by the `gpu_rendering` extension. Falls back to the 2D canvas when
+    /// WebGL2 is unavailable.
+    use_gpu_rendering: bool,
     enable_audio_playback: bool,
     enable_credssp: bool,
     enable_standard_rdp_security: bool,
@@ -192,6 +196,7 @@ impl Default for SessionBuilderInner {
             use_display_control: false,
             use_egfx: true,
             use_h264: false,
+            use_gpu_rendering: false,
             enable_audio_playback: false,
             performance_flags: None,
             desktop_scale_factor: None,
@@ -318,6 +323,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
             |egfx: bool| { self.0.borrow_mut().use_egfx = egfx };
             |h264: bool| { self.0.borrow_mut().use_h264 = h264 };
+            |gpu_rendering: bool| { self.0.borrow_mut().use_gpu_rendering = gpu_rendering };
 
             |enable_audio_playback: bool| { self.0.borrow_mut().enable_audio_playback = enable_audio_playback };
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
@@ -608,6 +614,27 @@ impl SessionBuilder {
         };
         config.enable_audio_playback = rdpsnd_backend.is_some();
 
+        // Created before anything draws: the canvas carries one context type for good.
+        let gpu_backend = if use_egfx && self.0.borrow().use_gpu_rendering {
+            match crate::gpu::GlBackend::new(&render_canvas) {
+                Ok(gl) => {
+                    info!("Rendering EGFX on the GPU (WebGL2)");
+                    Some(gl)
+                }
+                Err(error) => {
+                    warn!(%error, "GPU rendering unavailable; drawing on the CPU");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let frame_output = if gpu_backend.is_some() {
+            crate::h264::FrameOutput::Gpu
+        } else {
+            crate::h264::FrameOutput::Readback
+        };
+
         // Probed after the AudioContext so audio keeps the Connect click's user activation.
         let h264_decoder: Option<Box<dyn H264Decoder>> = if use_egfx && self.0.borrow().use_h264 {
             if crate::h264::probe_support().await {
@@ -617,7 +644,7 @@ impl SessionBuilder {
                         // The session loop owns the receiver; a closed channel means the session ended.
                         let _ = wake_tx.unbounded_send(RdpInputEvent::GraphicsDecoded);
                     },
-                    crate::h264::FrameOutput::Readback,
+                    frame_output,
                 )))
             } else {
                 info!("WebCodecs H.264 unavailable; EGFX stays on the CPU codecs");
@@ -751,6 +778,7 @@ impl SessionBuilder {
             use_display_control,
             use_egfx,
             h264_decoder,
+            gpu_backend: gpu_backend.clone(),
             redirect,
             rdpsnd_backend,
         })
@@ -772,6 +800,7 @@ impl SessionBuilder {
             input_events_tx,
 
             render_canvas,
+            gpu: gpu_backend,
             set_cursor_style_callback,
             set_cursor_style_callback_context,
 
@@ -915,6 +944,8 @@ pub(crate) struct Session {
     input_events_tx: mpsc::UnboundedSender<RdpInputEvent>,
 
     render_canvas: HtmlCanvasElement,
+    /// The GPU backend EGFX draws with, shared with the presenter; `None` draws on the CPU.
+    gpu: Option<crate::gpu::GlBackend>,
     set_cursor_style_callback: js_sys::Function,
     set_cursor_style_callback_context: JsValue,
 
@@ -971,8 +1002,16 @@ impl Session {
         let desktop_height =
             NonZeroU32::new(u32::from(connection_result.desktop_size.height)).context("desktop height is zero")?;
 
-        let mut gui =
-            Canvas::new(self.render_canvas.clone(), desktop_width, desktop_height).context("canvas initialization")?;
+        let mut gui = match &self.gpu {
+            Some(gl) => {
+                gl.resize_output(desktop_width.get(), desktop_height.get());
+                Presenter::Gl(gl.clone())
+            }
+            None => Presenter::Canvas2d(
+                Canvas::new(self.render_canvas.clone(), desktop_width, desktop_height)
+                    .context("canvas initialization")?,
+            ),
+        };
 
         debug!("Canvas initialized");
 
@@ -1287,6 +1326,12 @@ impl Session {
                     }
                 }
             };
+
+            // A lost GPU context takes every surface and cache texture with it, while the
+            // server still trusts its cache: the session cannot continue, and reconnects.
+            if let Some(reason) = gui.failure() {
+                return Err(anyhow::anyhow!(reason).into());
+            }
 
             for out in outputs {
                 match out {
@@ -2252,6 +2297,8 @@ struct ConnectParams {
     use_egfx: bool,
     /// WebCodecs H.264 decoder for EGFX; `None` keeps AVC unadvertised.
     h264_decoder: Option<Box<dyn H264Decoder>>,
+    /// GPU surface backend for EGFX; `None` keeps the CPU compositor.
+    gpu_backend: Option<crate::gpu::GlBackend>,
     /// Set when this connection follows a Server Redirection PDU.
     redirect: Option<RedirectConnector>,
     /// `Some` when the `enable_audio_playback` extension is on and Web Audio is available.
@@ -2308,6 +2355,7 @@ async fn connect(
         use_display_control,
         use_egfx,
         h264_decoder,
+        gpu_backend,
         redirect,
         rdpsnd_backend,
     }: ConnectParams,
@@ -2498,7 +2546,12 @@ async fn connect(
                 h264: h264_decoder.is_some(),
                 logged_first_frame: false,
             };
-            drdynvc = drdynvc.with_dynamic_channel(GraphicsPipelineClient::new(Box::new(handler), h264_decoder));
+            let graphics = GraphicsPipelineClient::new(Box::new(handler), h264_decoder);
+            let graphics = match gpu_backend {
+                Some(gl) => graphics.with_surface_backend(Box::new(gl)),
+                None => graphics,
+            };
+            drdynvc = drdynvc.with_dynamic_channel(graphics);
         }
 
         connector.attach_static_channel(drdynvc);

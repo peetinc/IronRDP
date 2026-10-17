@@ -10,6 +10,7 @@
         displayControl,
         egfx,
         h264,
+        gpuRendering,
         enableAudioPlayback,
         enableCredssp,
         kdcProxyUrl,
@@ -49,6 +50,7 @@
     // the legacy bitmap path and still render.
     let enable_egfx = true;
     let enable_h264 = import.meta.env.VITE_RIG_H264 === 'true';
+    let enable_gpu = import.meta.env.VITE_RIG_GPU === 'true';
     let enable_audio = true;
     let visual_effects = import.meta.env.VITE_RIG_VISUAL_EFFECTS === 'true';
     let enable_nla = true;
@@ -215,6 +217,7 @@
             .withExtension(displayControl(true))
             .withExtension(egfx(enable_egfx))
             .withExtension(h264(enable_h264))
+            .withExtension(gpuRendering(enable_gpu))
             .withExtension(
                 performanceFlags(
                     visual_effects
@@ -449,6 +452,15 @@
                                     style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
                                 />
                                 <label for="enable_h264">H.264 (WebCodecs)</label>
+                            </div>
+                            <div class="checkbox-wrapper">
+                                <input
+                                    id="enable_gpu"
+                                    type="checkbox"
+                                    bind:checked={enable_gpu}
+                                    style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
+                                />
+                                <label for="enable_gpu">GPU rendering (WebGL2)</label>
                             </div>
                             <div class="checkbox-wrapper">
                                 <input

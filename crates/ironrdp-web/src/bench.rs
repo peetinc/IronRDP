@@ -8,11 +8,11 @@ use futures_util::StreamExt as _;
 use ironrdp::dvc::DvcProcessor as _;
 use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
-use js_sys::{Object, Reflect, Uint8Array};
+use js_sys::{Array, Object, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
-use crate::canvas::Canvas;
+use crate::canvas::{Canvas, Presenter};
 
 /// Splits a capture into its messages: each is a `u32` little-endian length, then the message.
 fn split_capture(mut capture: &[u8]) -> Result<Vec<&[u8]>, &'static str> {
@@ -52,24 +52,32 @@ impl GraphicsPipelineHandler for BenchHandler {
 /// Replays a capture through [`GraphicsPipelineClient`] and the session's renderer.
 #[wasm_bindgen]
 pub struct EgfxBench {
-    canvas: Canvas,
+    presenter: Presenter,
     h264: bool,
 }
 
 #[wasm_bindgen]
 impl EgfxBench {
     /// A bench drawing to `canvas`. With `h264`, AVC frames decode through WebCodecs, as in a
-    /// session with H.264 on.
+    /// session with H.264 on; with `gpu`, EGFX renders through the WebGL2 backend.
     #[wasm_bindgen(js_name = create)]
-    pub async fn create(canvas: HtmlCanvasElement, h264: bool) -> Result<EgfxBench, JsValue> {
+    pub async fn create(canvas: HtmlCanvasElement, h264: bool, gpu: bool) -> Result<EgfxBench, JsValue> {
         let h264 = h264 && crate::h264::probe_support().await;
-        let canvas = Canvas::new(canvas, NonZeroU32::MIN, NonZeroU32::MIN).map_err(|error| error.to_string())?;
-        Ok(Self { canvas, h264 })
+        let presenter = if gpu {
+            Presenter::Gl(crate::gpu::GlBackend::new(&canvas).map_err(|error| error.to_string())?)
+        } else {
+            Presenter::Canvas2d(
+                Canvas::new(canvas, NonZeroU32::MIN, NonZeroU32::MIN).map_err(|error| error.to_string())?,
+            )
+        };
+        Ok(Self { presenter, h264 })
     }
 
     /// Replays `capture` as fast as the pipeline allows and returns
-    /// `{ messages, errors, frames, ms, fps, frameMsP50, frameMsP95, frameMsMax, decoderWaitMs }`.
-    pub async fn run(&mut self, capture: Uint8Array) -> Result<JsValue, JsValue> {
+    /// `{ messages, errors, frames, ms, fps, frameMsP50, frameMsP95, frameMsMax, decoderWaitMs,
+    /// samples }`. With `sample_every` above zero, `samples` holds, after every
+    /// `sample_every`th frame, every 8th pixel of every 8th row of the canvas as RGB.
+    pub async fn run(&mut self, capture: Uint8Array, sample_every: u32) -> Result<JsValue, JsValue> {
         let capture = capture.to_vec();
         let messages = split_capture(&capture).map_err(JsValue::from_str)?;
 
@@ -83,13 +91,22 @@ impl EgfxBench {
                 move || {
                     let _ = wake_tx.unbounded_send(());
                 },
-                crate::h264::FrameOutput::Readback,
+                if matches!(self.presenter, Presenter::Gl(_)) {
+                    crate::h264::FrameOutput::Gpu
+                } else {
+                    crate::h264::FrameOutput::Readback
+                },
             )))
         } else {
             None
         };
         let mut client = GraphicsPipelineClient::new(Box::new(handler), decoder);
+        if let Presenter::Gl(gl) = &self.presenter {
+            client = client.with_surface_backend(Box::new(gl.clone()));
+        }
         client.start(0).map_err(|error| error.to_string())?;
+        let samples = Array::new();
+        let mut sampled_frames = 0;
 
         let (mut errors, mut decoder_wait_ms) = (0u32, 0.0);
         let started = now();
@@ -111,7 +128,7 @@ impl EgfxBench {
                 && let (Some(width), Some(height)) =
                     (NonZeroU32::new(u32::from(width)), NonZeroU32::new(u32::from(height)))
             {
-                self.canvas.resize(width, height);
+                self.presenter.resize(width, height);
             }
             for mut update in client.drain_output() {
                 let region = InclusiveRectangle {
@@ -120,9 +137,23 @@ impl EgfxBench {
                     right: update.region.right.saturating_sub(1),
                     bottom: update.region.bottom.saturating_sub(1),
                 };
-                self.canvas
+                self.presenter
                     .draw(&mut update.data, region)
                     .map_err(|error| error.to_string())?;
+            }
+            if 0 < sample_every {
+                let frames = frame_ends.lock().map(|ends| ends.len()).unwrap_or(0);
+                if sampled_frames + usize::try_from(sample_every).unwrap_or(usize::MAX) <= frames {
+                    sampled_frames = frames;
+                    let sample = match &self.presenter {
+                        Presenter::Gl(gl) => gl.sample_output(8),
+                        Presenter::Canvas2d(canvas) => canvas.sample(8),
+                    };
+                    samples.push(&Uint8Array::from(sample.as_slice()));
+                }
+            }
+            if let Some(reason) = self.presenter.failure() {
+                return Err(JsValue::from_str(reason));
             }
         }
         let ms = now() - started;
@@ -163,6 +194,7 @@ impl EgfxBench {
         for (key, value) in fields {
             Reflect::set(&result, &JsValue::from_str(key), &JsValue::from_f64(value))?;
         }
+        Reflect::set(&result, &JsValue::from_str("samples"), &samples)?;
         Ok(result.into())
     }
 }

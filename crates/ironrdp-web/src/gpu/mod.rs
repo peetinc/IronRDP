@@ -13,9 +13,10 @@ mod geometry;
 use core::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::Context as _;
-use ironrdp::pdu::geometry::ExclusiveRectangle;
+use ironrdp::pdu::geometry::{ExclusiveRectangle, InclusiveRectangle, Rectangle as _};
 use ironrdp_egfx::compositor::{OutputUpdate, SurfaceBackend};
 use ironrdp_egfx::decode::DecodedFrame;
 use ironrdp_egfx::pdu::{Color, Point};
@@ -24,7 +25,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::{HtmlCanvasElement, WebGl2RenderingContext as Gl, WebGlFramebuffer, WebGlTexture};
 
 pub(crate) use self::frames::insert as hold_frame;
-use self::geometry::{BlitRect, clip, clip_copy, present_blit};
+use self::geometry::{BlitRect, clip, clip_copy, exceeds_texture_limit, present_blit};
 use crate::h264::VideoFrame;
 
 /// Upper bound on the texture bytes held across surfaces and cache slots, as the CPU
@@ -57,8 +58,30 @@ thread_local! {
 }
 
 /// [`SurfaceBackend`] drawing with WebGL2 into a canvas; a handle to its thread-local slot.
+///
+/// Clones share the slot, so the EGFX client and the session's presenter draw to one
+/// context; the slot is freed with the last clone.
+#[derive(Clone)]
 pub(crate) struct GlBackend {
-    slot: u32,
+    slot: Arc<SlotGuard>,
+}
+
+/// Frees a GL slot when the last [`GlBackend`] handle drops.
+struct SlotGuard(u32);
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        let state = SLOTS.with(|slots| slots.borrow_mut().remove(&self.0));
+        if let Some(mut state) = state {
+            state.clear_surfaces();
+            for (_, target) in core::mem::take(&mut state.cache) {
+                target.delete(&state.gl);
+            }
+            if let Some(output) = state.output_target.take() {
+                output.delete(&state.gl);
+            }
+        }
+    }
 }
 
 /// A texture with a framebuffer to draw into or read from it.
@@ -86,13 +109,19 @@ struct GlState {
     /// Staging for copies within one surface, which WebGL cannot blit directly.
     scratch: Option<Target>,
     allocated: usize,
+    max_texture_size: u32,
+    /// Why the backend stopped drawing, once it has; the session ends with this.
+    failure: Rc<Cell<Option<&'static str>>>,
+    /// Pixels the session draws outside EGFX (legacy bitmap updates), at canvas size.
+    output_target: Option<Target>,
     _on_lost: Closure<dyn FnMut()>,
 }
 
 impl GlBackend {
-    /// A backend drawing into `canvas`. `lost` is set if the browser drops the GPU context,
-    /// after which nothing is drawn and the session must end.
-    pub(crate) fn new(canvas: &HtmlCanvasElement, lost: Rc<Cell<bool>>) -> anyhow::Result<Self> {
+    /// A backend drawing into `canvas`. Once [`failure`](Self::failure) reports a reason
+    /// (the browser dropped the GPU context, or a surface outgrew it), nothing more is drawn
+    /// and the session must end.
+    pub(crate) fn new(canvas: &HtmlCanvasElement) -> anyhow::Result<Self> {
         let attributes = web_sys::WebGlContextAttributes::new();
         attributes.set_alpha(false);
         attributes.set_antialias(false);
@@ -108,10 +137,28 @@ impl GlBackend {
             .map_err(|_| anyhow::anyhow!("webgl2 context is not a WebGL2RenderingContext"))?;
         gl.pixel_storei(Gl::UNPACK_ALIGNMENT, 1);
 
-        let on_lost = Closure::<dyn FnMut()>::new(move || {
-            warn!("GPU context lost");
-            lost.set(true);
-        });
+        let failure = Rc::new(Cell::new(None));
+        let on_lost = {
+            let failure = Rc::clone(&failure);
+            Closure::<dyn FnMut()>::new(move || {
+                warn!("GPU context lost");
+                failure.set(Some("GPU context lost"));
+            })
+        };
+        let max_texture_size = gl
+            .get_parameter(Gl::MAX_TEXTURE_SIZE)
+            .ok()
+            .and_then(|value| value.as_f64())
+            .map_or(0, |value| {
+                #[expect(
+                    clippy::as_conversions,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "a texture size well below u32::MAX"
+                )]
+                let size = value as u32;
+                size
+            });
         canvas
             .add_event_listener_with_callback("webglcontextlost", on_lost.as_ref().unchecked_ref())
             .map_err(|error| anyhow::anyhow!("listen for webglcontextlost: {error:?}"))?;
@@ -125,6 +172,9 @@ impl GlBackend {
             video: None,
             scratch: None,
             allocated: 0,
+            max_texture_size,
+            failure,
+            output_target: None,
             _on_lost: on_lost,
         };
         let slot = NEXT_SLOT.with(|next| {
@@ -133,53 +183,114 @@ impl GlBackend {
             slot
         });
         SLOTS.with(|slots| slots.borrow_mut().insert(slot, state));
-        Ok(Self { slot })
+        Ok(Self {
+            slot: Arc::new(SlotGuard(slot)),
+        })
     }
 
-    /// The largest texture edge this GPU supports.
-    pub(crate) fn max_texture_size(&self) -> u32 {
-        self.with(|state| {
-            state
-                .gl
-                .get_parameter(Gl::MAX_TEXTURE_SIZE)
-                .ok()
-                .and_then(|value| value.as_f64())
-                .and_then(|value| {
-                    #[expect(
-                        clippy::as_conversions,
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss,
-                        reason = "a texture size well below u32::MAX"
-                    )]
-                    let size = value as u32;
-                    Some(size)
-                })
-                .unwrap_or(0)
+    /// Why the backend stopped drawing, if it has.
+    pub(crate) fn failure(&self) -> Option<&'static str> {
+        SLOTS.with(|slots| slots.borrow().get(&self.slot.0).and_then(|state| state.failure.get()))
+    }
+
+    /// The canvas size, in pixels.
+    pub(crate) fn size(&self) -> (u32, u32) {
+        SLOTS.with(|slots| {
+            slots
+                .borrow()
+                .get(&self.slot.0)
+                .map_or((0, 0), |state| (state.canvas.width(), state.canvas.height()))
         })
-        .unwrap_or(0)
+    }
+
+    /// Resizes the canvas for pixels drawn outside EGFX.
+    pub(crate) fn resize_output(&self, width: u32, height: u32) {
+        self.with(|state| {
+            state.canvas.set_width(width);
+            state.canvas.set_height(height);
+            state.output = (width, height);
+            if let Some(output) = state.output_target.take() {
+                output.delete(&state.gl);
+            }
+        });
+    }
+
+    /// Draws `rgba`, the pixels of `region`, onto the canvas: the path for updates that do
+    /// not come through EGFX (legacy bitmaps).
+    pub(crate) fn present_rgba(&self, region: &InclusiveRectangle, rgba: &[u8]) {
+        self.with(|state| {
+            let (width, height) = (
+                u16::try_from(state.output.0).unwrap_or(u16::MAX),
+                u16::try_from(state.output.1).unwrap_or(u16::MAX),
+            );
+            if state.output_target.is_none() {
+                state.output_target = Target::new(&state.gl, width, height);
+            }
+            let Some(output) = state.output_target.as_ref() else {
+                return;
+            };
+            let rect = ExclusiveRectangle {
+                left: region.left,
+                top: region.top,
+                right: region.right.saturating_add(1),
+                bottom: region.bottom.saturating_add(1),
+            };
+            upload_into(
+                &state.gl,
+                output,
+                &rect,
+                rgba,
+                u32::from(region.width()),
+                (rect.left, rect.top),
+            );
+            let (source, destination) = present_blit((width, height), (0, 0), state.output, state.output.1);
+            blit(
+                &state.gl,
+                Some(&output.framebuffer),
+                None,
+                source,
+                destination,
+                Gl::NEAREST,
+            );
+        });
+    }
+
+    /// Every `step`th pixel of every `step`th row of what was just presented, as RGB, top row
+    /// first. For the bench's CPU-against-GPU comparison; it must run in the same task as the
+    /// present, because the canvas is not preserved after compositing.
+    pub(crate) fn sample_output(&self, step: u32) -> Vec<u8> {
+        self.with(|state| {
+            let (width, height) = state.output;
+            let mut rgba = vec![0u8; usize::try_from(u64::from(width) * u64::from(height) * 4).unwrap_or(0)];
+            state.gl.bind_framebuffer(Gl::READ_FRAMEBUFFER, None);
+            #[expect(clippy::as_conversions, clippy::cast_possible_wrap, reason = "canvas sizes fit i32")]
+            let read = state.gl.read_pixels_with_opt_u8_array(
+                0,
+                0,
+                width as i32,
+                height as i32,
+                Gl::RGBA,
+                Gl::UNSIGNED_BYTE,
+                Some(&mut rgba),
+            );
+            if read.is_err() {
+                return Vec::new();
+            }
+            // GL rows run bottom to top.
+            sample_rgb(&rgba, width, height, step, true)
+        })
+        .unwrap_or_default()
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut GlState) -> R) -> Option<R> {
         SLOTS.with(|slots| {
             let mut slots = slots.borrow_mut();
-            let state = slots.get_mut(&self.slot)?;
+            let state = slots.get_mut(&self.slot.0)?;
             if state.gl.is_context_lost() {
                 return None;
             }
             Some(f(state))
         })
-    }
-}
-
-impl Drop for GlBackend {
-    fn drop(&mut self) {
-        let state = SLOTS.with(|slots| slots.borrow_mut().remove(&self.slot));
-        if let Some(mut state) = state {
-            state.clear_surfaces();
-            for (_, target) in core::mem::take(&mut state.cache) {
-                target.delete(&state.gl);
-            }
-        }
     }
 }
 
@@ -267,6 +378,55 @@ fn blit(
     );
 }
 
+/// Uploads the `rect` of `pixels`, an RGBA image `stride` pixels wide whose top-left is
+/// `origin`, into `target`, clipped to it.
+fn upload_into(gl: &Gl, target: &Target, rect: &ExclusiveRectangle, pixels: &[u8], stride: u32, origin: (u16, u16)) {
+    let Some(rect) = clip(rect, target.width, target.height) else {
+        return;
+    };
+    gl.bind_texture(Gl::TEXTURE_2D, Some(&target.texture));
+    #[expect(clippy::as_conversions, clippy::cast_possible_wrap, reason = "image strides fit i32")]
+    gl.pixel_storei(Gl::UNPACK_ROW_LENGTH, stride as i32);
+    gl.pixel_storei(Gl::UNPACK_SKIP_PIXELS, i32::from(rect.left - origin.0));
+    gl.pixel_storei(Gl::UNPACK_SKIP_ROWS, i32::from(rect.top - origin.1));
+    if let Err(error) = gl.tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_opt_u8_array(
+        Gl::TEXTURE_2D,
+        0,
+        i32::from(rect.left),
+        i32::from(rect.top),
+        i32::from(rect.right - rect.left),
+        i32::from(rect.bottom - rect.top),
+        Gl::RGBA,
+        Gl::UNSIGNED_BYTE,
+        Some(pixels),
+    ) {
+        warn!(?error, "Failed to upload surface pixels");
+    }
+    gl.pixel_storei(Gl::UNPACK_ROW_LENGTH, 0);
+    gl.pixel_storei(Gl::UNPACK_SKIP_PIXELS, 0);
+    gl.pixel_storei(Gl::UNPACK_SKIP_ROWS, 0);
+}
+
+/// Every `step`th pixel of every `step`th row of an RGBA image, as RGB, top row first.
+/// `bottom_up` says the image's rows are stored bottom first, as GL reads them.
+pub(crate) fn sample_rgb(rgba: &[u8], width: u32, height: u32, step: u32, bottom_up: bool) -> Vec<u8> {
+    let (Ok(width), Ok(height), Ok(step)) = (usize::try_from(width), usize::try_from(height), usize::try_from(step))
+    else {
+        return Vec::new();
+    };
+    let mut rgb = Vec::new();
+    for y in (0..height).step_by(step.max(1)) {
+        let row = if bottom_up { height - 1 - y } else { y };
+        for x in (0..width).step_by(step.max(1)) {
+            let offset = (row * width + x) * 4;
+            if let Some(pixel) = rgba.get(offset..offset + 3) {
+                rgb.extend_from_slice(pixel);
+            }
+        }
+    }
+    rgb
+}
+
 impl GlState {
     fn clear_surfaces(&mut self) {
         for (_, surface) in core::mem::take(&mut self.surfaces) {
@@ -300,34 +460,9 @@ impl GlState {
     /// Uploads the `rect` of `pixels`, an RGBA image `stride` pixels wide whose top-left
     /// is `origin`, into the surface.
     fn upload(&self, surface_id: u16, rect: &ExclusiveRectangle, pixels: &[u8], stride: u32, origin: (u16, u16)) {
-        let Some(surface) = self.surfaces.get(&surface_id) else {
-            return;
-        };
-        let Some(rect) = clip(rect, surface.target.width, surface.target.height) else {
-            return;
-        };
-        let gl = &self.gl;
-        gl.bind_texture(Gl::TEXTURE_2D, Some(&surface.target.texture));
-        #[expect(clippy::as_conversions, clippy::cast_possible_wrap, reason = "image strides fit i32")]
-        gl.pixel_storei(Gl::UNPACK_ROW_LENGTH, stride as i32);
-        gl.pixel_storei(Gl::UNPACK_SKIP_PIXELS, i32::from(rect.left - origin.0));
-        gl.pixel_storei(Gl::UNPACK_SKIP_ROWS, i32::from(rect.top - origin.1));
-        if let Err(error) = gl.tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_opt_u8_array(
-            Gl::TEXTURE_2D,
-            0,
-            i32::from(rect.left),
-            i32::from(rect.top),
-            i32::from(rect.right - rect.left),
-            i32::from(rect.bottom - rect.top),
-            Gl::RGBA,
-            Gl::UNSIGNED_BYTE,
-            Some(pixels),
-        ) {
-            warn!(?error, "Failed to upload surface pixels");
+        if let Some(surface) = self.surfaces.get(&surface_id) {
+            upload_into(&self.gl, &surface.target, rect, pixels, stride, origin);
         }
-        gl.pixel_storei(Gl::UNPACK_ROW_LENGTH, 0);
-        gl.pixel_storei(Gl::UNPACK_SKIP_PIXELS, 0);
-        gl.pixel_storei(Gl::UNPACK_SKIP_ROWS, 0);
     }
 
     /// Draws a `VideoFrame` into the video texture, re-specifying it at the frame's size.
@@ -470,6 +605,16 @@ impl SurfaceBackend for GlBackend {
 
     fn create_surface(&mut self, id: u16, width: u16, height: u16) {
         self.with(|state| {
+            if exceeds_texture_limit(width, height, state.max_texture_size) {
+                warn!(
+                    width,
+                    height,
+                    max = state.max_texture_size,
+                    "Surface exceeds the GPU texture limit"
+                );
+                state.failure.set(Some("Surface exceeds the GPU texture limit"));
+                return;
+            }
             if let Some(old) = state.surfaces.remove(&id) {
                 state.release(old.target);
             }
@@ -675,5 +820,27 @@ impl SurfaceBackend for GlBackend {
 
     fn drain_output(&mut self) -> Vec<OutputUpdate> {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sample_rgb_takes_every_step_pixel_top_row_first() {
+        // 2x2 RGBA: top-left 1, top-right 2, bottom-left 3, bottom-right 4 (stored top first).
+        let top_first = [1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255, 4, 4, 4, 255];
+        let bottom_first = [3, 3, 3, 255, 4, 4, 4, 255, 1, 1, 1, 255, 2, 2, 2, 255];
+
+        assert_eq!(
+            sample_rgb(&top_first, 2, 2, 1, false),
+            vec![1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4]
+        );
+        assert_eq!(
+            sample_rgb(&bottom_first, 2, 2, 1, true),
+            vec![1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4]
+        );
+        assert_eq!(sample_rgb(&top_first, 2, 2, 2, false), vec![1, 1, 1]);
     }
 }

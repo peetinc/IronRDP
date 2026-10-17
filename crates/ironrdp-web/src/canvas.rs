@@ -41,6 +41,24 @@ impl Canvas {
         self.canvas.set_height(height.get());
     }
 
+    /// Every `step`th pixel of every `step`th row, as RGB, top row first (the bench's
+    /// CPU-against-GPU comparison).
+    pub(crate) fn sample(&self, step: u32) -> Vec<u8> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let (width, height) = self.size();
+            self.ctx
+                .get_image_data(0.0, 0.0, f64::from(width), f64::from(height))
+                .map(|image| crate::gpu::sample_rgb(&image.data(), width, height, step, false))
+                .unwrap_or_default()
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (&self.ctx, step);
+            unimplemented!("web canvas is only available on wasm32")
+        }
+    }
+
     /// Blits a dirty region with `put_image_data`. Forces alpha opaque first: the framebuffer isn't
     /// guaranteed opaque (zero-init columns, QOI-RGBA) and `put_image_data` stores alpha verbatim.
     pub(crate) fn draw(&self, buffer: &mut [u8], region: InclusiveRectangle) -> anyhow::Result<()> {
@@ -64,6 +82,49 @@ impl Canvas {
         {
             let _ = (&self.ctx, buffer, region);
             unimplemented!("web canvas is only available on wasm32")
+        }
+    }
+}
+
+/// Where the session draws: the 2D canvas, or the WebGL2 backend when the session renders
+/// EGFX on the GPU (a canvas carries one kind of context, so the choice is made once).
+pub(crate) enum Presenter {
+    Canvas2d(Canvas),
+    Gl(crate::gpu::GlBackend),
+}
+
+impl Presenter {
+    /// Current backing store dimensions, in pixels.
+    pub(crate) fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Canvas2d(canvas) => canvas.size(),
+            Self::Gl(gl) => gl.size(),
+        }
+    }
+
+    pub(crate) fn resize(&mut self, width: NonZeroU32, height: NonZeroU32) {
+        match self {
+            Self::Canvas2d(canvas) => canvas.resize(width, height),
+            Self::Gl(gl) => gl.resize_output(width.get(), height.get()),
+        }
+    }
+
+    /// Draws a dirty region that did not come through the GPU backend.
+    pub(crate) fn draw(&self, buffer: &mut [u8], region: InclusiveRectangle) -> anyhow::Result<()> {
+        match self {
+            Self::Canvas2d(canvas) => canvas.draw(buffer, region),
+            Self::Gl(gl) => {
+                gl.present_rgba(&region, buffer);
+                Ok(())
+            }
+        }
+    }
+
+    /// Why GPU rendering stopped, if it has: the session cannot continue.
+    pub(crate) fn failure(&self) -> Option<&'static str> {
+        match self {
+            Self::Canvas2d(_) => None,
+            Self::Gl(gl) => gl.failure(),
         }
     }
 }
