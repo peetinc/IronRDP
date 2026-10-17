@@ -3294,7 +3294,7 @@ mod tests {
         }
     }
 
-    impl crate::compositor::SurfaceBackend for RecordingBackend {
+    impl SurfaceBackend for RecordingBackend {
         fn reset(&mut self, width: u32, height: u32) {
             self.record(format!("reset {width}x{height}"));
         }
@@ -3330,12 +3330,12 @@ mod tests {
         }
         fn surface_to_surface(
             &mut self,
-            src: u16,
-            dst: u16,
+            src_id: u16,
+            dst_id: u16,
             _src_rect: &ExclusiveRectangle,
             dst_points: &[crate::pdu::Point],
         ) {
-            self.record(format!("surface_to_surface {src}->{dst} {}", dst_points.len()));
+            self.record(format!("surface_to_surface {src_id}->{dst_id} {}", dst_points.len()));
         }
         fn surface_to_cache(&mut self, surface_id: u16, cache_slot: u16, _src_rect: &ExclusiveRectangle) {
             self.record(format!("surface_to_cache {surface_id}->{cache_slot}"));
@@ -3428,18 +3428,18 @@ mod tests {
         for pdu in [
             deferred_start_frame(1),
             red_fill(&rect),
-            GfxPdu::SurfaceToCache(crate::pdu::SurfaceToCachePdu {
+            GfxPdu::SurfaceToCache(SurfaceToCachePdu {
                 surface_id: DEFERRED_SURFACE,
                 cache_key: 1,
                 cache_slot: 3,
                 source_rectangle: rect.clone(),
             }),
-            GfxPdu::CacheToSurface(crate::pdu::CacheToSurfacePdu {
+            GfxPdu::CacheToSurface(CacheToSurfacePdu {
                 cache_slot: 3,
                 surface_id: DEFERRED_SURFACE,
                 destination_points: vec![crate::pdu::Point { x: 16, y: 16 }],
             }),
-            GfxPdu::SurfaceToSurface(crate::pdu::SurfaceToSurfacePdu {
+            GfxPdu::SurfaceToSurface(SurfaceToSurfacePdu {
                 source_surface_id: DEFERRED_SURFACE,
                 destination_surface_id: DEFERRED_SURFACE,
                 source_rectangle: rect,

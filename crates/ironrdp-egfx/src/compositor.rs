@@ -155,113 +155,6 @@ pub trait SurfaceBackend: Send {
 }
 
 impl SurfaceBackend for Compositor {
-    fn reset(&mut self, width: u32, height: u32) {
-        Compositor::reset(self, width, height);
-    }
-
-    fn create_surface(&mut self, id: u16, width: u16, height: u16) {
-        Compositor::create_surface(self, id, width, height);
-    }
-
-    fn delete_surface(&mut self, id: u16) {
-        Compositor::delete_surface(self, id);
-    }
-
-    fn map_surface(&mut self, id: u16, origin_x: u32, origin_y: u32) {
-        Compositor::map_surface(self, id, origin_x, origin_y);
-    }
-
-    fn map_surface_scaled(&mut self, id: u16, origin_x: u32, origin_y: u32, target_width: u32, target_height: u32) {
-        Compositor::map_surface_scaled(self, id, origin_x, origin_y, target_width, target_height);
-    }
-
-    fn write_rgba(&mut self, surface_id: u16, dest: &ExclusiveRectangle, rgba: &[u8]) {
-        self.apply_bitmap(surface_id, dest, rgba);
-    }
-
-    fn write_frame(&mut self, surface_id: u16, regions: &[ExclusiveRectangle], frame: &DecodedFrame) {
-        if frame.external_handle().is_some() {
-            warn!("Ignoring an external decoded frame: the CPU compositor has no access to its pixels");
-            return;
-        }
-        let Ok(frame_width) = u16::try_from(frame.width()) else {
-            return;
-        };
-        for region in regions {
-            let (width, height) = (region.right - region.left, region.bottom - region.top);
-            let pixels = copy_region(frame.data(), frame_width, region.left, region.top, width, height);
-            self.apply_bitmap(surface_id, region, &pixels);
-        }
-    }
-
-    fn solid_fill(&mut self, surface_id: u16, color: &Color, rects: &[ExclusiveRectangle]) {
-        Compositor::solid_fill(self, surface_id, color, rects);
-    }
-
-    fn surface_to_surface(&mut self, src_id: u16, dst_id: u16, src_rect: &ExclusiveRectangle, dst_points: &[Point]) {
-        Compositor::surface_to_surface(self, src_id, dst_id, src_rect, dst_points);
-    }
-
-    fn surface_to_cache(&mut self, surface_id: u16, cache_slot: u16, src_rect: &ExclusiveRectangle) {
-        Compositor::surface_to_cache(self, surface_id, cache_slot, src_rect);
-    }
-
-    fn cache_to_surface(&mut self, cache_slot: u16, surface_id: u16, dst_points: &[Point]) {
-        Compositor::cache_to_surface(self, cache_slot, surface_id, dst_points);
-    }
-
-    fn evict_cache_entry(&mut self, cache_slot: u16) {
-        Compositor::evict_cache_entry(self, cache_slot);
-    }
-
-    fn end_frame(&mut self) {
-        Compositor::end_frame(self);
-    }
-
-    fn drain_output(&mut self) -> Vec<OutputUpdate> {
-        Compositor::drain_output(self)
-    }
-}
-
-/// Client-side EGFX surface compositor.
-///
-/// Applies surface commands into persistent RGBA8888 buffers and accumulates the
-/// output regions that change. The
-/// [`GraphicsPipelineClient`](crate::client::GraphicsPipelineClient) feeds it each
-/// command and drains completed frames via [`drain_output`](Self::drain_output).
-#[derive(Debug, Default)]
-pub(crate) struct Compositor {
-    surfaces: BTreeMap<u16, Surface>,
-    cache: BTreeMap<u16, CachedTile>,
-    /// Pixel bytes currently held across `surfaces`, `cache` and `ready`, charged
-    /// against [`MAX_COMPOSITOR_BYTES`]. Kept as a running total rather than
-    /// recomputed so the check before an allocation stays O(1).
-    allocated_bytes: usize,
-    output_width: u16,
-    output_height: u16,
-    /// Regions dirtied by the frame currently being built (between
-    /// `StartFrame`/`EndFrame`), materialized into `ready` at commit.
-    frame: Vec<DirtyRegion>,
-    /// Deltas from completed frames, awaiting drain.
-    ready: Vec<OutputUpdate>,
-}
-
-impl Compositor {
-    pub(crate) fn materializable_output_size(width: u32, height: u32) -> Option<(u16, u16)> {
-        let width = u16::try_from(width).ok()?;
-        let height = u16::try_from(height).ok()?;
-        let byte_len = usize::from(width)
-            .checked_mul(usize::from(height))?
-            .checked_mul(BYTES_PER_PIXEL)?;
-
-        (width != 0
-            && height != 0
-            && width <= MAX_OUTPUT_DIM
-            && height <= MAX_OUTPUT_DIM
-            && byte_len <= MAX_COMPOSITOR_BYTES)
-            .then_some((width, height))
-    }
-
     /// Handle `ResetGraphics`: set the output size and drop all surfaces and
     /// pending output. The bitmap cache is kept.
     ///
@@ -278,7 +171,7 @@ impl Compositor {
     /// never refills them. Dropping the cache here turned every such draw into a
     /// no-op, leaving black blocks and stale content on screen. FreeRDP likewise
     /// evicts cache slots only when the channel closes.
-    pub(crate) fn reset(&mut self, width: u32, height: u32) {
+    fn reset(&mut self, width: u32, height: u32) {
         self.output_width = u16::try_from(width).unwrap_or(u16::MAX);
         self.output_height = u16::try_from(height).unwrap_or(u16::MAX);
         self.surfaces.clear();
@@ -289,42 +182,12 @@ impl Compositor {
         self.allocated_bytes = self.cache.values().map(|tile| tile.data.len()).sum();
     }
 
-    /// Reserve `len` pixel bytes, or refuse if that would exceed the budget.
-    ///
-    /// Refusing rather than erroring keeps the existing contract for allocations
-    /// the compositor declines: the surface or slot simply does not exist, and
-    /// commands targeting it become no-ops.
-    fn charge(&mut self, len: usize) -> bool {
-        match self.allocated_bytes.checked_add(len) {
-            Some(total) if total <= MAX_COMPOSITOR_BYTES => {
-                self.allocated_bytes = total;
-                true
-            }
-            _ => {
-                debug!(
-                    len,
-                    allocated = self.allocated_bytes,
-                    budget = MAX_COMPOSITOR_BYTES,
-                    "compositor allocation refused: budget exhausted"
-                );
-                false
-            }
-        }
-    }
-
-    /// Release a charge taken by [`Self::charge`].
-    fn release(&mut self, len: usize) {
-        // Saturating rather than wrapping: an accounting slip must not underflow
-        // into a huge budget that disables the limit entirely.
-        self.allocated_bytes = self.allocated_bytes.saturating_sub(len);
-    }
-
     /// Handle `CreateSurface`: allocate a zeroed RGBA8888 canvas.
     ///
     /// Surfaces beyond [`MAX_SURFACE_DIM`] on either edge are skipped rather than
     /// allocated; subsequent commands targeting them become no-ops (the metadata
     /// tracked by the client is unaffected).
-    pub(crate) fn create_surface(&mut self, id: u16, width: u16, height: u16) {
+    fn create_surface(&mut self, id: u16, width: u16, height: u16) {
         if width == 0 || height == 0 || width > MAX_SURFACE_DIM || height > MAX_SURFACE_DIM {
             return;
         }
@@ -352,7 +215,7 @@ impl Compositor {
     }
 
     /// Handle `DeleteSurface`.
-    pub(crate) fn delete_surface(&mut self, id: u16) {
+    fn delete_surface(&mut self, id: u16) {
         if let Some(surface) = self.surfaces.remove(&id) {
             self.release(surface.data.len());
         }
@@ -360,7 +223,7 @@ impl Compositor {
 
     /// Handle `MapSurfaceToOutput`: record the mapping and make the surface's
     /// current contents visible at `(origin_x, origin_y)`.
-    pub(crate) fn map_surface(&mut self, id: u16, origin_x: u32, origin_y: u32) {
+    fn map_surface(&mut self, id: u16, origin_x: u32, origin_y: u32) {
         let Some((width, height)) = self.surfaces.get(&id).map(|surface| (surface.width, surface.height)) else {
             return;
         };
@@ -370,14 +233,7 @@ impl Compositor {
 
     /// Handle `MapSurfaceToScaledOutput`: record the scaled mapping and make the
     /// surface's current contents visible at `(origin_x, origin_y)`.
-    pub(crate) fn map_surface_scaled(
-        &mut self,
-        id: u16,
-        origin_x: u32,
-        origin_y: u32,
-        target_width: u32,
-        target_height: u32,
-    ) {
+    fn map_surface_scaled(&mut self, id: u16, origin_x: u32, origin_y: u32, target_width: u32, target_height: u32) {
         let mapping = OutputMapping {
             origin: (origin_x, origin_y),
             target_width,
@@ -392,24 +248,27 @@ impl Compositor {
         self.record_dirty(id, 0, 0, w, h);
     }
 
-    /// Write a decoded RGBA8888 bitmap into a surface sub-rectangle (the output of
-    /// a `WireToSurface1` or `WireToSurface2` decode) and record the resulting output delta.
-    ///
-    /// `rgba` is expected to be `dest.width() * dest.height() * 4` bytes; short or
-    /// long buffers are handled defensively by the row-wise blit.
-    pub(crate) fn apply_bitmap(&mut self, surface_id: u16, dest: &ExclusiveRectangle, rgba: &[u8]) {
-        let x = dest.left;
-        let y = dest.top;
-        let w = dest.right.saturating_sub(dest.left);
-        let h = dest.bottom.saturating_sub(dest.top);
-        if let Some(surface) = self.surfaces.get_mut(&surface_id) {
-            blit_region(surface.canvas_mut(), x, y, w, h, rgba);
+    fn write_rgba(&mut self, surface_id: u16, dest: &ExclusiveRectangle, rgba: &[u8]) {
+        self.apply_bitmap(surface_id, dest, rgba);
+    }
+
+    fn write_frame(&mut self, surface_id: u16, regions: &[ExclusiveRectangle], frame: &DecodedFrame) {
+        if frame.external_handle().is_some() {
+            warn!("Ignoring an external decoded frame: the CPU compositor has no access to its pixels");
+            return;
         }
-        self.record_dirty(surface_id, x, y, w, h);
+        let Ok(frame_width) = u16::try_from(frame.width()) else {
+            return;
+        };
+        for region in regions {
+            let (width, height) = (region.right - region.left, region.bottom - region.top);
+            let pixels = copy_region(frame.data(), frame_width, region.left, region.top, width, height);
+            self.apply_bitmap(surface_id, region, &pixels);
+        }
     }
 
     /// Fill each rectangle of a surface with a solid, opaque color (`SolidFill`).
-    pub(crate) fn solid_fill(&mut self, surface_id: u16, color: &Color, rects: &[ExclusiveRectangle]) {
+    fn solid_fill(&mut self, surface_id: u16, color: &Color, rects: &[ExclusiveRectangle]) {
         let px = [color.r, color.g, color.b, 0xFF];
         for rect in rects {
             let x = rect.left;
@@ -427,13 +286,7 @@ impl Compositor {
     /// a copy or an on-screen scroll when source and destination are the same
     /// surface). The source region is read once; each destination point receives a
     /// copy.
-    pub(crate) fn surface_to_surface(
-        &mut self,
-        src_id: u16,
-        dst_id: u16,
-        src_rect: &ExclusiveRectangle,
-        dst_points: &[Point],
-    ) {
+    fn surface_to_surface(&mut self, src_id: u16, dst_id: u16, src_rect: &ExclusiveRectangle, dst_points: &[Point]) {
         // Read the source region into an owned tile first, so a scroll within one
         // surface (src_id == dst_id) reads pre-move pixels and never aliases.
         let Some(src) = self.surfaces.get(&src_id) else {
@@ -466,7 +319,7 @@ impl Compositor {
 
     /// Copy a surface rectangle into a cache slot (`SurfaceToCache`). The cache is
     /// off-screen, so this produces no output delta.
-    pub(crate) fn surface_to_cache(&mut self, surface_id: u16, cache_slot: u16, src_rect: &ExclusiveRectangle) {
+    fn surface_to_cache(&mut self, surface_id: u16, cache_slot: u16, src_rect: &ExclusiveRectangle) {
         // Size the tile in a scope that ends the surface borrow, so the budget calls
         // below can take `&mut self` while the charge still precedes the allocation.
         let (w, h) = {
@@ -524,7 +377,7 @@ impl Compositor {
 
     /// Render a cached tile onto a surface at each destination point
     /// (`CacheToSurface`).
-    pub(crate) fn cache_to_surface(&mut self, cache_slot: u16, surface_id: u16, dst_points: &[Point]) {
+    fn cache_to_surface(&mut self, cache_slot: u16, surface_id: u16, dst_points: &[Point]) {
         let Some(tile) = self.cache.get(&cache_slot) else {
             return;
         };
@@ -545,7 +398,7 @@ impl Compositor {
     }
 
     /// Evict a cache slot (`EvictCacheEntry`).
-    pub(crate) fn evict_cache_entry(&mut self, cache_slot: u16) {
+    fn evict_cache_entry(&mut self, cache_slot: u16) {
         if let Some(tile) = self.cache.remove(&cache_slot) {
             self.release(tile.data.len());
         }
@@ -556,7 +409,7 @@ impl Compositor {
     /// The pixels are read here rather than when each command ran, so a surface
     /// deleted or remapped mid-frame contributes nothing: its output region is
     /// repainted by whatever maps there next.
-    pub(crate) fn end_frame(&mut self) {
+    fn end_frame(&mut self) {
         let frame = core::mem::take(&mut self.frame);
         // Released before materializing so the pixel copies can spend the budget the
         // metadata was holding.
@@ -567,11 +420,97 @@ impl Compositor {
     }
 
     /// Take all committed output updates, leaving the pending set empty.
-    pub(crate) fn drain_output(&mut self) -> Vec<OutputUpdate> {
+    fn drain_output(&mut self) -> Vec<OutputUpdate> {
         let drained = core::mem::take(&mut self.ready);
         let released = drained.iter().map(|update| update.data.len()).sum();
         self.release(released);
         drained
+    }
+}
+
+/// Client-side EGFX surface compositor.
+///
+/// Applies surface commands into persistent RGBA8888 buffers and accumulates the
+/// output regions that change. The
+/// [`GraphicsPipelineClient`](crate::client::GraphicsPipelineClient) feeds it each
+/// command and drains completed frames via [`drain_output`](Self::drain_output).
+#[derive(Debug, Default)]
+pub(crate) struct Compositor {
+    surfaces: BTreeMap<u16, Surface>,
+    cache: BTreeMap<u16, CachedTile>,
+    /// Pixel bytes currently held across `surfaces`, `cache` and `ready`, charged
+    /// against [`MAX_COMPOSITOR_BYTES`]. Kept as a running total rather than
+    /// recomputed so the check before an allocation stays O(1).
+    allocated_bytes: usize,
+    output_width: u16,
+    output_height: u16,
+    /// Regions dirtied by the frame currently being built (between
+    /// `StartFrame`/`EndFrame`), materialized into `ready` at commit.
+    frame: Vec<DirtyRegion>,
+    /// Deltas from completed frames, awaiting drain.
+    ready: Vec<OutputUpdate>,
+}
+
+impl Compositor {
+    pub(crate) fn materializable_output_size(width: u32, height: u32) -> Option<(u16, u16)> {
+        let width = u16::try_from(width).ok()?;
+        let height = u16::try_from(height).ok()?;
+        let byte_len = usize::from(width)
+            .checked_mul(usize::from(height))?
+            .checked_mul(BYTES_PER_PIXEL)?;
+
+        (width != 0
+            && height != 0
+            && width <= MAX_OUTPUT_DIM
+            && height <= MAX_OUTPUT_DIM
+            && byte_len <= MAX_COMPOSITOR_BYTES)
+            .then_some((width, height))
+    }
+
+    /// Reserve `len` pixel bytes, or refuse if that would exceed the budget.
+    ///
+    /// Refusing rather than erroring keeps the existing contract for allocations
+    /// the compositor declines: the surface or slot simply does not exist, and
+    /// commands targeting it become no-ops.
+    fn charge(&mut self, len: usize) -> bool {
+        match self.allocated_bytes.checked_add(len) {
+            Some(total) if total <= MAX_COMPOSITOR_BYTES => {
+                self.allocated_bytes = total;
+                true
+            }
+            _ => {
+                debug!(
+                    len,
+                    allocated = self.allocated_bytes,
+                    budget = MAX_COMPOSITOR_BYTES,
+                    "compositor allocation refused: budget exhausted"
+                );
+                false
+            }
+        }
+    }
+
+    /// Release a charge taken by [`Self::charge`].
+    fn release(&mut self, len: usize) {
+        // Saturating rather than wrapping: an accounting slip must not underflow
+        // into a huge budget that disables the limit entirely.
+        self.allocated_bytes = self.allocated_bytes.saturating_sub(len);
+    }
+
+    /// Write a decoded RGBA8888 bitmap into a surface sub-rectangle (the output of
+    /// a `WireToSurface1` or `WireToSurface2` decode) and record the resulting output delta.
+    ///
+    /// `rgba` is expected to be `dest.width() * dest.height() * 4` bytes; short or
+    /// long buffers are handled defensively by the row-wise blit.
+    pub(crate) fn apply_bitmap(&mut self, surface_id: u16, dest: &ExclusiveRectangle, rgba: &[u8]) {
+        let x = dest.left;
+        let y = dest.top;
+        let w = dest.right.saturating_sub(dest.left);
+        let h = dest.bottom.saturating_sub(dest.top);
+        if let Some(surface) = self.surfaces.get_mut(&surface_id) {
+            blit_region(surface.canvas_mut(), x, y, w, h, rgba);
+        }
+        self.record_dirty(surface_id, x, y, w, h);
     }
 
     /// Copy the pixels for one dirty region into the drainable queue.
