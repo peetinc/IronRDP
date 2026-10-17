@@ -5,3 +5,5 @@
 !.env.example
 /static/iron-remote-desktop-rdp/
 /static/iron-remote-desktop/
+# Replay-bench captures: user screen content, never committed
+/static/bench/

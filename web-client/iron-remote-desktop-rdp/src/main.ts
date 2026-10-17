@@ -7,6 +7,7 @@ import wasm_init, {
     ClipboardData,
     Extension,
     RdpFile,
+    EgfxBench,
 } from '../../../crates/ironrdp-web/pkg/ironrdp_web';
 
 export async function init(log_level: string) {
@@ -15,6 +16,9 @@ export async function init(log_level: string) {
 }
 
 export { RdpFile };
+
+/** Replays a recorded EGFX capture through the real pipeline (test rig only). */
+export { EgfxBench };
 
 export const Backend = {
     DesktopSize: DesktopSize,

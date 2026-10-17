@@ -23,6 +23,7 @@ extern crate rustls_pki_types as _;
 extern crate ring as _;
 
 mod audio;
+mod bench;
 mod canvas;
 mod clipboard;
 mod drive;
