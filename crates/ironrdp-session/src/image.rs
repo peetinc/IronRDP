@@ -948,17 +948,25 @@ impl DecodedImage {
 
         let pointer_rendering_state = self.pointer_rendering_begin(update_rectangle)?;
 
-        rgba32.enumerate().for_each(|(row_idx, row)| {
-            row.chunks_exact(SRC_COLOR_DEPTH)
-                .enumerate()
-                .for_each(|(col_idx, src_pixel)| {
-                    let dst_idx = ((top + row_idx) * image_width + left + col_idx) * DST_COLOR_DEPTH;
+        // Same channel order (the web client's canvas format): whole rows copy at once.
+        let same_order = [ri, gi, bi, ai] == [0, 1, 2, 3];
 
-                    self.data[dst_idx + ri] = src_pixel[0];
-                    self.data[dst_idx + gi] = src_pixel[1];
-                    self.data[dst_idx + bi] = src_pixel[2];
-                    self.data[dst_idx + ai] = src_pixel[3];
-                })
+        rgba32.enumerate().for_each(|(row_idx, row)| {
+            let dst_start = ((top + row_idx) * image_width + left) * DST_COLOR_DEPTH;
+            let destination = &mut self.data[dst_start..dst_start + row.len()];
+            if same_order {
+                destination.copy_from_slice(row);
+            } else {
+                destination
+                    .chunks_exact_mut(DST_COLOR_DEPTH)
+                    .zip(row.chunks_exact(SRC_COLOR_DEPTH))
+                    .for_each(|(dst_pixel, src_pixel)| {
+                        dst_pixel[ri] = src_pixel[0];
+                        dst_pixel[gi] = src_pixel[1];
+                        dst_pixel[bi] = src_pixel[2];
+                        dst_pixel[ai] = src_pixel[3];
+                    });
+            }
         });
 
         let update_rectangle = self.pointer_rendering_end(pointer_rendering_state)?;
@@ -1158,5 +1166,53 @@ mod tests {
             image.apply_rgb16_bitmap(&[0; 6], &encoded_rectangle, 1).is_err(),
             "oversized bitmap data must not be applied"
         );
+    }
+
+    // Two 2x1 rows of RGBA, placed at (1, 1) in a 4x3 image.
+    const RGBA_ROWS: [u8; 16] = [
+        1, 2, 3, 4, 5, 6, 7, 8, // top row
+        9, 10, 11, 12, 13, 14, 15, 16, // bottom row
+    ];
+    const RGBA_RECTANGLE: InclusiveRectangle = InclusiveRectangle {
+        left: 1,
+        top: 1,
+        right: 2,
+        bottom: 2,
+    };
+
+    #[test]
+    fn rgba32_lands_in_its_rectangle_of_an_rgba_image() {
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, 4, 3);
+
+        image.apply_rgba32(&RGBA_ROWS, &RGBA_RECTANGLE, false).unwrap();
+
+        assert_eq!(pixel(&image, 1, 1), [1, 2, 3, 4]);
+        assert_eq!(pixel(&image, 2, 1), [5, 6, 7, 8]);
+        assert_eq!(pixel(&image, 1, 2), [9, 10, 11, 12]);
+        assert_eq!(pixel(&image, 2, 2), [13, 14, 15, 16]);
+        assert_eq!(pixel(&image, 0, 1), [0; 4]);
+        assert_eq!(pixel(&image, 3, 1), [0; 4]);
+        assert_eq!(pixel(&image, 1, 0), [0; 4]);
+    }
+
+    #[test]
+    fn flipped_rgba32_lands_bottom_up() {
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, 4, 3);
+
+        image.apply_rgba32(&RGBA_ROWS, &RGBA_RECTANGLE, true).unwrap();
+
+        assert_eq!(pixel(&image, 1, 1), [9, 10, 11, 12]);
+        assert_eq!(pixel(&image, 1, 2), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn rgba32_is_reordered_for_a_bgra_image() {
+        let mut image = DecodedImage::new(PixelFormat::BgrA32, 4, 3);
+
+        image.apply_rgba32(&RGBA_ROWS, &RGBA_RECTANGLE, false).unwrap();
+
+        assert_eq!(pixel(&image, 1, 1), [3, 2, 1, 4]);
+        assert_eq!(pixel(&image, 2, 2), [15, 14, 13, 16]);
+        assert_eq!(pixel(&image, 3, 2), [0; 4]);
     }
 }
