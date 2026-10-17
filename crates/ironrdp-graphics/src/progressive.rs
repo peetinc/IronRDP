@@ -42,7 +42,7 @@ use alloc::collections::btree_map::Entry;
 use ironrdp_core::invalid_field_err;
 use ironrdp_pdu::codecs::rfx::EntropyAlgorithm;
 use ironrdp_pdu::codecs::rfx::progressive::{ComponentCodecQuant, ProgressiveCodecQuant, TILE_FLAG_DIFFERENCE};
-use ironrdp_pdu::geometry::{ExclusiveRectangle, InclusiveRectangle};
+use ironrdp_pdu::geometry::{ExclusiveRectangle, InclusiveRectangle, Rectangle as _};
 
 use crate::dwt_extrapolate::BandInfo;
 use crate::rectangle_processing::Region;
@@ -1533,8 +1533,33 @@ impl ProgressiveDecoder {
             // within the same frame, under this codec context or another, so clip them
             // against every tile updated in this frame rather than only the newly
             // decoded tiles.
+            //
+            // Each normalized rectangle is first assigned to the tiles it overlaps, so clipping
+            // costs the rectangle-tile overlaps instead of every frame tile against every
+            // rectangle: at 4K, Windows sends about 1,000 rectangles in a frame that touched
+            // all 2,040 tiles.
+            let mut rectangles_by_tile: BTreeMap<(u16, u16), Region> = BTreeMap::new();
+            for rectangle in &clipping_region.rectangles {
+                for y_idx in rectangle.top / TILE_DIM..=rectangle.bottom / TILE_DIM {
+                    for x_idx in rectangle.left / TILE_DIM..=rectangle.right / TILE_DIM {
+                        charge_region_clipping_work(&mut region_clipping_work, 1)?;
+                        rectangles_by_tile
+                            .entry((x_idx, y_idx))
+                            .or_default()
+                            .rectangles
+                            .push(rectangle.clone());
+                    }
+                }
+            }
+            for tile_region in rectangles_by_tile.values_mut() {
+                tile_region.extents = InclusiveRectangle::union_all(&tile_region.rectangles);
+            }
+
             for (&(x_idx, y_idx), frame_tile) in frame_tiles.iter() {
-                charge_region_clipping_work(&mut region_clipping_work, clipping_region.rectangles.len().max(1))?;
+                charge_region_clipping_work(&mut region_clipping_work, 1)?;
+                let Some(tile_region) = rectangles_by_tile.get(&(x_idx, y_idx)) else {
+                    continue;
+                };
                 let left = x_idx.saturating_mul(TILE_DIM);
                 let top = y_idx.saturating_mul(TILE_DIM);
                 let right = left.saturating_add(TILE_DIM).min(surface_width);
@@ -1543,7 +1568,8 @@ impl ProgressiveDecoder {
                     continue;
                 }
 
-                let update_rectangles = clipping_region
+                charge_region_clipping_work(&mut region_clipping_work, tile_region.rectangles.len())?;
+                let update_rectangles = tile_region
                     .intersect_rectangle(&InclusiveRectangle {
                         left,
                         top,
@@ -2381,39 +2407,39 @@ mod tests {
         ironrdp_pdu::codecs::rfx::RfxRectangle { x, y, width, height }
     }
 
-    #[test]
-    fn decoder_bounds_region_clipping_work() {
-        use ironrdp_pdu::codecs::rfx::RfxRectangle;
+    /// A one-REGION progressive stream with these rectangles and no tiles.
+    fn stream_with_rects(rects: Vec<ironrdp_pdu::codecs::rfx::RfxRectangle>) -> Vec<u8> {
         use ironrdp_pdu::codecs::rfx::progressive::{
             ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu,
             ProgressiveRegion, ProgressiveSyncPdu, encode_progressive_stream,
         };
 
-        fn stream_with_rects(rects: Vec<RfxRectangle>) -> Vec<u8> {
-            encode_progressive_stream(&[
-                ProgressiveBlock::Sync(ProgressiveSyncPdu),
-                ProgressiveBlock::Context(ProgressiveContextPdu {
-                    context_id: 0,
-                    tile_size: 0x0040,
-                    flags: 0,
-                }),
-                ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
-                    frame_index: 0,
-                    region_count: 1,
-                }),
-                ProgressiveBlock::Region(ProgressiveRegion {
-                    tile_size: 0x40,
-                    rects,
-                    quant_vals: vec![],
-                    quant_prog_vals: vec![],
-                    flags: 0,
-                    tiles: vec![],
-                }),
-                ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
-            ])
-            .unwrap()
-        }
+        encode_progressive_stream(&[
+            ProgressiveBlock::Sync(ProgressiveSyncPdu),
+            ProgressiveBlock::Context(ProgressiveContextPdu {
+                context_id: 0,
+                tile_size: 0x0040,
+                flags: 0,
+            }),
+            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                frame_index: 0,
+                region_count: 1,
+            }),
+            ProgressiveBlock::Region(ProgressiveRegion {
+                tile_size: 0x40,
+                rects,
+                quant_vals: vec![],
+                quant_prog_vals: vec![],
+                flags: 0,
+                tiles: vec![],
+            }),
+            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+        ])
+        .unwrap()
+    }
 
+    #[test]
+    fn decoder_bounds_region_clipping_work() {
         // Each disjoint rectangle grows the normalized Region by one entry.
         // 1,500 such inserts exceed the aggregate scan budget long before the
         // wire-format u16 rectangle count could drive quadratic work unchecked.
@@ -2435,8 +2461,9 @@ mod tests {
                 .is_ok()
         );
 
-        // Intersecting a moderately fragmented region with an attacker-sized
-        // accumulated tile set is charged to the same per-payload budget.
+        // Clipping against the frame's accumulated tiles costs one unit per tile plus the
+        // rectangle-tile overlaps, not tiles times rectangles, so a moderately fragmented
+        // region over a large accumulated tile set stays well inside the budget.
         let rects = (0..100u16).map(|x| rect(x.saturating_mul(3), 0, 2, 2)).collect();
         let frame_tiles = (0..11_000u16)
             .map(|index| ((index % 128, index / 128), FrameTile::Context(1)))
@@ -2444,11 +2471,34 @@ mod tests {
         let mut decoder = ProgressiveDecoder::new();
         decoder.begin_frame();
         decoder.frame_tiles.insert(1, frame_tiles);
-        let error = match decoder.decode_bitmap(1, 1, 8192, 8192, &stream_with_rects(rects)) {
-            Err(error) => error,
-            Ok(_) => panic!("tile intersections must share the clipping work budget"),
-        };
-        assert!(error.to_string().contains("clipping work limit exceeded"));
+        assert!(
+            decoder
+                .decode_bitmap(1, 1, 8192, 8192, &stream_with_rects(rects))
+                .is_ok()
+        );
+    }
+
+    /// Windows sent this shape at 4K: a frame that touched every tile, then a REGION of about
+    /// 1,000 small rectangles. Clipping must cost what the rectangles overlap, not every frame
+    /// tile against every rectangle, or a legitimate update exhausts the budget and ends the
+    /// session.
+    #[test]
+    fn busy_4k_frame_clips_within_the_work_budget() {
+        const WIDTH: u16 = 3840;
+        const HEIGHT: u16 = 2160;
+        let rects = (0..1_001u16)
+            .map(|index| rect((index % 1_200) * 3, (index / 1_200) * 3, 2, 2))
+            .collect();
+        let frame_tiles = (0..WIDTH / TILE_DIM)
+            .flat_map(|x_idx| (0..HEIGHT.div_ceil(TILE_DIM)).map(move |y_idx| ((x_idx, y_idx), FrameTile::Context(1))))
+            .collect();
+        let mut decoder = ProgressiveDecoder::new();
+        decoder.begin_frame();
+        decoder.frame_tiles.insert(1, frame_tiles);
+
+        let result = decoder.decode_bitmap(1, 1, WIDTH, HEIGHT, &stream_with_rects(rects));
+
+        assert!(result.is_ok(), "busy 4K frame must clip: {:?}", result.err());
     }
 
     /// A REGION repaints the tiles its rectangles cover that were updated earlier in the
