@@ -31,12 +31,18 @@ use ironrdp_pdu::geometry::ExclusiveRectangle;
 /// Contains RGBA pixel data for a decoded H.264 frame.
 /// The pixel data is in RGBA format (4 bytes per pixel),
 /// row-major, top-to-bottom, left-to-right.
+///
+/// An [external](Self::external) frame instead names pixels a [`SurfaceBackend`] holds itself,
+/// such as a browser `VideoFrame` on the GPU. It has no CPU pixels.
+///
+/// [`SurfaceBackend`]: crate::compositor::SurfaceBackend
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct DecodedFrame {
     data: Vec<u8>,
     width: u32,
     height: u32,
+    external: Option<u64>,
 }
 
 impl DecodedFrame {
@@ -50,10 +56,31 @@ impl DecodedFrame {
             u64::from(width).saturating_mul(u64::from(height)).saturating_mul(4),
             "DecodedFrame buffer must be RGBA8888 (width * height * 4 bytes)",
         );
-        Self { data, width, height }
+        Self {
+            data,
+            width,
+            height,
+            external: None,
+        }
     }
 
-    /// RGBA pixel data (4 bytes per pixel).
+    /// A frame whose pixels the surface backend holds, identified by `handle`. Only a
+    /// backend that understands the handle can draw it.
+    pub fn external(handle: u64, width: u32, height: u32) -> Self {
+        Self {
+            data: Vec::new(),
+            width,
+            height,
+            external: Some(handle),
+        }
+    }
+
+    /// The backend's handle for an [external](Self::external) frame.
+    pub fn external_handle(&self) -> Option<u64> {
+        self.external
+    }
+
+    /// RGBA pixel data (4 bytes per pixel). Empty for an [external](Self::external) frame.
     pub fn data(&self) -> &[u8] {
         &self.data
     }

@@ -66,7 +66,7 @@ use ironrdp_pdu::{PduResult, decode_cursor, decode_err, pdu_other_err};
 use tracing::{debug, trace, warn};
 
 use crate::CHANNEL_NAME;
-use crate::compositor::{Compositor, OutputUpdate};
+use crate::compositor::{Compositor, OutputUpdate, SurfaceBackend};
 
 /// Diagnostic capture hook: the in-process twin of `IRONRDP_DUMP_EGFX` for
 /// targets with no filesystem (wasm).
@@ -439,7 +439,7 @@ pub struct GraphicsPipelineClient {
     codec_caps: CodecCapabilities,
 
     surfaces: BTreeMap<u16, Surface>,
-    compositor: Compositor,
+    compositor: Box<dyn SurfaceBackend>,
     current_frame_id: Option<u32>,
     total_frames_decoded: u32,
     pending_output_reset: Option<(u16, u16)>,
@@ -484,13 +484,20 @@ impl GraphicsPipelineClient {
             negotiated_caps: None,
             codec_caps: CodecCapabilities::default(),
             surfaces: BTreeMap::new(),
-            compositor: Compositor::default(),
+            compositor: Box::new(Compositor::default()),
             current_frame_id: None,
             total_frames_decoded: 0,
             pending_output_reset: None,
             deferred_avc420: None,
             backlog: VecDeque::new(),
         }
+    }
+
+    /// Applies surface commands to `backend` instead of the default CPU [`Compositor`].
+    #[must_use]
+    pub fn with_surface_backend(mut self, backend: Box<dyn SurfaceBackend>) -> Self {
+        self.compositor = backend;
+        self
     }
 
     // ========================================================================
@@ -1059,7 +1066,7 @@ impl GraphicsPipelineClient {
                     height,
                 };
                 self.compositor
-                    .apply_bitmap(update.surface_id, &update.destination_rectangle, &update.data);
+                    .write_rgba(update.surface_id, &update.destination_rectangle, &update.data);
                 self.handler.on_bitmap_updated(&update);
             };
 
@@ -1224,11 +1231,16 @@ impl GraphicsPipelineClient {
                 width,
                 height,
             };
-            compositor.apply_bitmap(update.surface_id, &update.destination_rectangle, &update.data);
+            compositor.write_rgba(update.surface_id, &update.destination_rectangle, &update.data);
             handler.on_bitmap_updated(&update);
         };
 
-        if regions.is_empty() {
+        // An external frame's pixels stay with the backend: its clipped regions go to
+        // `write_frame` together, and `on_bitmap_updated` is not called, having no pixels to show.
+        let external = frame.external_handle().is_some();
+        let mut external_regions = Vec::new();
+
+        if regions.is_empty() && !external {
             // No region metadata: fall back to the single bounding-box update,
             // copying from the frame origin. This matches the pre-#2042 behavior
             // for streams that legitimately omit regionRects.
@@ -1236,6 +1248,13 @@ impl GraphicsPipelineClient {
             emit_avc420(dest_rect.clone(), cropped_data);
             return Ok(());
         }
+        // Without region metadata an external frame paints the destination rectangle, from
+        // the same position in the frame.
+        let regions = if regions.is_empty() {
+            core::slice::from_ref(dest_rect)
+        } else {
+            regions
+        };
 
         for region in regions {
             // Clip the region to the surface and the decoded frame so a
@@ -1273,11 +1292,18 @@ impl GraphicsPipelineClient {
                 right: clip_right,
                 bottom: clip_bottom,
             };
+            if external {
+                external_regions.push(clipped);
+                continue;
+            }
 
             // Copy pixels (x, y) -> (x, y): the source in the decoded frame is the
             // region's own top-left, not the frame origin.
             let data = copy_frame_region(frame.data(), frame.width(), &clipped);
             emit_avc420(clipped, data);
+        }
+        if external {
+            compositor.write_frame(surface_id, &external_regions, frame);
         }
         Ok(())
     }
@@ -1310,7 +1336,7 @@ impl GraphicsPipelineClient {
             height: dest_height,
         };
 
-        self.compositor.apply_bitmap(surface_id, dest_rect, &update.data);
+        self.compositor.write_rgba(surface_id, dest_rect, &update.data);
         self.handler.on_bitmap_updated(&update);
         Ok(())
     }
@@ -1356,7 +1382,7 @@ impl GraphicsPipelineClient {
             height: dest_height,
         };
 
-        self.compositor.apply_bitmap(surface_id, dest_rect, &update.data);
+        self.compositor.write_rgba(surface_id, dest_rect, &update.data);
         self.handler.on_bitmap_updated(&update);
         Ok(())
     }
@@ -1382,7 +1408,7 @@ impl GraphicsPipelineClient {
         };
 
         self.compositor
-            .apply_bitmap(update.surface_id, &update.destination_rectangle, &update.data);
+            .write_rgba(update.surface_id, &update.destination_rectangle, &update.data);
         self.handler.on_bitmap_updated(&update);
     }
 
@@ -3253,6 +3279,186 @@ mod tests {
             replies.len(),
             1,
             "nothing to wait for: the frame is acknowledged at once"
+        );
+    }
+
+    /// Records the surface commands it receives, by name and key arguments.
+    #[derive(Clone, Default)]
+    struct RecordingBackend {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingBackend {
+        fn record(&self, call: String) {
+            self.calls.lock().expect("calls lock").push(call);
+        }
+    }
+
+    impl crate::compositor::SurfaceBackend for RecordingBackend {
+        fn reset(&mut self, width: u32, height: u32) {
+            self.record(format!("reset {width}x{height}"));
+        }
+        fn create_surface(&mut self, id: u16, width: u16, height: u16) {
+            self.record(format!("create_surface {id} {width}x{height}"));
+        }
+        fn delete_surface(&mut self, id: u16) {
+            self.record(format!("delete_surface {id}"));
+        }
+        fn map_surface(&mut self, id: u16, origin_x: u32, origin_y: u32) {
+            self.record(format!("map_surface {id} {origin_x},{origin_y}"));
+        }
+        fn map_surface_scaled(&mut self, id: u16, origin_x: u32, origin_y: u32, target_width: u32, target_height: u32) {
+            self.record(format!(
+                "map_surface_scaled {id} {origin_x},{origin_y} {target_width}x{target_height}"
+            ));
+        }
+        fn write_rgba(&mut self, surface_id: u16, dest: &ExclusiveRectangle, _rgba: &[u8]) {
+            self.record(format!(
+                "write_rgba {surface_id} ({},{},{},{})",
+                dest.left, dest.top, dest.right, dest.bottom
+            ));
+        }
+        fn write_frame(&mut self, surface_id: u16, regions: &[ExclusiveRectangle], frame: &DecodedFrame) {
+            let regions: Vec<_> = regions.iter().map(|r| (r.left, r.top, r.right, r.bottom)).collect();
+            self.record(format!(
+                "write_frame {surface_id} {regions:?} {:?}",
+                frame.external_handle()
+            ));
+        }
+        fn solid_fill(&mut self, surface_id: u16, _color: &crate::pdu::Color, rects: &[ExclusiveRectangle]) {
+            self.record(format!("solid_fill {surface_id} {}", rects.len()));
+        }
+        fn surface_to_surface(
+            &mut self,
+            src: u16,
+            dst: u16,
+            _src_rect: &ExclusiveRectangle,
+            dst_points: &[crate::pdu::Point],
+        ) {
+            self.record(format!("surface_to_surface {src}->{dst} {}", dst_points.len()));
+        }
+        fn surface_to_cache(&mut self, surface_id: u16, cache_slot: u16, _src_rect: &ExclusiveRectangle) {
+            self.record(format!("surface_to_cache {surface_id}->{cache_slot}"));
+        }
+        fn cache_to_surface(&mut self, cache_slot: u16, surface_id: u16, dst_points: &[crate::pdu::Point]) {
+            self.record(format!(
+                "cache_to_surface {cache_slot}->{surface_id} {}",
+                dst_points.len()
+            ));
+        }
+        fn evict_cache_entry(&mut self, cache_slot: u16) {
+            self.record(format!("evict_cache_entry {cache_slot}"));
+        }
+        fn end_frame(&mut self) {
+            self.record("end_frame".to_owned());
+        }
+        fn drain_output(&mut self) -> Vec<OutputUpdate> {
+            Vec::new()
+        }
+    }
+
+    /// A deferring-decoder client drawing into a [`RecordingBackend`], set up like
+    /// [`deferred_client`], with the setup calls cleared.
+    fn recording_client() -> (GraphicsPipelineClient, Arc<Mutex<DeferredState>>, RecordingBackend) {
+        let state = Arc::new(Mutex::new(DeferredState::default()));
+        let backend = RecordingBackend::default();
+        let mut client = GraphicsPipelineClient::new(
+            Box::new(TestHandler),
+            Some(Box::new(DeferredDecoder {
+                state: Arc::clone(&state),
+            })),
+        )
+        .with_surface_backend(Box::new(backend.clone()));
+        for pdu in [
+            GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+                width: u32::from(DEFERRED_SIZE),
+                height: u32::from(DEFERRED_SIZE),
+                monitors: vec![],
+            }),
+            GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id: DEFERRED_SURFACE,
+                width: DEFERRED_SIZE,
+                height: DEFERRED_SIZE,
+                pixel_format: PixelFormat::XRgb,
+            }),
+            GfxPdu::MapSurfaceToOutput(crate::pdu::MapSurfaceToOutputPdu {
+                surface_id: DEFERRED_SURFACE,
+                output_origin_x: 0,
+                output_origin_y: 0,
+            }),
+        ] {
+            client.dispatch_pdu(pdu).expect("set up surface");
+        }
+        backend.calls.lock().expect("calls lock").clear();
+        (client, state, backend)
+    }
+
+    #[test]
+    fn external_avc420_frame_goes_to_the_backend_with_its_regions() {
+        let (mut client, state, backend) = recording_client();
+        let region = deferred_rect(0, 0, 16, 16);
+        for pdu in [
+            deferred_start_frame(1),
+            avc420_update(&region),
+            GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: 1 }),
+        ] {
+            client.dispatch_pdu(pdu).expect("dispatch");
+        }
+
+        state.lock().expect("state lock").ready = Some(Ok(DecodedFrame::external(
+            7,
+            u32::from(DEFERRED_SIZE),
+            u32::from(DEFERRED_SIZE),
+        )));
+        client.resume().expect("resume");
+
+        assert_eq!(
+            *backend.calls.lock().expect("calls lock"),
+            vec![
+                "write_frame 1 [(0, 0, 16, 16)] Some(7)".to_owned(),
+                "end_frame".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn commands_reach_a_custom_backend_in_order() {
+        let (mut client, _state, backend) = recording_client();
+        let rect = deferred_rect(0, 0, 8, 8);
+        for pdu in [
+            deferred_start_frame(1),
+            red_fill(&rect),
+            GfxPdu::SurfaceToCache(crate::pdu::SurfaceToCachePdu {
+                surface_id: DEFERRED_SURFACE,
+                cache_key: 1,
+                cache_slot: 3,
+                source_rectangle: rect.clone(),
+            }),
+            GfxPdu::CacheToSurface(crate::pdu::CacheToSurfacePdu {
+                cache_slot: 3,
+                surface_id: DEFERRED_SURFACE,
+                destination_points: vec![crate::pdu::Point { x: 16, y: 16 }],
+            }),
+            GfxPdu::SurfaceToSurface(crate::pdu::SurfaceToSurfacePdu {
+                source_surface_id: DEFERRED_SURFACE,
+                destination_surface_id: DEFERRED_SURFACE,
+                source_rectangle: rect,
+                destination_points: vec![crate::pdu::Point { x: 32, y: 32 }],
+            }),
+            GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: 1 }),
+        ] {
+            client.dispatch_pdu(pdu).expect("dispatch");
+        }
+
+        assert_eq!(
+            *backend.calls.lock().expect("calls lock"),
+            vec![
+                "solid_fill 1 1".to_owned(),
+                "surface_to_cache 1->3".to_owned(),
+                "cache_to_surface 3->1 1".to_owned(),
+                "surface_to_surface 1->1 1".to_owned(),
+                "end_frame".to_owned(),
+            ]
         );
     }
 }

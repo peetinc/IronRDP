@@ -19,8 +19,9 @@
 use std::collections::BTreeMap;
 
 use ironrdp_pdu::geometry::ExclusiveRectangle;
-use tracing::debug;
+use tracing::{debug, warn};
 
+use crate::decode::DecodedFrame;
 use crate::pdu::{Color, Point};
 
 const BYTES_PER_PIXEL: usize = 4;
@@ -121,6 +122,105 @@ struct CachedTile {
     height: u16,
     /// RGBA8888, `width * height * 4` bytes.
     data: Vec<u8>,
+}
+
+/// Where the graphics pipeline applies surface commands.
+///
+/// [`Compositor`] is the default: CPU surfaces whose changed output regions are drained as
+/// pixels. A backend may instead keep surfaces elsewhere (a browser's GPU, for example) and
+/// present them itself, returning nothing from [`drain_output`](Self::drain_output).
+///
+/// [`GraphicsPipelineClient`](crate::client::GraphicsPipelineClient) validates every command
+/// (surface and output limits, rectangle counts) before calling the backend.
+pub trait SurfaceBackend: Send {
+    /// Starts a new graphics output of `width` by `height`, discarding every surface.
+    fn reset(&mut self, width: u32, height: u32);
+    fn create_surface(&mut self, id: u16, width: u16, height: u16);
+    fn delete_surface(&mut self, id: u16);
+    fn map_surface(&mut self, id: u16, origin_x: u32, origin_y: u32);
+    fn map_surface_scaled(&mut self, id: u16, origin_x: u32, origin_y: u32, target_width: u32, target_height: u32);
+    /// Writes tightly packed RGBA8888 pixels into `dest`.
+    fn write_rgba(&mut self, surface_id: u16, dest: &ExclusiveRectangle, rgba: &[u8]);
+    /// Writes the `regions` of a decoded frame, each from the same position in the frame.
+    fn write_frame(&mut self, surface_id: u16, regions: &[ExclusiveRectangle], frame: &DecodedFrame);
+    fn solid_fill(&mut self, surface_id: u16, color: &Color, rects: &[ExclusiveRectangle]);
+    fn surface_to_surface(&mut self, src_id: u16, dst_id: u16, src_rect: &ExclusiveRectangle, dst_points: &[Point]);
+    fn surface_to_cache(&mut self, surface_id: u16, cache_slot: u16, src_rect: &ExclusiveRectangle);
+    fn cache_to_surface(&mut self, cache_slot: u16, surface_id: u16, dst_points: &[Point]);
+    fn evict_cache_entry(&mut self, cache_slot: u16);
+    /// Commits the frame built since the last call.
+    fn end_frame(&mut self);
+    /// The output regions that changed in committed frames, as pixels, emptied by each call.
+    fn drain_output(&mut self) -> Vec<OutputUpdate>;
+}
+
+impl SurfaceBackend for Compositor {
+    fn reset(&mut self, width: u32, height: u32) {
+        Compositor::reset(self, width, height);
+    }
+
+    fn create_surface(&mut self, id: u16, width: u16, height: u16) {
+        Compositor::create_surface(self, id, width, height);
+    }
+
+    fn delete_surface(&mut self, id: u16) {
+        Compositor::delete_surface(self, id);
+    }
+
+    fn map_surface(&mut self, id: u16, origin_x: u32, origin_y: u32) {
+        Compositor::map_surface(self, id, origin_x, origin_y);
+    }
+
+    fn map_surface_scaled(&mut self, id: u16, origin_x: u32, origin_y: u32, target_width: u32, target_height: u32) {
+        Compositor::map_surface_scaled(self, id, origin_x, origin_y, target_width, target_height);
+    }
+
+    fn write_rgba(&mut self, surface_id: u16, dest: &ExclusiveRectangle, rgba: &[u8]) {
+        self.apply_bitmap(surface_id, dest, rgba);
+    }
+
+    fn write_frame(&mut self, surface_id: u16, regions: &[ExclusiveRectangle], frame: &DecodedFrame) {
+        if frame.external_handle().is_some() {
+            warn!("Ignoring an external decoded frame: the CPU compositor has no access to its pixels");
+            return;
+        }
+        let Ok(frame_width) = u16::try_from(frame.width()) else {
+            return;
+        };
+        for region in regions {
+            let (width, height) = (region.right - region.left, region.bottom - region.top);
+            let pixels = copy_region(frame.data(), frame_width, region.left, region.top, width, height);
+            self.apply_bitmap(surface_id, region, &pixels);
+        }
+    }
+
+    fn solid_fill(&mut self, surface_id: u16, color: &Color, rects: &[ExclusiveRectangle]) {
+        Compositor::solid_fill(self, surface_id, color, rects);
+    }
+
+    fn surface_to_surface(&mut self, src_id: u16, dst_id: u16, src_rect: &ExclusiveRectangle, dst_points: &[Point]) {
+        Compositor::surface_to_surface(self, src_id, dst_id, src_rect, dst_points);
+    }
+
+    fn surface_to_cache(&mut self, surface_id: u16, cache_slot: u16, src_rect: &ExclusiveRectangle) {
+        Compositor::surface_to_cache(self, surface_id, cache_slot, src_rect);
+    }
+
+    fn cache_to_surface(&mut self, cache_slot: u16, surface_id: u16, dst_points: &[Point]) {
+        Compositor::cache_to_surface(self, cache_slot, surface_id, dst_points);
+    }
+
+    fn evict_cache_entry(&mut self, cache_slot: u16) {
+        Compositor::evict_cache_entry(self, cache_slot);
+    }
+
+    fn end_frame(&mut self) {
+        Compositor::end_frame(self);
+    }
+
+    fn drain_output(&mut self) -> Vec<OutputUpdate> {
+        Compositor::drain_output(self)
+    }
 }
 
 /// Client-side EGFX surface compositor.
