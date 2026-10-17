@@ -3,7 +3,8 @@
 //! Reads a capture file of length-prefixed messages (`u32` little-endian length, then the raw
 //! ZGFX-compressed EGFX message) and prints, per AVC codec, the QP and quality values the
 //! server put in each `RFX_AVC420_METABLOCK`, plus H.264 bytes and region area. A high QP
-//! means the server's encoder is compressing hard.
+//! means the server's encoder is compressing hard. Other codecs are counted too, with
+//! their payload bytes in the `h264_kb` column, to show the codec mix.
 //!
 //! Usage: egfx_qp <capture.bin>
 
@@ -45,6 +46,8 @@ fn main() {
     let mut buffer = Vec::new();
     let mut stats: BTreeMap<String, Stats> = BTreeMap::new();
     let mut frames = 0u64;
+    // Per 100 frames: (AVC, progressive, ClearCodec) payload bytes, to show when the mix changes.
+    let mut timeline: Vec<[u64; 3]> = Vec::new();
     let mut rest = capture.as_slice();
 
     while let Some((length, after)) = rest.split_first_chunk::<4>() {
@@ -59,8 +62,23 @@ fn main() {
         let mut cursor = ReadCursor::new(&buffer);
         while !cursor.is_empty() {
             let Ok(pdu) = decode_cursor::<GfxPdu>(&mut cursor) else { break };
+            let bucket = usize::try_from(frames / 100).expect("bucket");
+            if timeline.len() <= bucket {
+                timeline.resize(bucket + 1, [0; 3]);
+            }
+            let slot = &mut timeline[bucket];
+            match &pdu {
+                GfxPdu::WireToSurface1(pdu) => match pdu.codec_id {
+                    Codec1Type::Avc420 | Codec1Type::Avc444 | Codec1Type::Avc444v2 => slot[0] += pdu.bitmap_data.len() as u64,
+                    Codec1Type::ClearCodec => slot[2] += pdu.bitmap_data.len() as u64,
+                    _ => {}
+                },
+                GfxPdu::WireToSurface2(pdu) => slot[1] += pdu.bitmap_data.len() as u64,
+                _ => {}
+            }
             match pdu {
                 GfxPdu::EndFrame(_) => frames += 1,
+                GfxPdu::ResetGraphics(pdu) => println!("frame {frames}: ResetGraphics {}x{}", pdu.width, pdu.height),
                 GfxPdu::WireToSurface1(pdu) => {
                     let mut data = ReadCursor::new(&pdu.bitmap_data);
                     match pdu.codec_id {
@@ -85,12 +103,16 @@ fn main() {
                             }
                         }
                         other => {
-                            *stats.entry(format!("{other:?}")).or_default() = Stats {
-                                updates: stats.get(&format!("{other:?}")).map_or(0, |s| s.updates) + 1,
-                                ..Stats::default()
-                            };
+                            let entry = stats.entry(format!("{other:?}")).or_default();
+                            entry.updates += 1;
+                            entry.h264_bytes += u64::try_from(pdu.bitmap_data.len()).unwrap_or(0);
                         }
                     }
+                }
+                GfxPdu::WireToSurface2(pdu) => {
+                    let entry = stats.entry(format!("{:?} (WireToSurface2)", pdu.codec_id)).or_default();
+                    entry.updates += 1;
+                    entry.h264_bytes += u64::try_from(pdu.bitmap_data.len()).unwrap_or(0);
                 }
                 _ => {}
             }
@@ -98,6 +120,15 @@ fn main() {
     }
 
     println!("frames: {frames}");
+    for (bucket, [avc, progressive, clear]) in timeline.iter().enumerate() {
+        println!(
+            "frames {:>5}..: avc {:>6} KiB  progressive {:>6} KiB  clearcodec {:>6} KiB",
+            bucket * 100,
+            avc / 1024,
+            progressive / 1024,
+            clear / 1024
+        );
+    }
     for (name, s) in &stats {
         let qp_total: u64 = s.qp.values().sum();
         let qp_mean = if qp_total == 0 {
