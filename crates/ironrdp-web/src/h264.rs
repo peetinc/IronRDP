@@ -152,7 +152,7 @@ impl WebCodecsH264Decoder {
             next.set(slot.wrapping_add(1));
             slot
         });
-        SLOTS.with(|slots| slots.borrow_mut().insert(slot, Slot::new(Rc::new(wake), output)));
+        SLOTS.with(|slots| slots.borrow_mut().insert(slot, Slot::new(slot, Rc::new(wake), output)));
         Self { slot }
     }
 
@@ -167,6 +167,7 @@ impl Drop for WebCodecsH264Decoder {
         if let Some(mut slot) = slot {
             slot.close();
         }
+        crate::gpu::release_frames(self.slot);
     }
 }
 
@@ -220,6 +221,8 @@ struct Shared {
     finished: Option<DecoderResult<DecodedFrame>>,
     readback: Option<Readback>,
     output: FrameOutput,
+    /// The decoder's slot, which owns the frames it holds for the GPU backend.
+    owner: u32,
     submitted_at: f64,
     /// Per decoded chunk, oldest first: whether its picture is shown (`false` for AVC444
     /// chroma views). WebCodecs outputs pictures in decode order.
@@ -243,7 +246,7 @@ struct Readback {
 }
 
 impl Slot {
-    fn new(wake: Rc<dyn Fn()>, output: FrameOutput) -> Self {
+    fn new(owner: u32, wake: Rc<dyn Fn()>, output: FrameOutput) -> Self {
         Self {
             decoder: None,
             shared: Rc::new(RefCell::new(Shared {
@@ -251,6 +254,7 @@ impl Slot {
                 finished: None,
                 readback: None,
                 output,
+                owner,
                 submitted_at: 0.0,
                 shown: VecDeque::new(),
             })),
@@ -360,7 +364,7 @@ impl ActiveDecoder {
                     }
                     if shared.output == FrameOutput::Gpu {
                         let (width, height) = (frame.display_width(), frame.display_height());
-                        let handle = crate::gpu::hold_frame(frame);
+                        let handle = crate::gpu::hold_frame(shared.owner, frame);
                         shared.finished = Some(Ok(DecodedFrame::external(handle, width, height)));
                         drop(shared);
                         wake();

@@ -8,10 +8,10 @@ use std::collections::BTreeMap;
 
 use crate::h264::VideoFrame;
 
-/// Items by handle, each handed out once.
+/// Items by handle, each handed out once, and by the owner that inserted them.
 struct Store<T> {
     next: u64,
-    items: BTreeMap<u64, T>,
+    items: BTreeMap<u64, (u32, T)>,
 }
 
 impl<T> Default for Store<T> {
@@ -24,15 +24,28 @@ impl<T> Default for Store<T> {
 }
 
 impl<T> Store<T> {
-    fn insert(&mut self, item: T) -> u64 {
+    /// Holds `item` for `owner`, handing back the owner's items still held.
+    fn insert(&mut self, owner: u32, item: T) -> (u64, Vec<T>) {
+        let stale = self.release(owner);
         let handle = self.next;
         self.next = self.next.wrapping_add(1);
-        self.items.insert(handle, item);
-        handle
+        self.items.insert(handle, (owner, item));
+        (handle, stale)
     }
 
     fn take(&mut self, handle: u64) -> Option<T> {
-        self.items.remove(&handle)
+        self.items.remove(&handle).map(|(_, item)| item)
+    }
+
+    /// Every item `owner` still holds.
+    fn release(&mut self, owner: u32) -> Vec<T> {
+        let handles: Vec<u64> = self
+            .items
+            .iter()
+            .filter(|(_, (item_owner, _))| *item_owner == owner)
+            .map(|(handle, _)| *handle)
+            .collect();
+        handles.into_iter().filter_map(|handle| self.take(handle)).collect()
     }
 }
 
@@ -40,24 +53,31 @@ thread_local! {
     static FRAMES: RefCell<Store<VideoFrame>> = RefCell::new(Store::default());
 }
 
-/// Holds `frame` until the backend draws it, returning its handle.
+/// Holds `frame`, from the decoder `owner`, until the backend draws it, returning its handle.
 ///
-/// The pipeline has one H.264 frame in flight, so any frame still held is one the pipeline
-/// dropped (a failed or closed decode). It is closed here: an unclosed `VideoFrame` holds a
-/// decoder buffer, and enough of them stall the decoder.
-pub(crate) fn insert(frame: VideoFrame) -> u64 {
-    FRAMES.with(|frames| {
-        let mut frames = frames.borrow_mut();
-        for (_, stale) in core::mem::take(&mut frames.items) {
-            stale.close();
-        }
-        frames.insert(frame)
-    })
+/// Each decoder has one H.264 frame in flight, so any frame it still holds is one its
+/// pipeline dropped (a failed or closed decode). It is closed here: an unclosed `VideoFrame`
+/// holds a decoder buffer, and enough of them stall the decoder. Other decoders' frames, from
+/// other sessions on the page, are left alone.
+pub(crate) fn insert(owner: u32, frame: VideoFrame) -> u64 {
+    let (handle, stale) = FRAMES.with(|frames| frames.borrow_mut().insert(owner, frame));
+    for frame in stale {
+        frame.close();
+    }
+    handle
 }
 
 /// The frame for `handle`, once.
 pub(crate) fn take(handle: u64) -> Option<VideoFrame> {
     FRAMES.with(|frames| frames.borrow_mut().take(handle))
+}
+
+/// Closes every frame the decoder `owner` still holds; called as the decoder goes away.
+pub(crate) fn release(owner: u32) {
+    let stale = FRAMES.with(|frames| frames.borrow_mut().release(owner));
+    for frame in stale {
+        frame.close();
+    }
 }
 
 #[cfg(test)]
@@ -67,12 +87,37 @@ mod tests {
     #[test]
     fn store_hands_out_each_item_once() {
         let mut store = Store::default();
-        let first = store.insert("a");
-        let second = store.insert("b");
+        let (first, _) = store.insert(1, "a");
+        let (second, _) = store.insert(2, "b");
 
         assert_ne!(first, second);
         assert_eq!(store.take(second), Some("b"));
         assert_eq!(store.take(second), None);
         assert_eq!(store.take(first), Some("a"));
+    }
+
+    #[test]
+    fn insert_hands_back_only_the_same_owners_stale_items() {
+        let mut store = Store::default();
+        let (a_first, _) = store.insert(1, "a1");
+        let (b_first, _) = store.insert(2, "b1");
+
+        let (a_second, stale) = store.insert(1, "a2");
+
+        assert_eq!(stale, vec!["a1"]);
+        assert_eq!(store.take(a_first), None);
+        assert_eq!(store.take(b_first), Some("b1"));
+        assert_eq!(store.take(a_second), Some("a2"));
+    }
+
+    #[test]
+    fn release_hands_back_every_item_of_an_owner() {
+        let mut store = Store::default();
+        let (a, _) = store.insert(1, "a");
+        let (b, _) = store.insert(2, "b");
+
+        assert_eq!(store.release(1), vec!["a"]);
+        assert_eq!(store.take(a), None);
+        assert_eq!(store.take(b), Some("b"));
     }
 }

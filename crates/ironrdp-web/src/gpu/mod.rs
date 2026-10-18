@@ -24,7 +24,7 @@ use tracing::warn;
 use wasm_bindgen::prelude::*;
 use web_sys::{HtmlCanvasElement, WebGl2RenderingContext as Gl, WebGlFramebuffer, WebGlTexture};
 
-pub(crate) use self::frames::insert as hold_frame;
+pub(crate) use self::frames::{insert as hold_frame, release as release_frames};
 use self::geometry::{BlitRect, clip, clip_copy, exceeds_texture_limit, present_blit};
 use crate::h264::VideoFrame;
 
