@@ -141,8 +141,20 @@ pub trait SurfaceBackend: Send {
     fn map_surface_scaled(&mut self, id: u16, origin_x: u32, origin_y: u32, target_width: u32, target_height: u32);
     /// Writes tightly packed RGBA8888 pixels into `dest`.
     fn write_rgba(&mut self, surface_id: u16, dest: &ExclusiveRectangle, rgba: &[u8]);
-    /// Writes the `regions` of a decoded frame, each from the same position in the frame.
-    fn write_frame(&mut self, surface_id: u16, regions: &[ExclusiveRectangle], frame: &DecodedFrame);
+    /// Writes the `regions` of an external decoded frame, whose pixels the backend
+    /// holds (see [`DecodedFrame::external`]). CPU frames arrive through
+    /// [`write_rgba`](Self::write_rgba) instead.
+    ///
+    /// The frame's top-left pixel sits at `origin` on the surface, so surface pixel
+    /// `(x, y)` comes from frame pixel `(x - origin.0, y - origin.1)`. Every region
+    /// lies within the surface and the placed frame.
+    fn write_frame(
+        &mut self,
+        surface_id: u16,
+        origin: (u16, u16),
+        regions: &[ExclusiveRectangle],
+        frame: &DecodedFrame,
+    );
     fn solid_fill(&mut self, surface_id: u16, color: &Color, rects: &[ExclusiveRectangle]);
     fn surface_to_surface(&mut self, src_id: u16, dst_id: u16, src_rect: &ExclusiveRectangle, dst_points: &[Point]);
     fn surface_to_cache(&mut self, surface_id: u16, cache_slot: u16, src_rect: &ExclusiveRectangle);
@@ -252,19 +264,14 @@ impl SurfaceBackend for Compositor {
         self.apply_bitmap(surface_id, dest, rgba);
     }
 
-    fn write_frame(&mut self, surface_id: u16, regions: &[ExclusiveRectangle], frame: &DecodedFrame) {
-        if frame.external_handle().is_some() {
-            warn!("Ignoring an external decoded frame: the CPU compositor has no access to its pixels");
-            return;
-        }
-        let Ok(frame_width) = u16::try_from(frame.width()) else {
-            return;
-        };
-        for region in regions {
-            let (width, height) = (region.right - region.left, region.bottom - region.top);
-            let pixels = copy_region(frame.data(), frame_width, region.left, region.top, width, height);
-            self.apply_bitmap(surface_id, region, &pixels);
-        }
+    fn write_frame(
+        &mut self,
+        _surface_id: u16,
+        _origin: (u16, u16),
+        _regions: &[ExclusiveRectangle],
+        _frame: &DecodedFrame,
+    ) {
+        warn!("Ignoring an external decoded frame: the CPU compositor has no access to its pixels");
     }
 
     /// Fill each rectangle of a surface with a solid, opaque color (`SolidFill`).

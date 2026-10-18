@@ -1015,9 +1015,15 @@ impl GraphicsPipelineClient {
                 &pdu.bitmap_data,
             )
             .map_err(|error| {
-                warn!(?error, surface_id = pdu.surface_id, codec_context_id = pdu.codec_context_id,
-                      surface_width, surface_height, bitmap_len = pdu.bitmap_data.len(),
-                      "rfx progressive decode failed");
+                warn!(
+                    ?error,
+                    surface_id = pdu.surface_id,
+                    codec_context_id = pdu.codec_context_id,
+                    surface_width,
+                    surface_height,
+                    bitmap_len = pdu.bitmap_data.len(),
+                    "rfx progressive decode failed"
+                );
                 // `PduErrorKind::Other` needs a `&'static str` and
                 // `ProgressiveDecodeError` implements only `Display`, so the cause
                 // cannot be attached as a source. Naming the variant keeps it in the
@@ -1214,9 +1220,65 @@ impl GraphicsPipelineClient {
             .map(|s| (s.width, s.height))
             .unwrap_or((dest_rect.right, dest_rect.bottom));
 
+        // MS-RDPEGFX 2.2.4.4: without regionRects the update is the destination
+        // rectangle, filled from the frame origin; with them, each region's pixels
+        // come from its own position. Either way the frame is placed at `origin` on
+        // the surface and every region is clipped to the surface and the placed frame,
+        // so a malformed or over-large rect cannot read out of bounds or paint outside
+        // the surface. Both the CPU and the external path draw from this one placement.
+        let (origin, regions) = if regions.is_empty() {
+            ((dest_rect.left, dest_rect.top), core::slice::from_ref(dest_rect))
+        } else {
+            ((0, 0), regions)
+        };
+        let frame_right = origin
+            .0
+            .saturating_add(u16::try_from(frame.width()).unwrap_or(u16::MAX));
+        let frame_bottom = origin
+            .1
+            .saturating_add(u16::try_from(frame.height()).unwrap_or(u16::MAX));
+        let mut clipped_regions = Vec::with_capacity(regions.len());
+        for region in regions {
+            let clip_right = region.right.min(surface_bounds.0).min(frame_right);
+            let clip_bottom = region.bottom.min(surface_bounds.1).min(frame_bottom);
+            if region.left >= clip_right || region.top >= clip_bottom {
+                // A region that clips away to nothing is dropped here. Log it:
+                // a silent skip would leave a permanently stale screen area with
+                // no trace if a server's coordinate convention ever disagreed
+                // with the surface/frame bounds -- the same undebuggable class of
+                // rendering defect this change fixes.
+                warn!(
+                    surface_id,
+                    region_left = region.left,
+                    region_top = region.top,
+                    region_right = region.right,
+                    region_bottom = region.bottom,
+                    clip_right,
+                    clip_bottom,
+                    surface_width = surface_bounds.0,
+                    surface_height = surface_bounds.1,
+                    frame_right,
+                    frame_bottom,
+                    "AVC420 regionRect empty after clipping to surface/frame bounds -- skipped"
+                );
+                continue;
+            }
+            clipped_regions.push(ExclusiveRectangle {
+                left: region.left,
+                top: region.top,
+                right: clip_right,
+                bottom: clip_bottom,
+            });
+        }
+
+        // An external frame's pixels stay with the backend, so `on_bitmap_updated`
+        // is not called, having no pixels to show.
+        if frame.external_handle().is_some() {
+            self.compositor.write_frame(surface_id, origin, &clipped_regions, frame);
+            return Ok(());
+        }
         // Build and emit one AVC420 surface update from a destination rectangle
-        // and its pixel data. Shared by the no-regionRects fallback and the
-        // per-region loop so the BitmapUpdate shape lives in one place (mirrors
+        // and its pixel data. Keeps the BitmapUpdate shape in one place (mirrors
         // the `emit_update` closure on the uncompressed path).
         let compositor = &mut self.compositor;
         let handler = &mut self.handler;
@@ -1235,75 +1297,15 @@ impl GraphicsPipelineClient {
             handler.on_bitmap_updated(&update);
         };
 
-        // An external frame's pixels stay with the backend: its clipped regions go to
-        // `write_frame` together, and `on_bitmap_updated` is not called, having no pixels to show.
-        let external = frame.external_handle().is_some();
-        let mut external_regions = Vec::new();
-
-        if regions.is_empty() && !external {
-            // No region metadata: fall back to the single bounding-box update,
-            // copying from the frame origin. This matches the pre-#2042 behavior
-            // for streams that legitimately omit regionRects.
-            let cropped_data = crop_decoded_frame(frame.data(), frame.width(), frame.height(), dest_width, dest_height);
-            emit_avc420(dest_rect.clone(), cropped_data);
-            return Ok(());
-        }
-        // Without region metadata an external frame paints the destination rectangle, from
-        // the same position in the frame.
-        let regions = if regions.is_empty() {
-            core::slice::from_ref(dest_rect)
-        } else {
-            regions
-        };
-
-        for region in regions {
-            // Clip the region to the surface and the decoded frame so a
-            // malformed or over-large rect cannot read out of bounds or paint
-            // outside the surface.
-            let frame_w = u16::try_from(frame.width()).unwrap_or(u16::MAX);
-            let frame_h = u16::try_from(frame.height()).unwrap_or(u16::MAX);
-            let clip_right = region.right.min(surface_bounds.0).min(frame_w);
-            let clip_bottom = region.bottom.min(surface_bounds.1).min(frame_h);
-            if region.left >= clip_right || region.top >= clip_bottom {
-                // A region that clips away to nothing is dropped here. Log it:
-                // a silent skip would leave a permanently stale screen area with
-                // no trace if a server's coordinate convention ever disagreed
-                // with the surface/frame bounds -- the same undebuggable class of
-                // rendering defect this change fixes.
-                warn!(
-                    surface_id,
-                    region_left = region.left,
-                    region_top = region.top,
-                    region_right = region.right,
-                    region_bottom = region.bottom,
-                    clip_right,
-                    clip_bottom,
-                    surface_width = surface_bounds.0,
-                    surface_height = surface_bounds.1,
-                    frame_width = frame_w,
-                    frame_height = frame_h,
-                    "AVC420 regionRect empty after clipping to surface/frame bounds -- skipped"
-                );
-                continue;
-            }
-            let clipped = ExclusiveRectangle {
-                left: region.left,
-                top: region.top,
-                right: clip_right,
-                bottom: clip_bottom,
+        for clipped in clipped_regions {
+            let source = ExclusiveRectangle {
+                left: clipped.left - origin.0,
+                top: clipped.top - origin.1,
+                right: clipped.right - origin.0,
+                bottom: clipped.bottom - origin.1,
             };
-            if external {
-                external_regions.push(clipped);
-                continue;
-            }
-
-            // Copy pixels (x, y) -> (x, y): the source in the decoded frame is the
-            // region's own top-left, not the frame origin.
-            let data = copy_frame_region(frame.data(), frame.width(), &clipped);
+            let data = copy_frame_region(frame.data(), frame.width(), &source);
             emit_avc420(clipped, data);
-        }
-        if external {
-            compositor.write_frame(surface_id, &external_regions, frame);
         }
         Ok(())
     }
@@ -3318,10 +3320,18 @@ mod tests {
                 dest.left, dest.top, dest.right, dest.bottom
             ));
         }
-        fn write_frame(&mut self, surface_id: u16, regions: &[ExclusiveRectangle], frame: &DecodedFrame) {
+        fn write_frame(
+            &mut self,
+            surface_id: u16,
+            origin: (u16, u16),
+            regions: &[ExclusiveRectangle],
+            frame: &DecodedFrame,
+        ) {
             let regions: Vec<_> = regions.iter().map(|r| (r.left, r.top, r.right, r.bottom)).collect();
             self.record(format!(
-                "write_frame {surface_id} {regions:?} {:?}",
+                "write_frame {surface_id} at {},{} {regions:?} {:?}",
+                origin.0,
+                origin.1,
                 frame.external_handle()
             ));
         }
@@ -3415,7 +3425,37 @@ mod tests {
         assert_eq!(
             *backend.calls.lock().expect("calls lock"),
             vec![
-                "write_frame 1 [(0, 0, 16, 16)] Some(7)".to_owned(),
+                "write_frame 1 at 0,0 [(0, 0, 16, 16)] Some(7)".to_owned(),
+                "end_frame".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn external_avc420_frame_without_regions_fills_the_destination_from_the_frame_origin() {
+        let (mut client, state, backend) = recording_client();
+        for pdu in [
+            deferred_start_frame(1),
+            GfxPdu::WireToSurface1(crate::pdu::WireToSurface1Pdu {
+                surface_id: DEFERRED_SURFACE,
+                codec_id: Codec1Type::Avc420,
+                pixel_format: PixelFormat::XRgb,
+                destination_rectangle: deferred_rect(32, 0, 64, 32),
+                bitmap_data: encode_avc420_wire(&[]),
+            }),
+            GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: 1 }),
+        ] {
+            client.dispatch_pdu(pdu).expect("dispatch");
+        }
+
+        // The frame is the size of the destination, so its origin lands at (32, 0).
+        state.lock().expect("state lock").ready = Some(Ok(DecodedFrame::external(7, 32, 32)));
+        client.resume().expect("resume");
+
+        assert_eq!(
+            *backend.calls.lock().expect("calls lock"),
+            vec![
+                "write_frame 1 at 32,0 [(32, 0, 64, 32)] Some(7)".to_owned(),
                 "end_frame".to_owned()
             ]
         );

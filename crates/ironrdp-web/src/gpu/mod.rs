@@ -667,14 +667,15 @@ impl SurfaceBackend for GlBackend {
         self.with(|state| state.upload(surface_id, dest, rgba, u32::from(width), (dest.left, dest.top)));
     }
 
-    fn write_frame(&mut self, surface_id: u16, regions: &[ExclusiveRectangle], frame: &DecodedFrame) {
+    fn write_frame(
+        &mut self,
+        surface_id: u16,
+        origin: (u16, u16),
+        regions: &[ExclusiveRectangle],
+        frame: &DecodedFrame,
+    ) {
         let Some(handle) = frame.external_handle() else {
-            // CPU pixels, a whole frame: each region comes from its own position.
-            self.with(|state| {
-                for region in regions {
-                    state.upload(surface_id, region, frame.data(), frame.width(), (0, 0));
-                }
-            });
+            warn!("Ignoring a CPU frame passed as external");
             return;
         };
         let Some(video_frame) = frames::take(handle) else {
@@ -688,19 +689,26 @@ impl SurfaceBackend for GlBackend {
             else {
                 return;
             };
+            let frame_right = origin.0.saturating_add(width).min(surface.target.width);
+            let frame_bottom = origin.1.saturating_add(height).min(surface.target.height);
             for region in regions {
-                let Some(region) = clip(
-                    region,
-                    width.min(surface.target.width),
-                    height.min(surface.target.height),
-                ) else {
+                let Some(region) = clip(region, frame_right, frame_bottom) else {
                     continue;
+                };
+                if region.left < origin.0 || region.top < origin.1 {
+                    continue;
+                }
+                let source = ExclusiveRectangle {
+                    left: region.left - origin.0,
+                    top: region.top - origin.1,
+                    right: region.right - origin.0,
+                    bottom: region.bottom - origin.1,
                 };
                 blit(
                     &state.gl,
                     Some(video),
                     Some(&surface.target.framebuffer),
-                    blit_rect(&region),
+                    blit_rect(&source),
                     blit_rect(&region),
                     Gl::NEAREST,
                 );
