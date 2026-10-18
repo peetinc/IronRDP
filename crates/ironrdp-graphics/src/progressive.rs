@@ -1517,7 +1517,7 @@ impl ProgressiveDecoder {
             // coverage masks, so the work is the rows of the rectangle-tile overlaps. One
             // screen-wide region costs the square of the rectangle count, and checking every
             // frame tile against all of it costs tiles times rectangles: at 4K Windows sends
-            // REGIONs of over 1,000 rectangles in frames that touch all 2,040 tiles.
+            // REGION blocks of over 1,000 rectangles in frames that touch all 2,040 tiles.
             let mut coverage_by_tile: BTreeMap<(u16, u16), TileCoverage> = BTreeMap::new();
             for rectangle in &region.rects {
                 let left = rectangle.x.min(surface_width);
