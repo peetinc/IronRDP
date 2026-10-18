@@ -179,6 +179,10 @@ export declare class EgfxBench {
     run(capture: Uint8Array, sample_every: number): Promise<any>;
 }
 
+/**
+ * Play remote session audio (RDPSND) in the browser through Web Audio. Off by default.
+ * Browsers only start audio after a user gesture on the page; connecting from a click satisfies that.
+ */
 export declare function enableAudioPlayback(enable: boolean): Extension;
 
 export declare function enableCredssp(enable: boolean): Extension;
@@ -449,12 +453,9 @@ export declare interface FileWriteHandle {
 }
 
 /**
- * Play remote session audio (RDPSND) in the browser through Web Audio. Off by default.
- * Browsers only start audio after a user gesture on the page; connecting from a click satisfies that.
- */
-/**
  * Renders EGFX on the GPU (WebGL2): surfaces live in textures and H.264 frames are drawn
- * without being read back. Off by default; falls back to the 2D canvas without WebGL2.
+ * without being read back. Off by default. Falls back to the 2D canvas without WebGL2, or
+ * when the desktop is larger than the GPU's texture limit. A lost GPU context ends the session.
  */
 export declare function gpuRendering(enable: boolean): Extension;
 
