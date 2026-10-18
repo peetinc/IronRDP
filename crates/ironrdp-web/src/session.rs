@@ -800,7 +800,7 @@ impl SessionBuilder {
             input_events_tx,
 
             render_canvas,
-            gpu: gpu_backend,
+            gpu: RefCell::new(gpu_backend),
             set_cursor_style_callback,
             set_cursor_style_callback_context,
 
@@ -945,7 +945,8 @@ pub(crate) struct Session {
 
     render_canvas: HtmlCanvasElement,
     /// The GPU backend EGFX draws with, shared with the presenter; `None` draws on the CPU.
-    gpu: Option<crate::gpu::GlBackend>,
+    /// Replaced, with the EGFX client using it, when a Server Redirection reconnects.
+    gpu: RefCell<Option<crate::gpu::GlBackend>>,
     set_cursor_style_callback: js_sys::Function,
     set_cursor_style_callback_context: JsValue,
 
@@ -1002,7 +1003,7 @@ impl Session {
         let desktop_height =
             NonZeroU32::new(u32::from(connection_result.desktop_size.height)).context("desktop height is zero")?;
 
-        let mut gui = match &self.gpu {
+        let mut gui = match self.gpu.borrow().as_ref() {
             Some(gl) => {
                 gl.resize_output(desktop_width.get(), desktop_height.get());
                 Presenter::Gl(gl.clone())
@@ -1333,6 +1334,22 @@ impl Session {
                 return Err(anyhow::anyhow!(reason).into());
             }
 
+            // On the GPU, ResetGraphics resizes the canvas inside the EGFX backend and no
+            // GraphicsUpdate follows, so the resize bookkeeping of that arm happens here.
+            if let Presenter::Gl(_) = &gui {
+                let (width, height) = gui.size();
+                let output = connector::DesktopSize {
+                    width: u16::try_from(width).unwrap_or(u16::MAX),
+                    height: u16::try_from(height).unwrap_or(u16::MAX),
+                };
+                if self.desktop_size.get() != output {
+                    debug!(width, height, "GPU output size changed");
+                    requested_resize = None;
+                    // Remembered so a Server Redirection reconnects at this size.
+                    self.desktop_size.set(output);
+                }
+            }
+
             for out in outputs {
                 match out {
                     ActiveStageOutput::ResponseFrame(frame) => {
@@ -1602,6 +1619,7 @@ impl Session {
             rdp_reader,
             clipboard,
             printer,
+            gpu,
             ..
         } = self
             .builder
@@ -1628,6 +1646,9 @@ impl Session {
         *self.rdp_reader.borrow_mut() = rdp_reader.into_inner();
         *self.clipboard.borrow_mut() = clipboard.into_inner();
         *self.printer.borrow_mut() = printer.into_inner();
+        // The new connection's EGFX client draws with the new backend; dropping the old one
+        // frees its textures.
+        *self.gpu.borrow_mut() = gpu.into_inner();
 
         Ok(())
     }
