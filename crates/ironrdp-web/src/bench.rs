@@ -64,7 +64,7 @@ impl EgfxBench {
     pub async fn create(canvas: HtmlCanvasElement, h264: bool, gpu: bool) -> Result<EgfxBench, JsValue> {
         let h264 = h264 && crate::h264::probe_support().await;
         let presenter = if gpu {
-            Presenter::Gl(crate::gpu::GlBackend::new(&canvas).map_err(|error| error.to_string())?)
+            Presenter::Gl(crate::gpu::GlBackend::new(&canvas, 1, 1).map_err(|error| error.to_string())?)
         } else {
             Presenter::Canvas2d(
                 Canvas::new(canvas, NonZeroU32::MIN, NonZeroU32::MIN).map_err(|error| error.to_string())?,

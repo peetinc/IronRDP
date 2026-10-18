@@ -80,6 +80,18 @@ impl Drop for SlotGuard {
             if let Some(output) = state.output_target.take() {
                 output.delete(&state.gl);
             }
+            if let Some(scratch) = state.scratch.take() {
+                scratch.delete(&state.gl);
+            }
+            if let Some((texture, framebuffer)) = state.video.take() {
+                state.gl.delete_texture(Some(&texture));
+                state.gl.delete_framebuffer(Some(&framebuffer));
+            }
+            // The canvas outlives the backend (a reconnect draws into it again), and the
+            // listener would otherwise call into the closure dropped with this state.
+            let _ = state
+                .canvas
+                .remove_event_listener_with_callback("webglcontextlost", state.on_lost.as_ref().unchecked_ref());
         }
     }
 }
@@ -114,14 +126,16 @@ struct GlState {
     failure: Rc<Cell<Option<&'static str>>>,
     /// Pixels the session draws outside EGFX (legacy bitmap updates), at canvas size.
     output_target: Option<Target>,
-    _on_lost: Closure<dyn FnMut()>,
+    on_lost: Closure<dyn FnMut()>,
 }
 
 impl GlBackend {
-    /// A backend drawing into `canvas`. Once [`failure`](Self::failure) reports a reason
-    /// (the browser dropped the GPU context, or a surface outgrew it), nothing more is drawn
-    /// and the session must end.
-    pub(crate) fn new(canvas: &HtmlCanvasElement) -> anyhow::Result<Self> {
+    /// A backend drawing into `canvas`, for a `width` by `height` desktop. Fails when the GPU
+    /// cannot hold a texture that large, or will not say how large it can, so the session
+    /// draws on the CPU instead. Once [`failure`](Self::failure) reports a reason (the browser
+    /// dropped the GPU context, or a surface outgrew it), nothing more is drawn and the
+    /// session must end.
+    pub(crate) fn new(canvas: &HtmlCanvasElement, width: u16, height: u16) -> anyhow::Result<Self> {
         let attributes = web_sys::WebGlContextAttributes::new();
         attributes.set_alpha(false);
         attributes.set_antialias(false);
@@ -159,6 +173,9 @@ impl GlBackend {
                 let size = value as u32;
                 size
             });
+        if exceeds_texture_limit(width, height, max_texture_size) {
+            anyhow::bail!("a {width}x{height} desktop exceeds the GPU texture limit ({max_texture_size})");
+        }
         canvas
             .add_event_listener_with_callback("webglcontextlost", on_lost.as_ref().unchecked_ref())
             .map_err(|error| anyhow::anyhow!("listen for webglcontextlost: {error:?}"))?;
@@ -175,7 +192,7 @@ impl GlBackend {
             max_texture_size,
             failure,
             output_target: None,
-            _on_lost: on_lost,
+            on_lost,
         };
         let slot = NEXT_SLOT.with(|next| {
             let slot = next.get();
@@ -600,6 +617,10 @@ impl SurfaceBackend for GlBackend {
             state.canvas.set_width(width);
             state.canvas.set_height(height);
             state.output = (width, height);
+            // Sized for the previous output; recreated at the new size when next drawn into.
+            if let Some(output) = state.output_target.take() {
+                output.delete(&state.gl);
+            }
         });
     }
 

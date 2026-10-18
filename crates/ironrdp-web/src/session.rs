@@ -137,7 +137,7 @@ struct SessionBuilderInner {
     use_h264: bool,
     /// Render EGFX on the GPU (WebGL2), so H.264 frames are never read back to the CPU. Off
     /// by default; set by the `gpu_rendering` extension. Falls back to the 2D canvas when
-    /// WebGL2 is unavailable.
+    /// WebGL2 is unavailable or the desktop exceeds the GPU's texture limit.
     use_gpu_rendering: bool,
     enable_audio_playback: bool,
     enable_credssp: bool,
@@ -616,7 +616,7 @@ impl SessionBuilder {
 
         // Created before anything draws: the canvas carries one context type for good.
         let gpu_backend = if use_egfx && self.0.borrow().use_gpu_rendering {
-            match crate::gpu::GlBackend::new(&render_canvas) {
+            match crate::gpu::GlBackend::new(&render_canvas, desktop_size.width, desktop_size.height) {
                 Ok(gl) => {
                     info!("Rendering EGFX on the GPU (WebGL2)");
                     Some(gl)
