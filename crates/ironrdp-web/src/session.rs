@@ -141,7 +141,9 @@ struct SessionBuilderInner {
     use_gpu_rendering: bool,
     /// Acknowledge EGFX frames the way Windows App does: suspend acknowledgements while the
     /// client keeps up, so Windows does not pace itself to them, and send QoE reports
-    /// instead. On by default; the `frame_ack_suspend` extension turns it off.
+    /// instead. Off by default, set by the `frame_ack_suspend` extension: without the
+    /// acknowledgement brake Windows can outrun a slow link (a tunnel over the internet),
+    /// and the backlog in the network starves audio on the same connection.
     frame_ack_suspend: bool,
     enable_audio_playback: bool,
     enable_credssp: bool,
@@ -201,7 +203,7 @@ impl Default for SessionBuilderInner {
             use_egfx: true,
             use_h264: false,
             use_gpu_rendering: false,
-            frame_ack_suspend: true,
+            frame_ack_suspend: false,
             enable_audio_playback: false,
             performance_flags: None,
             desktop_scale_factor: None,

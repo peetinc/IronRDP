@@ -82,10 +82,11 @@ export function gpuRendering(enable: boolean): Extension {
 }
 
 /**
- * Acknowledge EGFX frames the way Windows App does. On by default: once the client keeps up,
- * it suspends frame acknowledgements so Windows does not pace itself to them, sends a QoE
- * report per frame instead, and resumes acknowledging when it falls behind. Pass `false` to
- * acknowledge every frame (the protocol's basic flow control).
+ * Acknowledge EGFX frames the way Windows App does. Off by default. When on, once the client
+ * keeps up it suspends frame acknowledgements so Windows does not pace itself to them, sends a
+ * QoE report per frame instead, and resumes acknowledging when its decode queue backs up. It
+ * sees only its own queue, not the network's: over a slow link (a tunnel across the internet)
+ * Windows can then outrun the link and audio on the same connection breaks up. Use it on a LAN.
  */
 export function frameAckSuspend(enable: boolean): Extension {
     return new Extension('frame_ack_suspend', enable);
