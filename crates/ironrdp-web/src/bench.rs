@@ -40,6 +40,35 @@ fn now() -> f64 {
         .map_or(0.0, |performance| performance.now())
 }
 
+/// Nearest-rank percentiles of a set of times.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Percentiles {
+    pub(crate) p50: f64,
+    pub(crate) p95: f64,
+    pub(crate) max: f64,
+}
+
+/// The p50, p95 and maximum of `values` (sorted in place); all zero for no values.
+pub(crate) fn percentiles(values: &mut [f64]) -> Percentiles {
+    values.sort_by(f64::total_cmp);
+    let at = |fraction: f64| {
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss,
+            reason = "an index into a list far shorter than 2^52"
+        )]
+        let index = ((values.len().saturating_sub(1)) as f64 * fraction).round() as usize;
+        values.get(index).copied().unwrap_or(0.0)
+    };
+    Percentiles {
+        p50: at(0.5),
+        p95: at(0.95),
+        max: values.last().copied().unwrap_or(0.0),
+    }
+}
+
 /// Records when each frame completes.
 struct BenchHandler {
     frame_ends: Arc<Mutex<Vec<f64>>>,
@@ -79,7 +108,12 @@ impl EgfxBench {
 
     /// Replays `capture` as fast as the pipeline allows and returns
     /// `{ messages, errors, frames, ms, fps, frameMsP50, frameMsP95, frameMsMax, decoderWaitMs,
-    /// samples }`. With `sample_every` above zero, `samples` holds, after every
+    /// messageMsP50, messageMsP95, messageMsMax, messagesOver50, messagesOver150, uploadMs,
+    /// uploadCalls, uploadMsMaxPerMessage, samples }`.
+    ///
+    /// A message's time is the main-thread time it costs, the bench's stand-in for one task
+    /// in a session: from `process` to the end of its draws, less any wait for the decoder.
+    /// Upload figures are the GL backend's surface uploads. With `sample_every` above zero, `samples` holds, after every
     /// `sample_every`th frame, every 8th pixel of every 8th row of the canvas as RGB.
     pub async fn run(&mut self, capture: Uint8Array, sample_every: u32) -> Result<JsValue, JsValue> {
         let capture = capture.to_vec();
@@ -117,8 +151,13 @@ impl EgfxBench {
         let mut sampled_frames = 0;
 
         let (mut errors, mut decoder_wait_ms) = (0u32, 0.0);
+        let mut message_ms = Vec::with_capacity(messages.len());
+        let (mut upload_ms, mut upload_calls, mut upload_ms_max) = (0.0, 0u32, 0.0f64);
+        crate::gpu::set_upload_timing(true);
+        let _ = crate::gpu::take_upload_stats();
         let started = now();
         for (index, message) in messages.iter().enumerate() {
+            let (message_started, wait_before) = (now(), decoder_wait_ms);
             if client.process(0, message).is_err() {
                 errors += 1;
             }
@@ -172,26 +211,25 @@ impl EgfxBench {
                     samples.push(&Uint8Array::from(sample.as_slice()));
                 }
             }
+            message_ms.push(now() - message_started - (decoder_wait_ms - wait_before));
+            let (ms, calls) = crate::gpu::take_upload_stats();
+            upload_ms += ms;
+            upload_calls += calls;
+            upload_ms_max = upload_ms_max.max(ms);
             if let Some(reason) = self.presenter.failure() {
+                crate::gpu::set_upload_timing(false);
                 return Err(JsValue::from_str(reason));
             }
         }
         let ms = now() - started;
+        crate::gpu::set_upload_timing(false);
 
         let frame_ends = frame_ends.lock().map(|ends| ends.clone()).unwrap_or_default();
         let mut frame_ms: Vec<f64> = frame_ends.windows(2).map(|pair| pair[1] - pair[0]).collect();
-        frame_ms.sort_by(f64::total_cmp);
-        let percentile = |fraction: f64| {
-            #[expect(
-                clippy::as_conversions,
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                clippy::cast_precision_loss,
-                reason = "an index into a short list of frame times"
-            )]
-            let index = ((frame_ms.len().saturating_sub(1)) as f64 * fraction).round() as usize;
-            frame_ms.get(index).copied().unwrap_or(0.0)
-        };
+        let frame = percentiles(&mut frame_ms);
+        let over = |limit: f64| message_ms.iter().filter(|ms| limit < **ms).count();
+        let (over_budget, over_limit) = (over(50.0), over(150.0));
+        let message = percentiles(&mut message_ms);
 
         let result = Object::new();
         let frames = frame_ends.len();
@@ -206,10 +244,18 @@ impl EgfxBench {
             ("frames", frames as f64),
             ("ms", ms),
             ("fps", if 0.0 < ms { frames as f64 * 1000.0 / ms } else { 0.0 }),
-            ("frameMsP50", percentile(0.5)),
-            ("frameMsP95", percentile(0.95)),
-            ("frameMsMax", frame_ms.last().copied().unwrap_or(0.0)),
+            ("frameMsP50", frame.p50),
+            ("frameMsP95", frame.p95),
+            ("frameMsMax", frame.max),
             ("decoderWaitMs", decoder_wait_ms),
+            ("messageMsP50", message.p50),
+            ("messageMsP95", message.p95),
+            ("messageMsMax", message.max),
+            ("messagesOver50", over_budget as f64),
+            ("messagesOver150", over_limit as f64),
+            ("uploadMs", upload_ms),
+            ("uploadCalls", f64::from(upload_calls)),
+            ("uploadMsMaxPerMessage", upload_ms_max),
         ];
         for (key, value) in fields {
             Reflect::set(&result, &JsValue::from_str(key), &JsValue::from_f64(value))?;
@@ -230,6 +276,44 @@ mod tests {
         let messages = split_capture(&capture).unwrap();
 
         assert_eq!(messages, vec![&[0xAA, 0xBB][..], &[0xCC][..]]);
+    }
+
+    #[test]
+    fn percentiles_of_nothing_are_zero() {
+        assert_eq!(
+            percentiles(&mut []),
+            Percentiles {
+                p50: 0.0,
+                p95: 0.0,
+                max: 0.0
+            }
+        );
+    }
+
+    #[test]
+    fn percentiles_use_nearest_rank_on_sorted_values() {
+        assert_eq!(
+            percentiles(&mut [5.0, 1.0, 3.0, 2.0, 4.0]),
+            Percentiles {
+                p50: 3.0,
+                p95: 5.0,
+                max: 5.0
+            }
+        );
+    }
+
+    #[test]
+    fn percentiles_ignore_input_order() {
+        // 1..=100, in a scrambled order.
+        let mut values: Vec<f64> = (0..100u32).map(|i| f64::from((i * 37) % 100 + 1)).collect();
+        assert_eq!(
+            percentiles(&mut values),
+            Percentiles {
+                p50: 51.0,
+                p95: 95.0,
+                max: 100.0
+            }
+        );
     }
 
     #[test]

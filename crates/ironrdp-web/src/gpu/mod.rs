@@ -55,6 +55,27 @@ extern "C" {
 thread_local! {
     static SLOTS: RefCell<BTreeMap<u32, GlState>> = const { RefCell::new(BTreeMap::new()) };
     static NEXT_SLOT: Cell<u32> = const { Cell::new(0) };
+    /// Whether `upload_into` times itself; only the bench turns it on.
+    static UPLOAD_TIMING: Cell<bool> = const { Cell::new(false) };
+    /// Time spent in `upload_into` while timing, in ms, and the number of uploads.
+    static UPLOAD_STATS: Cell<(f64, u32)> = const { Cell::new((0.0, 0)) };
+}
+
+/// Starts or stops timing surface uploads (see [`take_upload_stats`]).
+pub(crate) fn set_upload_timing(on: bool) {
+    UPLOAD_TIMING.set(on);
+}
+
+/// The time spent uploading surface pixels, in ms, and the number of uploads, since the last
+/// call.
+pub(crate) fn take_upload_stats() -> (f64, u32) {
+    UPLOAD_STATS.replace((0.0, 0))
+}
+
+fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|window| window.performance())
+        .map_or(0.0, |performance| performance.now())
 }
 
 /// [`SurfaceBackend`] drawing with WebGL2 into a canvas; a handle to its thread-local slot.
@@ -401,6 +422,7 @@ fn upload_into(gl: &Gl, target: &Target, rect: &ExclusiveRectangle, pixels: &[u8
     let Some(rect) = clip(rect, target.width, target.height) else {
         return;
     };
+    let started = UPLOAD_TIMING.get().then(now_ms);
     gl.bind_texture(Gl::TEXTURE_2D, Some(&target.texture));
     #[expect(clippy::as_conversions, clippy::cast_possible_wrap, reason = "image strides fit i32")]
     gl.pixel_storei(Gl::UNPACK_ROW_LENGTH, stride as i32);
@@ -422,6 +444,10 @@ fn upload_into(gl: &Gl, target: &Target, rect: &ExclusiveRectangle, pixels: &[u8
     gl.pixel_storei(Gl::UNPACK_ROW_LENGTH, 0);
     gl.pixel_storei(Gl::UNPACK_SKIP_PIXELS, 0);
     gl.pixel_storei(Gl::UNPACK_SKIP_ROWS, 0);
+    if let Some(started) = started {
+        let (ms, calls) = UPLOAD_STATS.get();
+        UPLOAD_STATS.set((ms + now_ms() - started, calls + 1));
+    }
 }
 
 /// Every `step`th pixel of every `step`th row of an RGBA image, as RGB, top row first.
