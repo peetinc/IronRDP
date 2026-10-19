@@ -101,6 +101,17 @@ export function enableAudioPlayback(enable: boolean): Extension {
 }
 
 /**
+ * URL of the audio playout worklet module (`playout_worklet.js`, shipped next to this
+ * package's bundle), for pages whose Content Security Policy does not allow `blob:` in
+ * `script-src`. Serve it from the page's origin, e.g. with Vite:
+ * `import url from '@devolutions/iron-remote-desktop-rdp/playout_worklet.js?url'`.
+ * Without it the module is loaded from a Blob URL.
+ */
+export function audioWorkletUrl(url: string): Extension {
+    return new Extension('audio_worklet_url', url);
+}
+
+/**
  * Client Info `performanceFlags` bits (MS-RDPBCGR 2.2.1.11.1.1.1): which desktop
  * effects the server may render. `DISABLE_*` bits turn an effect off, `ENABLE_*`
  * bits turn one on.

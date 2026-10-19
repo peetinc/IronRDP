@@ -141,7 +141,7 @@ impl AacDecoder {
         let on_output = Closure::<dyn FnMut(AudioData)>::new(move |data: AudioData| {
             match output.try_borrow_mut() {
                 Ok(mut output) => output.play_audio_data(&data),
-                Err(_) => debug!("Dropping AAC frame: output busy"),
+                Err(_) => warn!("Dropping AAC frame: output busy"),
             }
             data.close();
         });

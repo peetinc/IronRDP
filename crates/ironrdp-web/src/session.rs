@@ -146,6 +146,9 @@ struct SessionBuilderInner {
     /// and the backlog in the network starves audio on the same connection.
     frame_ack_suspend: bool,
     enable_audio_playback: bool,
+    /// Same-origin URL of `playout_worklet.js`, for pages whose CSP `script-src` does not
+    /// allow `blob:`; set by the `audio_worklet_url` extension.
+    audio_worklet_url: Option<String>,
     enable_credssp: bool,
     enable_standard_rdp_security: bool,
     enable_server_pointer: bool,
@@ -205,6 +208,7 @@ impl Default for SessionBuilderInner {
             use_gpu_rendering: false,
             frame_ack_suspend: false,
             enable_audio_playback: false,
+            audio_worklet_url: None,
             performance_flags: None,
             desktop_scale_factor: None,
             enable_credssp: true,
@@ -334,6 +338,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |frame_ack_suspend: bool| { self.0.borrow_mut().frame_ack_suspend = frame_ack_suspend };
 
             |enable_audio_playback: bool| { self.0.borrow_mut().enable_audio_playback = enable_audio_playback };
+            |audio_worklet_url: String| { self.0.borrow_mut().audio_worklet_url = Some(audio_worklet_url) };
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
             |enable_standard_rdp_security: bool| {
                 self.0.borrow_mut().enable_standard_rdp_security = enable_standard_rdp_security;
@@ -610,7 +615,7 @@ impl SessionBuilder {
         // connection: fall back to the no-op backend and leave `INFO_NOAUDIOPLAYBACK` set, so the
         // server neither redirects audio nor plays it (MS-RDPBCGR 2.2.1.11.1.1).
         let rdpsnd_backend = if self.0.borrow().enable_audio_playback {
-            match WasmRdpsndBackend::new() {
+            match WasmRdpsndBackend::new(self.0.borrow().audio_worklet_url.clone()) {
                 Ok(backend) => Some(backend),
                 Err(error) => {
                     warn!(%error, "Audio playback unavailable; continuing without sound");

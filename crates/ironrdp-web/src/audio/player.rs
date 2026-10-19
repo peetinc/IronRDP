@@ -1,29 +1,45 @@
-//! Web Audio output for decoded RDPSND blocks.
+//! Web Audio output for decoded RDPSND blocks, played on the audio rendering thread.
 //!
-//! Each block becomes one `AudioBufferSourceNode` started at a precise context
-//! time, so blocks play gapless. [`Schedule`] holds the timing policy; it is
-//! pure so it is unit-testable on the host.
+//! Blocks go to an `AudioWorkletNode` running `playout_worklet.js`, which keeps them in a ring
+//! buffer sized to the gaps it sees and plays them through one continuous resampler. On a WAN
+//! link, or while graphics decoding holds the main thread, blocks reach this module in bursts:
+//! the worklet keeps playing through the gaps. See
+//! `docs/plans/2026-10-19-web-audio-playout-design.md`.
+//!
+//! [`PendingBlocks`] and [`DelayWindow`] hold the timing policy and are pure, so they are
+//! unit-testable on the host.
+
+use core::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::rc::Rc;
 
 use anyhow::anyhow;
-use tracing::{debug, warn};
-use wasm_bindgen::closure::Closure;
-use wasm_bindgen::{JsCast as _, JsValue};
+use futures_util::StreamExt as _;
+use js_sys::{Array, Float32Array, Object, Reflect};
+use tracing::{debug, info, warn};
+use wasm_bindgen::JsCast as _;
+use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{AudioContext, AudioContextState, AudioDestinationNode, Window};
+use web_sys::{AudioContext, AudioContextState, Window};
 
 use super::codec::DecodedAudio;
 
-/// Delay before the first block (and after an underrun), absorbing arrival jitter.
-pub(crate) const LEAD_SECS: f64 = 0.05;
+/// The worklet module, loaded from a Blob URL unless the host page serves it itself
+/// (`audio_worklet_url`), as a strict `script-src` requires.
+const WORKLET_SOURCE: &str = include_str!("playout_worklet.js");
 
-/// Most audio allowed to sit in the queue. `Rdpsnd` confirms each block on receipt,
-/// so the server is never throttled by playback: without a cap, a stall (background
-/// tab, GC pause, network burst) would turn into permanent latency.
-pub(crate) const MAX_QUEUED_SECS: f64 = 0.5;
+/// Name the module registers its processor under.
+const PROCESSOR: &str = "rdpsnd-playout";
 
-/// Once the cap is hit, arrivals are dropped until the queue drains below this, so a
-/// stall costs one dropped stretch of audio instead of permanent latency at the cap.
-pub(crate) const LOW_WATERMARK_SECS: f64 = 2.0 * LEAD_SECS;
+/// Most audio held on the main thread while the worklet module loads.
+pub(crate) const PENDING_MAX_SECS: f64 = 2.0;
+
+/// Interval of the main-thread heartbeat. How late it fires shows how long the main thread
+/// was busy, which is what delays audio when graphics decoding runs there.
+const HEARTBEAT_MS: u32 = 20;
+
+/// The worklet posts stats every second; one summary is logged per this many.
+const STATS_PER_SUMMARY: u32 = 10;
 
 /// Whether `resume()` can still start this context. Anything but running or closed
 /// (`suspended`, or a state web-sys does not model such as Safari's `interrupted`).
@@ -54,50 +70,164 @@ fn resume(context: &AudioContext) {
     }
 }
 
-/// Gapless block timing on the `AudioContext` clock.
+/// Blocks received before the worklet is ready, oldest first, holding at most
+/// [`PENDING_MAX_SECS`] of audio.
 #[derive(Debug, Default)]
-pub(crate) struct Schedule {
-    /// Context time at which the queued audio runs out.
-    next_start: Option<f64>,
-    /// Set when the cap was hit; cleared once the queue is back under [`LOW_WATERMARK_SECS`].
-    draining: bool,
+pub(crate) struct PendingBlocks {
+    blocks: VecDeque<DecodedAudio>,
+    secs: f64,
 }
 
-impl Schedule {
-    /// Context time to start a block of `duration` seconds, or `None` to drop it
-    /// because the queue already holds [`MAX_QUEUED_SECS`].
-    pub(crate) fn place(&mut self, now: f64, duration: f64) -> Option<f64> {
-        let start = match self.next_start {
-            Some(next_start) if now <= next_start => next_start,
-            // First block, or the queue ran dry (underrun).
-            _ => now + LEAD_SECS,
+impl PendingBlocks {
+    pub(crate) fn push(&mut self, block: DecodedAudio) {
+        self.secs += duration_secs(&block);
+        self.blocks.push_back(block);
+        while PENDING_MAX_SECS < self.secs {
+            let Some(oldest) = self.blocks.pop_front() else {
+                break;
+            };
+            self.secs -= duration_secs(&oldest);
+        }
+    }
+
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = DecodedAudio> + '_ {
+        self.secs = 0.0;
+        self.blocks.drain(..)
+    }
+
+    pub(crate) fn secs(&self) -> f64 {
+        self.secs
+    }
+}
+
+fn duration_secs(block: &DecodedAudio) -> f64 {
+    if block.sample_rate == 0 {
+        return 0.0;
+    }
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        reason = "frame counts of audio blocks are far below f64's exact-integer range"
+    )]
+    let frames = block.frames() as f64;
+    frames / f64::from(block.sample_rate)
+}
+
+/// End-to-end delay of RDPSND blocks, from the server's `audio_timestamp` (ms) to their
+/// arrival here, relative to the lowest seen this session: how far behind the stream is.
+#[derive(Debug, Default)]
+pub(crate) struct DelayWindow {
+    /// The server clock, unwrapped past u32 overflow.
+    last_server: Option<u32>,
+    server_base: u64,
+    best: Option<f64>,
+    current: f64,
+    min: Option<f64>,
+    max: f64,
+}
+
+impl DelayWindow {
+    pub(crate) fn observe(&mut self, local_ms: f64, server_ts: u32) {
+        if self.last_server.is_some_and(|last| server_ts < last) {
+            self.server_base += 1 << 32;
+        }
+        self.last_server = Some(server_ts);
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_precision_loss,
+            reason = "milliseconds since the server clock started, far below 2^53"
+        )]
+        let server_clock_ms = (self.server_base + u64::from(server_ts)) as f64;
+
+        let delay = local_ms - server_clock_ms;
+        let best = self.best.map_or(delay, |best| best.min(delay));
+        self.best = Some(best);
+        let excess = delay - best;
+        self.current = excess;
+        self.min = Some(self.min.map_or(excess, |min| min.min(excess)));
+        self.max = self.max.max(excess);
+    }
+
+    /// The window's (min, current, max) delay above the best seen, in ms; starts a new window.
+    pub(crate) fn take(&mut self) -> (f64, f64, f64) {
+        let window = (self.min.unwrap_or(self.current), self.current, self.max);
+        self.min = None;
+        self.max = self.current;
+        window
+    }
+}
+
+#[derive(Debug, Default)]
+struct Diagnostics {
+    delay: DelayWindow,
+    heartbeat_late_ms_max: f64,
+    stats_received: u32,
+}
+
+impl Diagnostics {
+    /// Handles one stats message from the worklet: DEBUG every second, an INFO summary
+    /// with the main-thread view every [`STATS_PER_SUMMARY`].
+    fn on_worklet_stats(&mut self, stats: &JsValue) {
+        let field = |name: &str| {
+            Reflect::get(stats, &JsValue::from_str(name))
+                .ok()
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0)
         };
+        let (target_ms, depth_mean, depth_min, depth_max) = (
+            field("targetMs"),
+            field("depthMsMean"),
+            field("depthMsMin"),
+            field("depthMsMax"),
+        );
+        let (underruns, gap_ms_max, dropped_ms) = (field("underruns"), field("gapMsMax"), field("droppedMs"));
+        debug!(target_ms, depth_mean, depth_min, depth_max, underruns, "Audio playout");
 
-        let queued = start - now;
-        if self.draining && LOW_WATERMARK_SECS < queued {
-            return None;
+        self.stats_received += 1;
+        if !self.stats_received.is_multiple_of(STATS_PER_SUMMARY) {
+            return;
         }
-        if MAX_QUEUED_SECS < queued {
-            self.draining = true;
-            return None;
-        }
-        self.draining = false;
-
-        self.next_start = Some(start + duration);
-        Some(start)
+        let (delay_min, delay_now, delay_max) = self.delay.take();
+        let heartbeat_late_ms_max = core::mem::take(&mut self.heartbeat_late_ms_max);
+        info!(
+            target_ms,
+            depth_mean,
+            depth_min,
+            depth_max,
+            underruns,
+            gap_ms_max,
+            dropped_ms,
+            delay_min,
+            delay_now,
+            delay_max,
+            heartbeat_late_ms_max,
+            "Audio playout stats"
+        );
     }
+}
 
-    pub(crate) fn reset(&mut self) {
-        self.next_start = None;
-        self.draining = false;
-    }
+#[derive(Debug)]
+enum Node {
+    /// The worklet module is loading; blocks wait here.
+    Loading(PendingBlocks),
+    Ready {
+        node: AudioWorkletNode,
+        _on_message: Closure<dyn FnMut(MessageEvent)>,
+        _on_error: Closure<dyn FnMut(JsValue)>,
+    },
+    /// Loading failed; audio stays silent.
+    Failed,
 }
 
 #[derive(Debug)]
 pub(crate) struct Player {
     context: AudioContext,
-    destination: AudioDestinationNode,
-    schedule: Schedule,
+    node: Rc<RefCell<Node>>,
+    /// Set by the processor's error event: posting more blocks would be pointless.
+    processor_failed: Rc<Cell<bool>>,
+    diagnostics: Rc<RefCell<Diagnostics>>,
+    /// Cleared on drop to stop the heartbeat.
+    alive: Rc<Cell<bool>>,
     /// Whether playback already asked a suspended context to start. Later attempts come
     /// from [`GestureListener`], where browsers actually honor them.
     resume_attempted: bool,
@@ -127,7 +257,9 @@ impl Drop for GestureListener {
 }
 
 impl Player {
-    pub(crate) fn new() -> anyhow::Result<Self> {
+    /// A player whose worklet module is loaded from `worklet_url`, or from a Blob URL when
+    /// `None` (fine unless the page's CSP restricts `script-src`).
+    pub(crate) fn new(worklet_url: Option<String>) -> anyhow::Result<Self> {
         let context = AudioContext::new().map_err(|error| anyhow!("create AudioContext: {error:?}"))?;
 
         let gesture_listener = web_sys::window().map(|window| {
@@ -144,13 +276,43 @@ impl Player {
             GestureListener { window, callback }
         });
 
-        Ok(Self {
-            destination: context.destination(),
+        let player = Self {
             context,
-            schedule: Schedule::default(),
+            node: Rc::new(RefCell::new(Node::Loading(PendingBlocks::default()))),
+            processor_failed: Rc::new(Cell::new(false)),
+            diagnostics: Rc::new(RefCell::new(Diagnostics::default())),
+            alive: Rc::new(Cell::new(true)),
             resume_attempted: false,
             _gesture_listener: gesture_listener,
-        })
+        };
+
+        wasm_bindgen_futures::spawn_local(load_worklet(
+            player.context.clone(),
+            worklet_url,
+            Rc::clone(&player.node),
+            Rc::clone(&player.processor_failed),
+            Rc::clone(&player.diagnostics),
+        ));
+
+        let (alive, diagnostics) = (Rc::clone(&player.alive), Rc::clone(&player.diagnostics));
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut ticks = gloo_timers::future::IntervalStream::new(HEARTBEAT_MS);
+            let mut last = now_ms();
+            while ticks.next().await.is_some() && alive.get() {
+                let now = now_ms();
+                let late = now - last - f64::from(HEARTBEAT_MS);
+                let mut diagnostics = diagnostics.borrow_mut();
+                diagnostics.heartbeat_late_ms_max = diagnostics.heartbeat_late_ms_max.max(late);
+                last = now;
+            }
+        });
+
+        Ok(player)
+    }
+
+    /// Notes a block's arrival with the server's `audio_timestamp`, for the delay statistics.
+    pub(crate) fn note_arrival(&mut self, server_ts: u32) {
+        self.diagnostics.borrow_mut().delay.observe(now_ms(), server_ts);
     }
 
     pub(crate) fn enqueue(&mut self, audio: &DecodedAudio) {
@@ -162,132 +324,261 @@ impl Player {
             resume(&self.context);
         }
 
-        // While suspended (or interrupted), the context clock is frozen: scheduling against
-        // it would queue stale audio that plays whenever the context finally starts. Drop
-        // the block and start fresh once it runs.
+        // While suspended (or interrupted) the worklet does not run: anything posted would
+        // queue on its port without bound. Drop the block; playback starts fresh once it runs.
         if self.context.state() != AudioContextState::Running {
-            self.schedule.reset();
+            return;
+        }
+        if audio.frames() == 0 || audio.sample_rate == 0 || self.processor_failed.get() {
             return;
         }
 
-        let Ok(frames) = u32::try_from(audio.frames()) else {
-            warn!(frames = audio.frames(), "Dropping oversized RDPSND block");
-            return;
-        };
-        if frames == 0 || audio.sample_rate == 0 {
-            return;
-        }
-
-        let duration = f64::from(frames) / f64::from(audio.sample_rate);
-        let Some(when) = self.schedule.place(self.context.current_time(), duration) else {
-            debug!(duration, "Dropping RDPSND block: playback queue is full");
-            return;
-        };
-
-        if let Err(error) = start_block(&self.context, &self.destination, audio, frames, when) {
-            warn!(?error, "Failed to schedule RDPSND block");
-        }
-
-        fn start_block(
-            context: &AudioContext,
-            destination: &AudioDestinationNode,
-            audio: &DecodedAudio,
-            frames: u32,
-            when: f64,
-        ) -> Result<(), JsValue> {
-            let n_channels = u32::try_from(audio.channels.len()).map_err(|_| JsValue::from_str("too many channels"))?;
-            #[expect(
-                clippy::as_conversions,
-                clippy::cast_precision_loss,
-                reason = "RDPSND sample rates are far below f32's exact-integer range (2^24)"
-            )]
-            let sample_rate = audio.sample_rate as f32;
-
-            let buffer = context.create_buffer(n_channels, frames, sample_rate)?;
-            for (index, samples) in audio.channels.iter().enumerate() {
-                let index = i32::try_from(index).map_err(|_| JsValue::from_str("too many channels"))?;
-                buffer.copy_to_channel(samples, index)?;
+        match &mut *self.node.borrow_mut() {
+            Node::Loading(pending) => pending.push(audio.clone()),
+            Node::Ready { node, .. } => {
+                if let Err(error) = post_block(node, audio) {
+                    debug!(?error, "Failed to post RDPSND block to the playout worklet");
+                }
             }
-
-            let source = context.create_buffer_source()?;
-            source.set_buffer(Some(&buffer));
-            source.connect_with_audio_node(destination)?;
-            source.start_with_when(when)?;
-            Ok(())
+            Node::Failed => {}
         }
     }
 }
 
 impl Drop for Player {
     fn drop(&mut self) {
+        self.alive.set(false);
+        if let Node::Ready { node, .. } = &*self.node.borrow() {
+            // Detach the handlers before their closures go: the port can still deliver a
+            // message after the context starts closing.
+            node.port().set_onmessage(None);
+            node.set_onprocessorerror(None);
+            let _ = node.disconnect();
+        }
         if let Err(error) = self.context.close() {
             debug!(?error, "Failed to close AudioContext");
         }
     }
 }
 
+/// Loads the worklet module, creates the playout node and flushes the blocks that arrived
+/// meanwhile. Any failure leaves audio silent with one warning.
+async fn load_worklet(
+    context: AudioContext,
+    worklet_url: Option<String>,
+    node_slot: Rc<RefCell<Node>>,
+    processor_failed: Rc<Cell<bool>>,
+    diagnostics: Rc<RefCell<Diagnostics>>,
+) {
+    let result = async {
+        let worklet: Worklet = Reflect::get(&context, &JsValue::from_str("audioWorklet"))
+            .ok()
+            .filter(|value| !value.is_undefined())
+            .ok_or_else(|| JsValue::from_str("AudioWorklet is unavailable (secure context required)"))?
+            .unchecked_into();
+
+        let (url, blob_url) = match worklet_url {
+            Some(url) => (url, None),
+            None => {
+                let options = Object::new();
+                Reflect::set(
+                    &options,
+                    &JsValue::from_str("type"),
+                    &JsValue::from_str("text/javascript"),
+                )?;
+                let blob = JsBlob::new(&Array::of1(&JsValue::from_str(WORKLET_SOURCE)), &options)?;
+                let url = create_object_url(&blob)?;
+                (url.clone(), Some(url))
+            }
+        };
+        let loaded = JsFuture::from(worklet.add_module(&url)).await;
+        if let Some(blob_url) = blob_url {
+            revoke_object_url(&blob_url);
+        }
+        loaded?;
+
+        let options = Object::new();
+        Reflect::set(&options, &JsValue::from_str("numberOfInputs"), &JsValue::from(0))?;
+        Reflect::set(&options, &JsValue::from_str("numberOfOutputs"), &JsValue::from(1))?;
+        Reflect::set(
+            &options,
+            &JsValue::from_str("outputChannelCount"),
+            &Array::of1(&JsValue::from(2)),
+        )?;
+        let node = AudioWorkletNode::new(&context, PROCESSOR, &options)?;
+        node.connect(&context.destination())?;
+        Ok::<_, JsValue>(node)
+    }
+    .await;
+
+    let node = match result {
+        Ok(node) => node,
+        Err(error) => {
+            warn!(
+                ?error,
+                "Audio playback unavailable: the playout worklet did not load (a page CSP must allow its URL in script-src; see audioWorkletUrl)"
+            );
+            *node_slot.borrow_mut() = Node::Failed;
+            return;
+        }
+    };
+
+    let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+        let data = event.data();
+        let is_stats = Reflect::get(&data, &JsValue::from_str("type"))
+            .ok()
+            .and_then(|kind| kind.as_string())
+            .is_some_and(|kind| kind == "stats");
+        if is_stats {
+            diagnostics.borrow_mut().on_worklet_stats(&data);
+        }
+    });
+    node.port().set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+
+    let on_error = Closure::<dyn FnMut(JsValue)>::new(move |error: JsValue| {
+        warn!(?error, "Audio playout worklet failed; audio is silent");
+        processor_failed.set(true);
+    });
+    node.set_onprocessorerror(Some(on_error.as_ref().unchecked_ref()));
+
+    let mut slot = node_slot.borrow_mut();
+    if let Node::Loading(pending) = &mut *slot {
+        debug!(pending_secs = pending.secs(), "Audio playout worklet ready");
+        for block in pending.drain() {
+            if let Err(error) = post_block(&node, &block) {
+                debug!(?error, "Failed to post RDPSND block to the playout worklet");
+            }
+        }
+    }
+    *slot = Node::Ready {
+        node,
+        _on_message: on_message,
+        _on_error: on_error,
+    };
+}
+
+/// Posts one block as `{ type: 'block', rate, channels }`, transferring the sample buffers.
+fn post_block(node: &AudioWorkletNode, audio: &DecodedAudio) -> Result<(), JsValue> {
+    let channels = Array::new();
+    let transfer = Array::new();
+    for samples in &audio.channels {
+        let array = Float32Array::from(samples.as_slice());
+        transfer.push(&array.buffer());
+        channels.push(&array);
+    }
+    let message = Object::new();
+    Reflect::set(&message, &JsValue::from_str("type"), &JsValue::from_str("block"))?;
+    Reflect::set(&message, &JsValue::from_str("rate"), &JsValue::from(audio.sample_rate))?;
+    Reflect::set(&message, &JsValue::from_str("channels"), &channels)?;
+    node.port().post_message(&message, &transfer)
+}
+
+fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|window| window.performance())
+        .map_or(0.0, |performance| performance.now())
+}
+
+#[wasm_bindgen]
+extern "C" {
+    #[derive(Debug, Clone)]
+    type Worklet;
+
+    #[wasm_bindgen(method, js_name = addModule)]
+    fn add_module(this: &Worklet, url: &str) -> js_sys::Promise;
+
+    #[derive(Debug, Clone)]
+    type AudioWorkletNode;
+
+    #[wasm_bindgen(constructor, catch)]
+    fn new(context: &AudioContext, name: &str, options: &Object) -> Result<AudioWorkletNode, JsValue>;
+
+    #[wasm_bindgen(method, getter)]
+    fn port(this: &AudioWorkletNode) -> MessagePort;
+
+    #[wasm_bindgen(method, catch)]
+    fn connect(this: &AudioWorkletNode, destination: &web_sys::AudioDestinationNode) -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(method, catch)]
+    fn disconnect(this: &AudioWorkletNode) -> Result<(), JsValue>;
+
+    #[wasm_bindgen(method, setter = onprocessorerror)]
+    fn set_onprocessorerror(this: &AudioWorkletNode, handler: Option<&js_sys::Function>);
+
+    #[derive(Debug, Clone)]
+    type MessagePort;
+
+    #[wasm_bindgen(method, catch, js_name = postMessage)]
+    fn post_message(this: &MessagePort, message: &JsValue, transfer: &Array) -> Result<(), JsValue>;
+
+    #[wasm_bindgen(method, setter = onmessage)]
+    fn set_onmessage(this: &MessagePort, handler: Option<&js_sys::Function>);
+
+    #[derive(Debug, Clone)]
+    type MessageEvent;
+
+    #[wasm_bindgen(method, getter)]
+    fn data(this: &MessageEvent) -> JsValue;
+
+    #[wasm_bindgen(js_name = Blob)]
+    type JsBlob;
+
+    #[wasm_bindgen(constructor, catch, js_class = "Blob")]
+    fn new(parts: &Array, options: &Object) -> Result<JsBlob, JsValue>;
+
+    #[wasm_bindgen(js_namespace = URL, js_name = createObjectURL, catch)]
+    fn create_object_url(blob: &JsBlob) -> Result<String, JsValue>;
+
+    #[wasm_bindgen(js_namespace = URL, js_name = revokeObjectURL)]
+    fn revoke_object_url(url: &str);
+}
+
 #[cfg(test)]
+#[expect(
+    clippy::float_cmp,
+    reason = "the expected delays are exact sums of the integers fed in"
+)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn first_block_starts_after_lead() {
-        let mut schedule = Schedule::default();
-        assert_eq!(schedule.place(10.0, 0.02), Some(10.0 + LEAD_SECS));
-    }
-
-    #[test]
-    fn contiguous_blocks_play_back_to_back() {
-        let mut schedule = Schedule::default();
-        let first = schedule.place(10.0, 0.02).expect("placed");
-        let second = schedule.place(10.001, 0.02).expect("placed");
-        assert!((second - (first + 0.02)).abs() < 1e-9);
-    }
-
-    #[test]
-    fn underrun_restarts_after_lead() {
-        let mut schedule = Schedule::default();
-        schedule.place(10.0, 0.02).expect("placed");
-        // Next block arrives long after the queued audio ran out.
-        assert_eq!(schedule.place(20.0, 0.02), Some(20.0 + LEAD_SECS));
-    }
-
-    #[test]
-    fn burst_beyond_cap_is_dropped() {
-        let mut schedule = Schedule::default();
-        let now = 10.0;
-        let mut placed = 0;
-        let mut dropped = 0;
-        for _ in 0..100 {
-            match schedule.place(now, 0.02) {
-                Some(start) => {
-                    assert!(start - now <= MAX_QUEUED_SECS);
-                    placed += 1;
-                }
-                None => dropped += 1,
-            }
+    fn block(sample_rate: u32, frames: usize) -> DecodedAudio {
+        DecodedAudio {
+            sample_rate,
+            channels: vec![vec![0.0; frames]; 2],
         }
-        assert!(0 < placed);
-        assert!(0 < dropped);
     }
 
     #[test]
-    fn after_cap_queue_drains_to_low_watermark() {
-        let mut schedule = Schedule::default();
-        let mut now = 10.0;
-        // Burst after a stall: fill the queue to the cap.
-        while schedule.place(now, 0.02).is_some() {}
-        // Blocks now arrive in real time. Without hysteresis the queue would sit at the cap forever.
-        let mut accepted_lag = None;
-        for _ in 0..100 {
-            now += 0.02;
-            if let Some(start) = schedule.place(now, 0.02) {
-                accepted_lag = Some(start - now);
-                break;
-            }
+    fn pending_blocks_keep_at_most_two_seconds() {
+        let mut pending = PendingBlocks::default();
+        // 23.2 ms blocks: 200 of them is 4.6 s.
+        for _ in 0..200 {
+            pending.push(block(44_100, 1024));
         }
-        let lag = accepted_lag.expect("queue drains and playback resumes");
-        assert!(lag <= LOW_WATERMARK_SECS);
+        assert!(pending.secs() <= PENDING_MAX_SECS);
+        assert!(PENDING_MAX_SECS - 0.03 < pending.secs(), "keeps the newest ~2 s");
+        assert_eq!(pending.drain().count(), 86);
+        assert_eq!(pending.secs(), 0.0);
+    }
+
+    #[test]
+    fn delay_window_reports_delay_above_best_seen() {
+        let mut window = DelayWindow::default();
+        window.observe(1000.0, 500);
+        window.observe(1100.0, 550); // 50 ms behind the best
+        window.observe(1150.0, 650); // back to the best
+        assert_eq!(window.take(), (0.0, 0.0, 50.0));
+
+        window.observe(1300.0, 700); // 100 ms behind
+        assert_eq!(window.take(), (100.0, 100.0, 100.0));
+    }
+
+    #[test]
+    fn delay_window_follows_the_server_clock_across_u32_wrap() {
+        let mut window = DelayWindow::default();
+        window.observe(1000.0, u32::MAX - 10);
+        window.observe(1021.0, 10); // 21 ms later on both clocks, across the wrap
+        assert_eq!(window.take(), (0.0, 0.0, 0.0));
     }
 
     #[test]
@@ -295,13 +586,5 @@ mod tests {
         assert!(is_resumable(AudioContextState::Suspended));
         assert!(!is_resumable(AudioContextState::Running));
         assert!(!is_resumable(AudioContextState::Closed));
-    }
-
-    #[test]
-    fn reset_forgets_the_queue() {
-        let mut schedule = Schedule::default();
-        schedule.place(10.0, 0.4).expect("placed");
-        schedule.reset();
-        assert_eq!(schedule.place(10.0, 0.02), Some(10.0 + LEAD_SECS));
     }
 }

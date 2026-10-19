@@ -115,10 +115,12 @@ impl fmt::Debug for WasmRdpsndBackend {
 unsafe impl Send for WasmRdpsndBackend {}
 
 impl WasmRdpsndBackend {
-    pub(crate) fn new() -> anyhow::Result<Self> {
+    /// `worklet_url` serves the playout worklet module from the page's origin; `None` loads
+    /// it from a Blob URL (see [`Player::new`]).
+    pub(crate) fn new(worklet_url: Option<String>) -> anyhow::Result<Self> {
         Ok(Self {
             output: Rc::new(RefCell::new(Output {
-                player: Player::new()?,
+                player: Player::new(worklet_url)?,
                 volume: Volume::FULL,
                 decoded: DecodedAudio::default(),
             })),
@@ -191,7 +193,8 @@ impl RdpsndClientHandler for WasmRdpsndBackend {
         formats
     }
 
-    fn wave(&mut self, format: &AudioFormat, _ts: u32, data: Cow<'_, [u8]>) {
+    fn wave(&mut self, format: &AudioFormat, ts: u32, data: Cow<'_, [u8]>) {
+        self.output.borrow_mut().player.note_arrival(ts);
         if self.active_format.as_ref() != Some(format) {
             info!(format = %FormatName(format), "Playing RDPSND format");
             self.active_format = Some(format.clone());
