@@ -30,6 +30,10 @@ fn split_capture(mut capture: &[u8]) -> Result<Vec<&[u8]>, &'static str> {
     Ok(messages)
 }
 
+/// Queued EGFX entries at which the replay waits for the decoder: twice the depth at which
+/// suspended frame acknowledgements resume.
+const BENCH_QUEUE_LIMIT: usize = 64;
+
 fn now() -> f64 {
     web_sys::window()
         .and_then(|window| window.performance())
@@ -114,11 +118,23 @@ impl EgfxBench {
 
         let (mut errors, mut decoder_wait_ms) = (0u32, 0.0);
         let started = now();
-        for message in &messages {
+        for (index, message) in messages.iter().enumerate() {
             if client.process(0, message).is_err() {
                 errors += 1;
             }
-            while client.is_awaiting_decoder() {
+            // Like a session: frames that finished decoding apply as their wakes arrive,
+            // while messages keep coming. Waits only when the queue is deep (the server's
+            // flow control would hold it about there), and at the end.
+            let last = index + 1 == messages.len();
+            loop {
+                while wake_rx.try_recv().is_ok() {
+                    if client.resume().is_err() {
+                        errors += 1;
+                    }
+                }
+                if !client.is_awaiting_decoder() || (!last && client.queued_len() < BENCH_QUEUE_LIMIT) {
+                    break;
+                }
                 let waited = now();
                 if wake_rx.next().await.is_none() {
                     break;

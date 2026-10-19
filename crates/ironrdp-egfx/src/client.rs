@@ -637,6 +637,13 @@ impl GraphicsPipelineClient {
         0 < self.in_flight
     }
 
+    /// Entries not yet applied: H.264 pictures still decoding and the commands held behind
+    /// them.
+    #[must_use]
+    pub fn queued_len(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Continue after an asynchronous H.264 decoder finishes a frame.
     ///
     /// Applies the decoded frames at the front of the queue, and the commands held behind
