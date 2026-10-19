@@ -7,6 +7,14 @@
  */
 export declare function audioWorkletUrl(url: string): Extension;
 
+/**
+ * Tell Windows the client is a thin client (EGFX `AVC_THIN_CLIENT`). Off by default; needs
+ * `h264(true)`. Windows 11 then sends the whole desktop as H.264 instead of switching areas
+ * between H.264 and RemoteFX/ClearCodec, which keeps motion smooth at the cost of a softer
+ * picture. Read at connect only.
+ */
+export declare function avcThinClient(enable: boolean): Extension;
+
 export declare const Backend: {
     DesktopSize: typeof DesktopSize;
     InputTransaction: typeof InputTransaction;
