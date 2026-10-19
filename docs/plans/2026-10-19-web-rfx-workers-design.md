@@ -290,3 +290,41 @@ counter-proposal.
 
 **Rejected by both:** GPU-side RLGR/DWT (RLGR is serial bit decoding), WebGPU, and SIMD first
 (it keeps the stall on the main thread).
+
+## Stage 0 results (2026-10-19)
+
+Measured on Chrome 154, macOS, Apple M1 Max (ANGLE Metal). A Windows run of the micro-bench is
+still to come.
+
+**Main thread today** (replay bench, `h264=1&gpu=1`, in-thread decode). Message times are the
+main-thread time per capture message, the bench's stand-in for one task:
+
+| Capture | p50 | p95 | Max | Over 50 ms | Over 150 ms | GL upload (share of run) | Upload max per message |
+|---|---|---|---|---|---|---|---|
+| rfx-heavy | 1.6 ms | 64.1 ms | 314.1 ms | 866 | 4 | 2.8 s of 113.7 s (2.5%) | 15.5 ms |
+| live-local-4k | 0.2 ms | 25.0 ms | 234.8 ms | 202 | 6 | 1.0 s of 34.8 s (2.9%) | 19.1 ms |
+| mixed-17-31 | 0.5 ms | 79.4 ms | 240.1 ms | 322 | 7 | 1.4 s of 40.1 s (3.4%) | 14.7 ms |
+
+All three miss the acceptance (p95 under 50 ms, none over 150 ms). Uploads are at most about
+19 ms of any message, so decoding is the stall, as the codec breakdown said.
+
+**Upload micro-bench** (`tools/webgl-upload-bench.html`). 2,040 tiles into a 4K texture, p50
+of 30 runs, two runs, pixels verified with `?check=1`:
+
+| Variant | Main thread | Until the GPU is done | GL calls |
+|---|---|---|---|
+| A: today's per-tile pattern | 13.9 / 14.8 ms | 42.1 / 44.9 ms | 18,360 |
+| B: tight `srcOffset` | 13.8 / 14.4 ms | 41.7 / 43.0 ms | 2,041 |
+| C: pixel-unpack buffer | **2.2 / 2.2 ms** | **14.7 / 14.0 ms** | 2,044 |
+| D: texture array + instanced draw | 12.5 / 12.5 ms | 32.1 / 32.2 ms | 16 |
+
+The call count barely matters (A ≈ B). What costs is handing client memory to each call, and
+one buffer upload avoids it.
+
+**Decision: stage 2 uploads through a pixel-unpack buffer (C).**
+- **Mechanics:** each Worker reply is written into a `PIXEL_UNPACK_BUFFER` with one
+  `bufferData`, then one `texSubImage2D(…, offset)` per placement.
+- **Why not B:** the rule's first choice, B, fits the 15 ms budget only at p50, and is no
+  cheaper than today. C issues about 6× faster and finishes about 3× sooner.
+- **What changes in the design:** §3's "per-placement `texSubImage2D(srcOffset)`" becomes the
+  pixel-unpack buffer. No shaders are needed.

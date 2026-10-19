@@ -190,7 +190,12 @@ export declare class EgfxBench {
     /**
      * Replays `capture` as fast as the pipeline allows and returns
      * `{ messages, errors, frames, ms, fps, frameMsP50, frameMsP95, frameMsMax, decoderWaitMs,
-     * samples }`. With `sample_every` above zero, `samples` holds, after every
+     * messageMsP50, messageMsP95, messageMsMax, messagesOver50, messagesOver150, uploadMs,
+     * uploadCalls, uploadMsMaxPerMessage, samples }`.
+     *
+     * A message's time is the main-thread time it costs, the bench's stand-in for one task
+     * in a session: from `process` to the end of its draws, less any wait for the decoder.
+     * Upload figures are the GL backend's surface uploads. With `sample_every` above zero, `samples` holds, after every
      * `sample_every`th frame, every 8th pixel of every 8th row of the canvas as RGB.
      */
     run(capture: Uint8Array, sample_every: number): Promise<any>;
