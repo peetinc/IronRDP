@@ -328,3 +328,27 @@ one buffer upload avoids it.
   cheaper than today. C issues about 6× faster and finishes about 3× sooner.
 - **What changes in the design:** §3's "per-placement `texSubImage2D(srcOffset)`" becomes the
   pixel-unpack buffer. No shaders are needed.
+
+## Stage 2 results (2026-10-19)
+
+Same machine and browser as stage 0. One Worker, `h264=1&gpu=1&workers=1`. Main-thread time per
+capture message:
+
+| Capture | p95 (before → after) | Max (before → after) | Over 50 ms | Over 150 ms | Main thread busy |
+|---|---|---|---|---|---|
+| rfx-heavy | 64.1 → **2.8 ms** | 314.1 → **43.6 ms** | 866 → **0** | 4 → **0** | 94.7% → 10.9% |
+| live-local-4k | 25.0 → **1.8 ms** | 234.8 → **41–44 ms** | 202 → **0** | 6 → **0** | 92% → 13% |
+| mixed-17-31 | 79.4 → **3.0 ms** | 240.1 → **60.9 ms** | 322 → **1** | 7 → **0** | 97% → 7.5% |
+
+**Correctness:** `verify=workers` decoded every job in-thread too and compared the Worker's
+pixels and placements byte for byte. 6,531 + 3,248 + 2,138 jobs (every progressive command in
+the three captures), 0 mismatches.
+
+**Open:** the first of three live-local-4k runs had one 200 ms upload, putting 3 messages over
+150 ms. It did not recur in the next two runs. It is unexplained; the suspect is a GPU-side
+wait on the reused pixel-unpack buffer. If the live test shows it, the fix is to rotate
+several unpack buffers.
+
+**Throughput** is unchanged, as expected for one Worker. The whole replays took about as long
+as before (100 s against 114 s; 36 s against 40 s), so stage 3 is still needed for the sharp
+mode's frame rate.

@@ -184,9 +184,11 @@ export declare class EgfxBench {
     [Symbol.dispose](): void;
     /**
      * A bench drawing to `canvas`. With `h264`, AVC frames decode through WebCodecs, as in a
-     * session with H.264 on; with `gpu`, EGFX renders through the WebGL2 backend.
+     * session with H.264 on; with `gpu`, EGFX renders through the WebGL2 backend; with
+     * `workers` (and `gpu`), RemoteFX Progressive decodes in a Web Worker, and with
+     * `verify_workers` every Worker job is compared with in-thread decoding.
      */
-    static create(canvas: HTMLCanvasElement, h264: boolean, gpu: boolean): Promise<EgfxBench>;
+    static create(canvas: HTMLCanvasElement, h264: boolean, gpu: boolean, workers: boolean, verify_workers: boolean): Promise<EgfxBench>;
     /**
      * Replays `capture` as fast as the pipeline allows and returns
      * `{ messages, errors, frames, ms, fps, frameMsP50, frameMsP95, frameMsMax, decoderWaitMs,
@@ -1128,6 +1130,14 @@ export declare function requestFileContents(params: {
     size: number;
     clip_data_id?: number;
 }): Extension;
+
+/**
+ * Decode RemoteFX Progressive in a Web Worker instead of on the page's main thread. Off by
+ * default; takes effect only with `gpuRendering(true)`. Keeps Windows' sharp mode from
+ * stalling the page (and the audio) while it decodes. If the Worker cannot start, RemoteFX
+ * decodes on the main thread as before; if it fails mid-session, the session ends.
+ */
+export declare function rfxWorkers(enable: boolean): Extension;
 
 declare enum RotationUnit {
     Pixel = 0,
