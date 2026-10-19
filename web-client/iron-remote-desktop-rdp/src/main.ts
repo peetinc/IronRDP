@@ -93,6 +93,16 @@ export function frameAckSuspend(enable: boolean): Extension {
 }
 
 /**
+ * Tell Windows the client is a thin client (EGFX `AVC_THIN_CLIENT`). Off by default; needs
+ * `h264(true)`. Windows 11 then sends the whole desktop as H.264 instead of switching areas
+ * between H.264 and RemoteFX/ClearCodec, which keeps motion smooth at the cost of a softer
+ * picture. Read at connect only.
+ */
+export function avcThinClient(enable: boolean): Extension {
+    return new Extension('avc_thin_client', enable);
+}
+
+/**
  * Play remote session audio (RDPSND) in the browser through Web Audio. Off by default.
  * Browsers only start audio after a user gesture on the page; connecting from a click satisfies that.
  */

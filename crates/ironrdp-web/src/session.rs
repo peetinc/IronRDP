@@ -145,6 +145,11 @@ struct SessionBuilderInner {
     /// acknowledgement brake Windows can outrun a slow link (a tunnel over the internet),
     /// and the backlog in the network starves audio on the same connection.
     frame_ack_suspend: bool,
+    /// Set `AVC_THIN_CLIENT` on the 10.7 EGFX capability set. Off by default, set by the
+    /// `avc_thin_client` extension. Windows 11 then sends the whole desktop as H.264
+    /// instead of mixing H.264 video with RemoteFX and ClearCodec, which keeps motion
+    /// smooth but softens the picture. Ignored unless H.264 is in use.
+    avc_thin_client: bool,
     enable_audio_playback: bool,
     /// Same-origin URL of `playout_worklet.js`, for pages whose CSP `script-src` does not
     /// allow `blob:`; set by the `audio_worklet_url` extension.
@@ -207,6 +212,7 @@ impl Default for SessionBuilderInner {
             use_h264: false,
             use_gpu_rendering: false,
             frame_ack_suspend: false,
+            avc_thin_client: false,
             enable_audio_playback: false,
             audio_worklet_url: None,
             performance_flags: None,
@@ -336,6 +342,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |h264: bool| { self.0.borrow_mut().use_h264 = h264 };
             |gpu_rendering: bool| { self.0.borrow_mut().use_gpu_rendering = gpu_rendering };
             |frame_ack_suspend: bool| { self.0.borrow_mut().frame_ack_suspend = frame_ack_suspend };
+            |avc_thin_client: bool| { self.0.borrow_mut().avc_thin_client = avc_thin_client };
 
             |enable_audio_playback: bool| { self.0.borrow_mut().enable_audio_playback = enable_audio_playback };
             |audio_worklet_url: String| { self.0.borrow_mut().audio_worklet_url = Some(audio_worklet_url) };
@@ -773,6 +780,7 @@ impl SessionBuilder {
         }
 
         let use_display_control = self.0.borrow().use_display_control;
+        let avc_thin_client = self.0.borrow().avc_thin_client;
 
         let (connection_result, stream, rdp_leftover) = connect(ConnectParams {
             ws,
@@ -797,6 +805,7 @@ impl SessionBuilder {
             } else {
                 FrameAckPolicy::EveryFrame
             },
+            avc_thin_client,
             redirect,
             rdpsnd_backend,
         })
@@ -2339,6 +2348,7 @@ struct ConnectParams {
     /// GPU surface backend for EGFX; `None` keeps the CPU compositor.
     gpu_backend: Option<crate::gpu::GlBackend>,
     frame_ack_policy: FrameAckPolicy,
+    avc_thin_client: bool,
     /// Set when this connection follows a Server Redirection PDU.
     redirect: Option<RedirectConnector>,
     /// `Some` when the `enable_audio_playback` extension is on and Web Audio is available.
@@ -2397,6 +2407,7 @@ async fn connect(
         h264_decoder,
         gpu_backend,
         frame_ack_policy,
+        avc_thin_client,
         redirect,
         rdpsnd_backend,
     }: ConnectParams,
@@ -2516,39 +2527,16 @@ async fn connect(
             struct WebEgfxHandler {
                 /// An H.264 decoder is attached, so offer the 10.x set Windows needs for AVC.
                 h264: bool,
+                avc_thin_client: bool,
                 logged_first_frame: bool,
             }
 
             impl GraphicsPipelineHandler for WebEgfxHandler {
                 fn capabilities(&self) -> Vec<CapabilitySet> {
-                    // Same sets as the trait default — this override exists only to
-                    // prove the channel opened. `start()` calls this the moment the
-                    // server creates the DVC, and every DVC-layer log in
+                    // This override exists only to prove the channel opened. `start()` calls
+                    // it the moment the server creates the DVC, and every DVC-layer log in
                     // ironrdp-dvc is debug!, which Chrome hides.
-                    //
-                    // AVC420_ENABLED stays on V8_1 exactly as upstream has it;
-                    // `start()` filters that set out when no H.264 decoder is
-                    // configured, leaving V8 as what actually goes on the wire.
-                    let mut caps = vec![
-                        CapabilitySet::V8_1 {
-                            flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
-                        },
-                        CapabilitySet::V8 {
-                            flags: CapabilitiesV8Flags::SMALL_CACHE,
-                        },
-                    ];
-                    // Windows 11 confirms V8_1 with AVC420_ENABLED cleared: it only enables
-                    // H.264 for 10.x clients, and then sends AVC444, shown as its 4:2:0 main
-                    // view. AVC_THIN_CLIENT is left off: with it Windows sent luma only but at
-                    // the same heavy quantization.
-                    if self.h264 {
-                        caps.insert(
-                            0,
-                            CapabilitySet::V10_7 {
-                                flags: CapabilitiesV107Flags::SMALL_CACHE,
-                            },
-                        );
-                    }
+                    let caps = egfx_capabilities(self.h264, self.avc_thin_client);
                     info!(?caps, "EGFX channel OPENED — advertising capabilities");
                     caps
                 }
@@ -2585,6 +2573,7 @@ async fn connect(
             info!(h264 = h264_decoder.is_some(), "Attaching EGFX graphics pipeline");
             let handler = WebEgfxHandler {
                 h264: h264_decoder.is_some(),
+                avc_thin_client,
                 logged_first_frame: false,
             };
             let graphics = GraphicsPipelineClient::new(Box::new(handler), h264_decoder)
@@ -2813,6 +2802,34 @@ async fn upgrade_to_tls(
     ))
 }
 
+/// EGFX capability sets the web client advertises, most capable first.
+///
+/// AVC420_ENABLED stays on V8_1 exactly as upstream has it; `start()` filters that set out
+/// when no H.264 decoder is configured, leaving V8 as what actually goes on the wire.
+///
+/// Windows 11 confirms V8_1 with AVC420_ENABLED cleared: it only enables H.264 for 10.x
+/// clients, and then sends AVC444, shown as its 4:2:0 main view. With `avc_thin_client`,
+/// Windows has been seen to send the whole desktop as AVC444 luma-only frames (graphics
+/// profile 2048 rather than mixed mode's 2), smooth but heavily quantized.
+fn egfx_capabilities(h264: bool, avc_thin_client: bool) -> Vec<CapabilitySet> {
+    let mut caps = vec![
+        CapabilitySet::V8_1 {
+            flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
+        },
+        CapabilitySet::V8 {
+            flags: CapabilitiesV8Flags::SMALL_CACHE,
+        },
+    ];
+    if h264 {
+        let mut flags = CapabilitiesV107Flags::SMALL_CACHE;
+        if avc_thin_client {
+            flags |= CapabilitiesV107Flags::AVC_THIN_CLIENT;
+        }
+        caps.insert(0, CapabilitySet::V10_7 { flags });
+    }
+    caps
+}
+
 #[expect(clippy::as_conversions, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn f64_to_u16_saturating_cast(value: f64) -> u16 {
     value as u16
@@ -2821,6 +2838,31 @@ fn f64_to_u16_saturating_cast(value: f64) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn avc_thin_client_sets_the_flag_on_the_10_7_set_only() {
+        let sets = egfx_capabilities(true, true);
+        assert_eq!(
+            sets[0],
+            CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::SMALL_CACHE | CapabilitiesV107Flags::AVC_THIN_CLIENT,
+            }
+        );
+        assert_eq!(&sets[1..], &egfx_capabilities(true, false)[1..]);
+        assert_eq!(
+            egfx_capabilities(true, false)[0],
+            CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::SMALL_CACHE,
+            }
+        );
+        // Without an H.264 decoder there is no 10.x set to carry the flag.
+        assert_eq!(egfx_capabilities(false, true), egfx_capabilities(false, false));
+        assert!(
+            !egfx_capabilities(false, true)
+                .iter()
+                .any(|set| matches!(set, CapabilitySet::V10_7 { .. }))
+        );
+    }
 
     #[test]
     fn codec_sessions_ask_for_32_bit_color() {
