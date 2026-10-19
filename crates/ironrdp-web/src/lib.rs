@@ -38,6 +38,17 @@ mod rdp_file;
 mod session;
 mod tls;
 
+/// The browser's wall clock in whole milliseconds; times EGFX QoE frame acknowledgements.
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "Date.now() is a non-negative count of milliseconds, well inside u64"
+)]
+fn clock_ms() -> u64 {
+    js_sys::Date::now() as u64
+}
+
 mod wasm_bridge {
     use tracing::debug;
 

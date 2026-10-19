@@ -100,7 +100,11 @@ impl EgfxBench {
         } else {
             None
         };
-        let mut client = GraphicsPipelineClient::new(Box::new(handler), decoder);
+        // The policy a session uses, so the bench exercises its acknowledgement path too.
+        let mut client = GraphicsPipelineClient::new(Box::new(handler), decoder).with_frame_ack_policy(
+            ironrdp_egfx::client::FrameAckPolicy::SuspendWhenCaughtUp,
+            crate::clock_ms,
+        );
         if let Presenter::Gl(gl) = &self.presenter {
             client = client.with_surface_backend(Box::new(gl.clone()));
         }

@@ -82,6 +82,16 @@ export function gpuRendering(enable: boolean): Extension {
 }
 
 /**
+ * Acknowledge EGFX frames the way Windows App does. On by default: once the client keeps up,
+ * it suspends frame acknowledgements so Windows does not pace itself to them, sends a QoE
+ * report per frame instead, and resumes acknowledging when it falls behind. Pass `false` to
+ * acknowledge every frame (the protocol's basic flow control).
+ */
+export function frameAckSuspend(enable: boolean): Extension {
+    return new Extension('frame_ack_suspend', enable);
+}
+
+/**
  * Play remote session audio (RDPSND) in the browser through Web Audio. Off by default.
  * Browsers only start audio after a user gesture on the page; connecting from a click satisfies that.
  */

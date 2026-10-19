@@ -35,7 +35,7 @@ use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd, RdpsndClientHandler};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_core::WriteBuf;
-use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
+use ironrdp_egfx::client::{FrameAckPolicy, GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp_egfx::decode::H264Decoder;
 use ironrdp_egfx::pdu::{CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet};
 use ironrdp_futures::{FramedWrite as _, single_sequence_step, single_sequence_step_read};
@@ -139,6 +139,10 @@ struct SessionBuilderInner {
     /// by default; set by the `gpu_rendering` extension. Falls back to the 2D canvas when
     /// WebGL2 is unavailable or the desktop exceeds the GPU's texture limit.
     use_gpu_rendering: bool,
+    /// Acknowledge EGFX frames the way Windows App does: suspend acknowledgements while the
+    /// client keeps up, so Windows does not pace itself to them, and send QoE reports
+    /// instead. On by default; the `frame_ack_suspend` extension turns it off.
+    frame_ack_suspend: bool,
     enable_audio_playback: bool,
     enable_credssp: bool,
     enable_standard_rdp_security: bool,
@@ -197,6 +201,7 @@ impl Default for SessionBuilderInner {
             use_egfx: true,
             use_h264: false,
             use_gpu_rendering: false,
+            frame_ack_suspend: true,
             enable_audio_playback: false,
             performance_flags: None,
             desktop_scale_factor: None,
@@ -324,6 +329,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |egfx: bool| { self.0.borrow_mut().use_egfx = egfx };
             |h264: bool| { self.0.borrow_mut().use_h264 = h264 };
             |gpu_rendering: bool| { self.0.borrow_mut().use_gpu_rendering = gpu_rendering };
+            |frame_ack_suspend: bool| { self.0.borrow_mut().frame_ack_suspend = frame_ack_suspend };
 
             |enable_audio_playback: bool| { self.0.borrow_mut().enable_audio_playback = enable_audio_playback };
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
@@ -779,6 +785,11 @@ impl SessionBuilder {
             use_egfx,
             h264_decoder,
             gpu_backend: gpu_backend.clone(),
+            frame_ack_policy: if self.0.borrow().frame_ack_suspend {
+                FrameAckPolicy::SuspendWhenCaughtUp
+            } else {
+                FrameAckPolicy::EveryFrame
+            },
             redirect,
             rdpsnd_backend,
         })
@@ -2320,6 +2331,7 @@ struct ConnectParams {
     h264_decoder: Option<Box<dyn H264Decoder>>,
     /// GPU surface backend for EGFX; `None` keeps the CPU compositor.
     gpu_backend: Option<crate::gpu::GlBackend>,
+    frame_ack_policy: FrameAckPolicy,
     /// Set when this connection follows a Server Redirection PDU.
     redirect: Option<RedirectConnector>,
     /// `Some` when the `enable_audio_playback` extension is on and Web Audio is available.
@@ -2377,6 +2389,7 @@ async fn connect(
         use_egfx,
         h264_decoder,
         gpu_backend,
+        frame_ack_policy,
         redirect,
         rdpsnd_backend,
     }: ConnectParams,
@@ -2567,7 +2580,8 @@ async fn connect(
                 h264: h264_decoder.is_some(),
                 logged_first_frame: false,
             };
-            let graphics = GraphicsPipelineClient::new(Box::new(handler), h264_decoder);
+            let graphics = GraphicsPipelineClient::new(Box::new(handler), h264_decoder)
+                .with_frame_ack_policy(frame_ack_policy, crate::clock_ms);
             let graphics = match gpu_backend {
                 Some(gl) => graphics.with_surface_backend(Box::new(gl)),
                 None => graphics,
