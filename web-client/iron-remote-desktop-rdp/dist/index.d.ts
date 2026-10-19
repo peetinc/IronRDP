@@ -1,3 +1,12 @@
+/**
+ * URL of the audio playout worklet module (`playout_worklet.js`, shipped next to this
+ * package's bundle), for pages whose Content Security Policy does not allow `blob:` in
+ * `script-src`. Serve it from the page's origin, e.g. with Vite:
+ * `import url from '@devolutions/iron-remote-desktop-rdp/playout_worklet.js?url'`.
+ * Without it the module is loaded from a Blob URL.
+ */
+export declare function audioWorkletUrl(url: string): Extension;
+
 export declare const Backend: {
     DesktopSize: typeof DesktopSize;
     InputTransaction: typeof InputTransaction;
