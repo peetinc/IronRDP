@@ -1,0 +1,26 @@
+[package]
+name = "ironrdp-rfx-worker"
+version = "0.0.0"
+readme = "README.md"
+description = "RemoteFX Progressive decoding as a standalone WebAssembly module, for browser Workers"
+publish = false
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+doctest = false
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ironrdp-graphics = { path = "../ironrdp-graphics" }
+
+[dev-dependencies]
+ironrdp-pdu = { path = "../ironrdp-pdu" }
+
+[lints]
+workspace = true

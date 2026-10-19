@@ -3300,6 +3300,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrdp-rfx-worker"
+version = "0.0.0"
+dependencies = [
+ "ironrdp-graphics",
+ "ironrdp-pdu",
+]
+
+[[package]]
 name = "ironrdp-rpc"
 version = "0.1.0"
 dependencies = [
