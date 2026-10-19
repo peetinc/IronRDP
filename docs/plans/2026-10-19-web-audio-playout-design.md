@@ -133,6 +133,15 @@ gap turned a paused video, where Windows stops sending, into a 2 s target. So:
   after a pause is not. Blocks with no known delay (queued while the worklet loaded) and
   values over 10 s (a wrapped 16-bit timestamp) fall back to the outage rule above.
 
+**Second revision: sync before smoothness (2026-10-19).** Every millisecond of target is audio
+behind the picture, and 400 ms was already visibly late. The user's ruling: take gaps from
+jitter rather than late audio. So the target is now `clamp(120 ms, 300 ms, latest + 60 ms)`,
+where `latest` is the latest arrival (`lateMs`, or the outage without it) of the last 30 s,
+kept as one maximum per second of context clock. It falls once late arrivals age out. The trim
+margin is 60 ms. A stall longer than about 300 ms now costs a gap, and the audio it held back
+is skipped instead of played late. This replaces `TARGET_START`, `TARGET_CEIL` and
+`GAP_MARGIN` in the table above and "the target never decays".
+
 **Reader.** The read position advances by a fixed `streamRate / contextRate` per output frame,
 with 4-point cubic (Catmull-Rom) interpolation. That is one continuous fractional reader, so
 there are no per-block resampling ticks. There is no rate skew.
@@ -202,8 +211,8 @@ Accept when:
 
 ## Open risks
 
-- **Latency only ratchets up**, to at most 2 s. A single long stall raises latency for the
-  rest of the session. Trimming bounds depth to the target, not the target itself.
+- **Gaps on a jittery link.** With the 300 ms ceiling, a link whose arrivals stall longer than
+  that drops out briefly on each stall. That is the chosen trade for sync.
 - **Clock drift between the server and the AudioContext** (tens of ppm) slowly grows or
   shrinks depth, about 0.2 s per hour. An underrun or the 4 s ring bounds it. Measured
   per session through the delay stats.

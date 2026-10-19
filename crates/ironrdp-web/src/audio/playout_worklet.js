@@ -3,10 +3,13 @@
 // The main thread posts decoded planar f32 blocks (`{ type: 'block', rate, channels, lateMs }`);
 // this module keeps them in a ring buffer and plays them through one continuous fractional
 // reader. Blocks reach the main thread in bursts on a jittery WAN link, so playback waits until
-// the ring holds `target` of audio, and `target` rises to cover the latest arrival seen:
-// `lateMs`, how far behind its server timestamp a block arrived. A pause in the stream (Windows
-// stops sending while nothing plays) resumes with fresh blocks and raises nothing. Without
-// `lateMs`, `target` rises when the ring runs dry, to cover the outage that emptied it. Bursts only refill what a gap drained, so the ring holds about
+// the ring holds `target` of audio. `target` covers the latest arrival of the last
+// `LATE_WINDOW_SECS`: `lateMs`, how far behind its server timestamp a block arrived. A pause in
+// the stream (Windows stops sending while nothing plays) resumes with fresh blocks and raises
+// nothing. Without `lateMs`, the outage that emptied the ring counts instead.
+//
+// Audio stays in step with the picture before it plays without gaps: `target` is at most
+// `TARGET_CEIL_MS`, so a longer stall costs a gap, and the audio it held back is skipped. Bursts only refill what a gap drained, so the ring holds about
 // `target` in steady play. More than that means playback stopped while audio kept arriving
 // (a hidden tab, an output device switch): the reader then fades out, skips to the newest
 // `target` of audio and fades back in, so sound stays in step with the picture.
@@ -15,10 +18,12 @@
 // bottom only adapts it to the AudioWorklet API. See
 // `docs/plans/2026-10-19-web-audio-playout-design.md`.
 
-const TARGET_START_MS = 400;
-const TARGET_CEIL_MS = 2000;
-// Added to the outage that caused an underrun when raising the target.
-const GAP_MARGIN_MS = 100;
+const TARGET_FLOOR_MS = 120;
+const TARGET_CEIL_MS = 300;
+// Added to the latest arrival when setting the target.
+const GAP_MARGIN_MS = 60;
+// How long a late arrival keeps the target raised.
+const LATE_WINDOW_SECS = 30;
 const RING_SECS = 4;
 // A larger `lateMs` is a broken server clock (a wrapped 16-bit timestamp), not a stall.
 const LATE_VALID_MS = 10000;
@@ -26,7 +31,7 @@ const FADE_IN_MS = 5;
 // Playback fades out once less than this much audio remains, so running dry never clicks.
 const FADE_OUT_MS = 2;
 // Depth beyond `target` that makes the reader skip the excess, and the fade around the skip.
-const TRIM_MARGIN_MS = 150;
+const TRIM_MARGIN_MS = 60;
 const TRIM_FADE_MS = 5;
 const STATS_INTERVAL_SECS = 1;
 
@@ -43,7 +48,11 @@ export class Playout {
         this.written = 0;
         this.head = 0;
         this.state = BUFFERING;
-        this.targetMs = TARGET_START_MS;
+        this.targetMs = TARGET_FLOOR_MS;
+        // The latest arrival in each of the last `LATE_WINDOW_SECS` seconds, by context clock.
+        this.lateBySecond = new Float64Array(LATE_WINDOW_SECS);
+        this.lateSecond = 0;
+        this.nextSecondClock = contextRate;
         this.gain = 0;
         // Context frames rendered so far: the module's clock.
         this.clock = 0;
@@ -72,14 +81,11 @@ export class Playout {
         }
 
         if (Number.isFinite(lateMs) && 0 <= lateMs && lateMs < LATE_VALID_MS) {
-            this.gapMsMax = Math.max(this.gapMsMax, lateMs);
-            this.targetMs = Math.min(TARGET_CEIL_MS, Math.max(this.targetMs, lateMs + GAP_MARGIN_MS));
+            this.noteLate(lateMs);
             this.awaitingRefill = false;
         } else if (this.awaitingRefill && this.lastPushClock >= 0) {
             // The outage that emptied the ring: from the last arrival before it to this one.
-            const outageMs = ((this.clock - this.lastPushClock) / this.contextRate) * 1000;
-            this.gapMsMax = Math.max(this.gapMsMax, outageMs);
-            this.targetMs = Math.min(TARGET_CEIL_MS, Math.max(this.targetMs, outageMs + GAP_MARGIN_MS));
+            this.noteLate(((this.clock - this.lastPushClock) / this.contextRate) * 1000);
             this.awaitingRefill = false;
         }
         this.lastPushClock = this.clock;
@@ -156,6 +162,12 @@ export class Playout {
         }
 
         this.clock += length;
+        if (this.nextSecondClock <= this.clock) {
+            this.nextSecondClock += this.contextRate;
+            this.lateSecond = (this.lateSecond + 1) % LATE_WINDOW_SECS;
+            this.lateBySecond[this.lateSecond] = 0;
+            this.updateTarget();
+        }
         const depth = this.depthMs();
         this.depthSum += depth;
         this.depthCount++;
@@ -178,6 +190,20 @@ export class Playout {
             p1 +
             0.5 * t * (p2 - p0 + t * (2 * p0 - 5 * p1 + 4 * p2 - p3 + t * (3 * (p1 - p2) + p3 - p0)))
         );
+    }
+
+    noteLate(lateMs) {
+        this.gapMsMax = Math.max(this.gapMsMax, lateMs);
+        this.lateBySecond[this.lateSecond] = Math.max(this.lateBySecond[this.lateSecond], lateMs);
+        this.updateTarget();
+    }
+
+    updateTarget() {
+        let late = 0;
+        for (let i = 0; i < LATE_WINDOW_SECS; i++) {
+            late = Math.max(late, this.lateBySecond[i]);
+        }
+        this.targetMs = Math.min(TARGET_CEIL_MS, Math.max(TARGET_FLOOR_MS, late + GAP_MARGIN_MS));
     }
 
     /** Moves the read position to the newest `target` of audio, counting what it skips. */

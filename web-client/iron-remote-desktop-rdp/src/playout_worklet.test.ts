@@ -35,6 +35,13 @@ class Rig {
     }
 }
 
+// The worklet's latency bounds: audio stays in step with the picture, at the cost of a
+// gap when a stall outlasts the ceiling.
+const TARGET_FLOOR_MS = 120;
+const TARGET_CEIL_MS = 300;
+const GAP_MARGIN_MS = 60;
+const TRIM_MARGIN_MS = 60;
+
 function silentBlock(): Float32Array[] {
     return [new Float32Array(BLOCK_FRAMES), new Float32Array(BLOCK_FRAMES)];
 }
@@ -44,34 +51,62 @@ function blocksFor(ms: number): number {
 }
 
 describe('Playout', () => {
-    it('burst pattern from the log plays without gaps after adaptation', () => {
-        // The server produces one block every 23.2 ms. The client receives them in clumps:
-        // every block produced so far, delivered at once, separated by these gaps (ms) as in
-        // the captured WAN log: short gaps, then a 650 ms stall.
-        const gaps = [80, 100, 650, 90, 120, 300, 650, 100, 80, 650, 110, 90, 650, 100, 650, 100];
-        const rig = new Rig();
-        let produced = 0;
+    /**
+     * The server produces one block every 23.2 ms. The client receives them in clumps: every
+     * block produced so far, delivered at once, separated by `gaps` (ms). Returns the deepest
+     * the ring got, sampled every quantum.
+     */
+    function playBursts(rig: Rig, gaps: number[], onDelivery?: (index: number) => void): number {
         let delivered = 0;
         let now = 0;
-        let underrunsAfterWarmup = -1;
+        let deepest = 0;
         gaps.forEach((gap, index) => {
-            now += gap;
-            rig.renderUntil(now);
-            produced = Math.floor(now / BLOCK_MS);
+            const end = now + gap;
+            while (rig.nowMs < end) {
+                rig.renderUntil(rig.nowMs + 1);
+                deepest = Math.max(deepest, rig.playout.depthMs());
+            }
+            now = end;
+            const produced = Math.floor(now / BLOCK_MS);
             for (; delivered < produced; delivered++) {
                 // How late the block arrives: it was produced at the end of its own span.
                 rig.push(silentBlock(), now - (delivered + 1) * BLOCK_MS);
             }
-            if (index === 5) {
+            onDelivery?.(index);
+        });
+        return deepest;
+    }
+
+    it('moderate jitter plays without gaps after adaptation', () => {
+        const gaps = [80, 100, 200, 90, 120, 150, 200, 100, 80, 200, 110, 90, 150, 100, 200, 100];
+        const rig = new Rig();
+        let underrunsAfterWarmup = -1;
+        playBursts(rig, gaps, (index) => {
+            if (index === 2) {
                 // Warmup: the target adapts to the first late burst.
                 underrunsAfterWarmup = rig.playout.stats().underruns;
             }
         });
 
         const stats = rig.playout.stats();
-        expect(stats.droppedMs).toBe(0);
         expect(stats.underruns).toBe(underrunsAfterWarmup);
-        expect(stats.targetMs).toBeLessThanOrEqual(2000);
+        expect(stats.droppedMs).toBe(0);
+        expect(stats.targetMs).toBeLessThanOrEqual(TARGET_CEIL_MS);
+    });
+
+    it('stalls beyond the ceiling cost a gap, not latency', () => {
+        // The captured WAN log: short gaps, then 650 ms stalls.
+        const gaps = [80, 100, 650, 90, 120, 300, 650, 100, 80, 650, 110, 90, 650, 100, 650, 100];
+        const rig = new Rig();
+        const deepest = playBursts(rig, gaps);
+
+        const stats = rig.playout.stats();
+        expect(stats.targetMs).toBe(TARGET_CEIL_MS);
+        // Stale audio is skipped rather than played late: depth never exceeds the ceiling by
+        // more than the trim margin and one block.
+        expect(deepest).toBeLessThanOrEqual(TARGET_CEIL_MS + TRIM_MARGIN_MS + BLOCK_MS);
+        expect(stats.trimmedMs).toBeGreaterThan(0);
+        expect(stats.droppedMs).toBe(0);
     });
 
     it('sine has no discontinuity across blocks and rate conversion', () => {
@@ -103,29 +138,27 @@ describe('Playout', () => {
         expect(worst).toBeLessThanOrEqual(maxStep * 1.05);
     });
 
-    it('underrun raises target to the outage plus margin, capped at ceiling', () => {
+    it('without timestamps an outage raises the target, up to the ceiling', () => {
         const rig = new Rig();
         for (let i = 0; i < blocksFor(500); i++) {
             rig.push(silentBlock());
         }
-        rig.renderUntil(600); // plays the 500 ms, then runs dry
-        rig.renderUntil(1600); // ~1 s of silence while buffering
-        for (let i = 0; i < blocksFor(2500); i++) {
+        rig.renderUntil(200); // plays the newest 120 ms, then runs dry
+        for (let i = 0; i < blocksFor(500); i++) {
             rig.push(silentBlock());
         }
-        rig.renderUntil(1700);
-        // Nothing arrived for 1.6 s: that outage, plus the margin, becomes the target.
+        rig.renderUntil(210);
+        // Nothing arrived for 200 ms: that outage, plus the margin, becomes the target.
         const raised = rig.playout.stats().targetMs;
-        expect(raised).toBeGreaterThanOrEqual(1650);
-        expect(raised).toBeLessThanOrEqual(1750);
+        expect(raised).toBeGreaterThanOrEqual(200 + GAP_MARGIN_MS - 5);
+        expect(raised).toBeLessThanOrEqual(200 + GAP_MARGIN_MS + 5);
 
-        rig.renderUntil(4300); // plays out, then runs dry again
-        rig.renderUntil(7500); // a 3 s outage
-        for (let i = 0; i < blocksFor(2500); i++) {
+        rig.renderUntil(2000); // runs dry: a 1.8 s outage
+        for (let i = 0; i < blocksFor(500); i++) {
             rig.push(silentBlock());
         }
-        rig.renderUntil(7600);
-        expect(rig.playout.stats().targetMs).toBe(2000);
+        rig.renderUntil(2010);
+        expect(rig.playout.stats().targetMs).toBe(TARGET_CEIL_MS);
     });
 
     it('backlog above target is trimmed back to target while playing', () => {
@@ -133,18 +166,19 @@ describe('Playout', () => {
         for (let i = 0; i < blocksFor(500); i++) {
             rig.push(silentBlock());
         }
-        rig.renderUntil(100);
+        rig.renderUntil(50);
+        const trimmedBefore = rig.playout.stats().trimmedMs;
         // Playback stalled elsewhere (hidden tab, output device switch) while audio kept
         // arriving: 3 s lands on top of what is queued.
         for (let i = 0; i < blocksFor(3000); i++) {
             rig.push(silentBlock());
         }
-        rig.renderUntil(150);
+        rig.renderUntil(100);
 
         const stats = rig.playout.stats();
-        expect(rig.playout.depthMs()).toBeLessThanOrEqual(stats.targetMs + 50);
-        expect(stats.trimmedMs).toBeGreaterThan(2900);
-        expect(stats.trimmedMs).toBeLessThan(3200);
+        expect(rig.playout.depthMs()).toBeLessThanOrEqual(stats.targetMs + TRIM_MARGIN_MS);
+        expect(stats.trimmedMs - trimmedBefore).toBeGreaterThan(2900);
+        expect(stats.trimmedMs - trimmedBefore).toBeLessThan(3100);
         expect(stats.droppedMs).toBe(0);
         expect(stats.underruns).toBe(0);
     });
@@ -195,17 +229,33 @@ describe('Playout', () => {
         expect(worst).toBeLessThanOrEqual(maxStep * 1.05 + fadeStep);
     });
 
-    it('a late block raises the target before the ring runs dry', () => {
+    it('a late block raises the target before the ring runs dry, up to the ceiling', () => {
         const rig = new Rig();
         for (let i = 0; i < blocksFor(500); i++) {
             rig.push(silentBlock(), 0);
         }
-        rig.renderUntil(100);
-        rig.push(silentBlock(), 900);
+        rig.renderUntil(50);
+        rig.push(silentBlock(), 150);
+        expect(rig.playout.stats().targetMs).toBe(150 + GAP_MARGIN_MS);
+        expect(rig.playout.stats().underruns).toBe(0);
 
-        const stats = rig.playout.stats();
-        expect(stats.targetMs).toBe(1000);
-        expect(stats.underruns).toBe(0);
+        rig.push(silentBlock(), 900);
+        expect(rig.playout.stats().targetMs).toBe(TARGET_CEIL_MS);
+    });
+
+    it('the target falls back once late blocks age out', () => {
+        const rig = new Rig();
+        rig.push(silentBlock(), 200);
+        expect(rig.playout.stats().targetMs).toBe(200 + GAP_MARGIN_MS);
+        // 31 s of on-time blocks.
+        for (let block = 0; block * BLOCK_MS < 31_000; block++) {
+            rig.renderUntil(block * BLOCK_MS);
+            rig.push(silentBlock(), 0);
+        }
+        rig.renderUntil(31_100);
+
+        expect(rig.playout.stats().targetMs).toBe(TARGET_FLOOR_MS);
+        expect(rig.playout.depthMs()).toBeLessThanOrEqual(TARGET_FLOOR_MS + TRIM_MARGIN_MS);
     });
 
     it('a pause in the stream leaves the target alone', () => {
@@ -221,14 +271,14 @@ describe('Playout', () => {
         }
         rig.renderUntil(60_100);
 
-        expect(rig.playout.stats().targetMs).toBe(400);
+        expect(rig.playout.stats().targetMs).toBe(TARGET_FLOOR_MS);
     });
 
     it('an implausible lateness is ignored', () => {
         // A wrapped 16-bit server timestamp reads as a delay of days.
         const rig = new Rig();
         rig.push(silentBlock(), 4_294_967_000);
-        expect(rig.playout.stats().targetMs).toBe(400);
+        expect(rig.playout.stats().targetMs).toBe(TARGET_FLOOR_MS);
     });
 
     it('full ring drops oldest with fade and counts it', () => {
