@@ -453,6 +453,14 @@ export declare interface FileWriteHandle {
 }
 
 /**
+ * Acknowledge EGFX frames the way Windows App does. On by default: once the client keeps up,
+ * it suspends frame acknowledgements so Windows does not pace itself to them, sends a QoE
+ * report per frame instead, and resumes acknowledging when it falls behind. Pass `false` to
+ * acknowledge every frame (the protocol's basic flow control).
+ */
+export declare function frameAckSuspend(enable: boolean): Extension;
+
+/**
  * Renders EGFX on the GPU (WebGL2): surfaces live in textures and H.264 frames are drawn
  * without being read back. Off by default. Falls back to the 2D canvas without WebGL2, or
  * when the desktop is larger than the GPU's texture limit. A lost GPU context ends the session.
