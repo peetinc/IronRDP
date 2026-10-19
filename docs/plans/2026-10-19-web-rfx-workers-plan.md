@@ -166,17 +166,96 @@ waiting for a `fenceSync` with `clientWaitSync` polled at 0 timeout, after `flus
 
 ---
 
-## Stages 1–4 (outlined; detailed after stage 0)
+## Stage 1 (detailed after stage 0)
 
-- **Stage 1:** `ProgressiveBackend` and the pending integration in `ironrdp-egfx`, with a fake
-  backend. Tests:
-  - late and out-of-order completion;
-  - control order across submit-ahead;
-  - Create/DeleteSurface barriers;
-  - acks after the frame's jobs;
-  - an error is fatal.
+Shared names, in `crates/ironrdp-egfx/src/decode.rs`:
 
-  The bench's drain learns to wait for progressive jobs (`is_awaiting_decoder`).
+```rust
+pub enum ProgressiveControl { StartFrame, EndFrame, DeleteContext { surface_id: u16, codec_context_id: u32 }, DeleteSurface { surface_id: u16 } }
+pub struct DecodedTiles { pub external: Option<u64>, pub tiles: Vec<ironrdp_graphics::progressive::DecodedTile> }
+pub struct ProgressiveJobError { pub reason: &'static str }
+pub trait ProgressiveBackend: Send {
+    fn max_in_flight(&self) -> usize;
+    fn submit(&mut self, job: u32, surface_id: u16, codec_context_id: u32, width: u16, height: u16, data: &[u8]);
+    fn control(&mut self, control: ProgressiveControl);
+    /// The result of `job` once complete; `None` while it decodes. Jobs complete in submission order.
+    fn poll(&mut self, job: u32) -> Option<Result<DecodedTiles, ProgressiveJobError>>;
+}
+```
+
+The client:
+- **Builder:** `GraphicsPipelineClient::with_progressive_backend(self, Box<dyn ProgressiveBackend>) -> Self`.
+- **Pending entries:**
+  - `Pending::Progressive(DeferredProgressive { job, surface_id })`;
+  - `Pending::Forwarded(GfxPdu)`: a progressive control already given to the backend by
+    submit-ahead. When it applies, it is handled without forwarding it again.
+- **Surface backend:** `SurfaceBackend::write_external_tiles(&mut self, surface_id: u16, handle: u64)`,
+  with a default that warns.
+
+### Task 4: Asynchronous progressive path, applied in stream order
+
+**Files:**
+- Modify: `crates/ironrdp-egfx/src/decode.rs` (the types above);
+- Modify: `crates/ironrdp-egfx/src/compositor.rs` (`write_external_tiles` default);
+- Modify: `crates/ironrdp-egfx/src/client.rs`;
+- Tests: `client.rs` tests, with a `FakeProgressive` backend recording `submit`/`control` calls
+  as strings and completing jobs the test chooses.
+
+- [ ] **Step 1: Write the failing tests.**
+  - `progressive_jobs_apply_in_stream_order_when_completed_out_of_order`. Two W2S2 commands
+    for the 64×64 deferred surface. Job 2 completes first: nothing applies. Then job 1
+    completes: both apply, and the pixel is job 2's.
+  - `commands_behind_a_progressive_job_wait_for_it`. A W2S2 then a red SolidFill: while the
+    job is pending the output is empty. After it, the fill is on top.
+  - `a_failed_progressive_job_is_a_session_error`: `resume()` returns `Err`.
+  - `frame_ack_waits_for_the_frames_progressive_job`: no `FrameAcknowledge` until the job
+    completes.
+  - `controls_reach_the_backend_when_applied`. StartFrame, DeleteEncodingContext and EndFrame
+    are forwarded, and `ProgressiveDecoder` is unused. ResetGraphics is never forwarded.
+- [ ] **Step 2: Run.** `cargo test -p ironrdp-egfx --lib progressive_`. Expected: compile
+  failure (missing types).
+- [ ] **Step 3: Implement** the Task 4 half: no submit-ahead yet, so a W2S2 submits when it
+  reaches handling. Then:
+  - `is_awaiting_decoder` covers progressive jobs;
+  - the backlog cap counts only `Pdu`/`Forwarded` entries.
+- [ ] **Step 4: Run.** `cargo test -p ironrdp-egfx`. Expected: all pass, the existing 80 included.
+- [ ] **Step 5: Commit.** `feat(egfx): asynchronous RemoteFX Progressive backend, applied in stream order`.
+
+### Task 5: Progressive submit-ahead, with controls forwarded in stream order
+
+**Files:** `crates/ironrdp-egfx/src/client.rs` and its tests.
+
+- [ ] **Step 1: Write the failing tests.**
+  - `progressive_commands_submit_ahead_up_to_the_limit`: with limit 2 and three queued
+    behind a pending H.264 frame, two are submitted.
+  - `controls_reach_the_backend_in_stream_order_across_submit_ahead`. The backend's call log is
+    exactly:
+
+    ```
+    start, submit 1, delete_context, submit 2, end, start, submit 3, end
+    ```
+
+    That is for: frame 1 with W2S2, DeleteEncodingContext, W2S2, EndFrame; then frame 2 with
+    W2S2, EndFrame. All queued behind a pending job, then everything completes. No call is
+    repeated after the jobs apply.
+  - `create_and_delete_surface_stop_progressive_submit_ahead`: a W2S2 queued after a
+    CreateSurface or DeleteSurface is not submitted until that applies, and then with the new
+    size.
+  - `reset_graphics_stops_progressive_submit_ahead`.
+- [ ] **Step 2: Run.** `cargo test -p ironrdp-egfx --lib progressive_`. Expected: the new tests fail
+  (submission happens late).
+- [ ] **Step 3: Implement.** `submit_ahead` also walks for progressive:
+  - submit W2S2 while under `max_in_flight`;
+  - forward StartFrame, EndFrame and DeleteEncodingContext, replacing them with `Forwarded`;
+  - stop at ResetGraphics, CapabilitiesConfirm, CreateSurface and DeleteSurface, and at a W2S2
+    over the limit;
+  - `bench.rs`'s drain needs nothing more, since `is_awaiting_decoder` covers it.
+- [ ] **Step 4: Run.** `cargo test -p ironrdp-egfx`. Expected: all pass. Then
+  `cargo clippy -p ironrdp-egfx --tests`. Expected: clean.
+- [ ] **Step 5: Commit.** `feat(egfx): submit RemoteFX Progressive commands ahead, controls in stream order`.
+
+## Stages 2–4 (outlined)
+
 - **Stage 2:** one Worker, GPU only. Covers:
   - the `ironrdp-rfx-worker` cdylib and `rfx_worker.js`;
   - Blob URL and `rfxWorkerUrl`;
