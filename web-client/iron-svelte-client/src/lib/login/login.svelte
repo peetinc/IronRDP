@@ -11,6 +11,7 @@
         egfx,
         h264,
         avcThinClient,
+        rfxWorkers,
         gpuRendering,
         enableAudioPlayback,
         enableCredssp,
@@ -53,6 +54,7 @@
     let enable_h264 = import.meta.env.VITE_RIG_H264 === 'true';
     let enable_gpu = import.meta.env.VITE_RIG_GPU === 'true';
     let enable_thin_client = import.meta.env.VITE_RIG_THIN_CLIENT === 'true';
+    let enable_rfx_workers = import.meta.env.VITE_RIG_RFX_WORKERS === 'true';
     let enable_audio = true;
     let visual_effects = import.meta.env.VITE_RIG_VISUAL_EFFECTS === 'true';
     let enable_nla = true;
@@ -220,6 +222,7 @@
             .withExtension(egfx(enable_egfx))
             .withExtension(h264(enable_h264))
             .withExtension(avcThinClient(enable_thin_client))
+            .withExtension(rfxWorkers(enable_rfx_workers))
             .withExtension(gpuRendering(enable_gpu))
             .withExtension(
                 performanceFlags(
@@ -464,6 +467,15 @@
                                     style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
                                 />
                                 <label for="enable_thin_client">Full-screen H.264 (thin client)</label>
+                            </div>
+                            <div class="checkbox-wrapper">
+                                <input
+                                    id="enable_rfx_workers"
+                                    type="checkbox"
+                                    bind:checked={enable_rfx_workers}
+                                    style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
+                                />
+                                <label for="enable_rfx_workers">RemoteFX workers (needs GPU)</label>
                             </div>
                             <div class="checkbox-wrapper">
                                 <input

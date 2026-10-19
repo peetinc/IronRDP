@@ -4,6 +4,8 @@
     // Usage: /bench?capture=mixed-17-31.bin&h264=1&gpu=1
     // verify=1 replays on the CPU and then the GPU and compares sampled pixels every 100 frames.
     // lose=1 (with gpu=1) drops the GPU context mid-run.
+    // workers=1 (with gpu=1) decodes RemoteFX in a Web Worker; verify=workers also decodes every
+    // job in-thread and compares the Worker's bytes (workerJobs, workerMismatches).
     import { onMount } from 'svelte';
     import { init, EgfxBench } from '../../../static/iron-remote-desktop-rdp';
 
@@ -46,17 +48,19 @@
         const h264 = params.get('h264') === '1';
         const gpu = params.get('gpu') === '1';
         const verify = params.get('verify') === '1';
+        const workers = params.get('workers') === '1' || params.get('verify') === 'workers';
+        const verifyWorkers = params.get('verify') === 'workers';
         try {
             await init('warn');
             status = `fetching ${capture}`;
             const bytes = new Uint8Array(await (await fetch(`/bench/${capture}`)).arrayBuffer());
             if (verify) {
                 status = `verifying ${capture}: CPU pass`;
-                const cpu = (await (await EgfxBench.create(verifyCanvas, h264, false)).run(bytes, 100)) as {
+                const cpu = (await (await EgfxBench.create(verifyCanvas, h264, false, false, false)).run(bytes, 100)) as {
                     samples: Uint8Array[];
                 };
                 status = `verifying ${capture}: GPU pass`;
-                const gpuRun = (await (await EgfxBench.create(canvas, h264, true)).run(bytes, 100)) as {
+                const gpuRun = (await (await EgfxBench.create(canvas, h264, true, false, false)).run(bytes, 100)) as {
                     samples: Uint8Array[];
                 };
                 // Per checkpoint: sampled pixels that differ at all, and by more than 2 per channel.
@@ -80,7 +84,7 @@
                 return;
             }
 
-            const bench = await EgfxBench.create(canvas, h264, gpu);
+            const bench = await EgfxBench.create(canvas, h264, gpu, workers, verifyWorkers);
             status = `replaying ${capture} (${(bytes.length / 1e6).toFixed(1)} MB)`;
             // lose=1 drops the GPU context 2 s in (it fires while the pipeline awaits a
             // decoder), to check the run ends with "GPU context lost".
@@ -95,7 +99,7 @@
             delete run.samples;
             const profile = profiler ? summarize(await profiler.stop()) : null;
 
-            result = { capture, h264, gpu, ...run, ...(profile ?? {}) };
+            result = { capture, h264, gpu, workers, verifyWorkers, ...run, ...(profile ?? {}) };
             status = 'done';
         } catch (error) {
             result = { capture, error: String(error) };

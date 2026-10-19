@@ -37,7 +37,8 @@ fn draw_tiles_as_the_client_does(
             let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
             let mut crop = Vec::new();
             for y in 0..usize::from(h) {
-                let start = ((usize::from(rect.top - top) + y) * usize::from(TILE_DIM) + usize::from(rect.left - left)) * 4;
+                let start =
+                    ((usize::from(rect.top - top) + y) * usize::from(TILE_DIM) + usize::from(rect.left - left)) * 4;
                 crop.extend_from_slice(&tile.pixels[start..start + usize::from(w) * 4]);
             }
             draw(surface, surface_width, rect.left, rect.top, w, h, &crop);
@@ -48,11 +49,17 @@ fn draw_tiles_as_the_client_does(
 }
 
 /// Draws packed placements onto an RGBA surface; returns their rectangles.
-fn draw_placements(surface: &mut [u8], surface_width: u16, pixels: &[u8], placements: &[i32]) -> Vec<ExclusiveRectangle> {
+fn draw_placements(
+    surface: &mut [u8],
+    surface_width: u16,
+    pixels: &[u8],
+    placements: &[i32],
+) -> Vec<ExclusiveRectangle> {
     placements
         .chunks_exact(5)
         .map(|p| {
-            let [left, top, width, height, offset] = [p[0], p[1], p[2], p[3], p[4]].map(|v| usize::try_from(v).unwrap());
+            let [left, top, width, height, offset] =
+                [p[0], p[1], p[2], p[3], p[4]].map(|v| usize::try_from(v).unwrap());
             let [left, top, width, height] = [left, top, width, height].map(|v| u16::try_from(v).unwrap());
             draw(surface, surface_width, left, top, width, height, &pixels[offset..]);
             ExclusiveRectangle {
@@ -85,7 +92,9 @@ fn pack_tiles_reproduces_the_clients_tile_writes() {
 
 #[test]
 fn pack_tiles_clips_tiles_at_the_surface_edge() {
-    let pixels_of_tile: Vec<u8> = (0..64u32 * 64).flat_map(|i| [u8::try_from(i % 64).unwrap(), u8::try_from(i / 64).unwrap(), 7, 0xFF]).collect();
+    let pixels_of_tile: Vec<u8> = (0..64u32 * 64)
+        .flat_map(|i| [u8::try_from(i % 64).unwrap(), u8::try_from(i / 64).unwrap(), 7, 0xFF])
+        .collect();
     let tile = DecodedTile {
         x_idx: 1,
         y_idx: 0,
@@ -103,7 +112,10 @@ fn pack_tiles_clips_tiles_at_the_surface_edge() {
     assert_eq!(placements, [64, 0, 36, 64, 0]);
     assert_eq!(pixels.len(), 36 * 64 * 4);
     for y in 0..64 {
-        assert_eq!(&pixels[y * 36 * 4..(y + 1) * 36 * 4], &pixels_of_tile[y * 64 * 4..y * 64 * 4 + 36 * 4]);
+        assert_eq!(
+            &pixels[y * 36 * 4..(y + 1) * 36 * 4],
+            &pixels_of_tile[y * 64 * 4..y * 64 * 4 + 36 * 4]
+        );
     }
 }
 
@@ -117,7 +129,9 @@ fn worker_decoder_matches_progressive_decoder() {
         worker.control(CONTROL_END_FRAME, 0, 0);
 
         reference.begin_frame();
-        let tiles = reference.decode_bitmap(0, 1, WIDTH, HEIGHT, pass).expect("reference decodes");
+        let tiles = reference
+            .decode_bitmap(0, 1, WIDTH, HEIGHT, pass)
+            .expect("reference decodes");
         reference.end_frame();
         let (mut pixels, mut placements) = (Vec::new(), Vec::new());
         pack_tiles(WIDTH, HEIGHT, &tiles, &mut pixels, &mut placements);
@@ -134,6 +148,10 @@ fn worker_decoder_reports_decode_errors_by_code() {
     let code = worker
         .submit(0, 1, WIDTH, HEIGHT, &[0xFF; 32])
         .expect_err("garbage does not decode");
-    assert!(error_reason(code).starts_with("rfx progressive decode failed"), "{}", error_reason(code));
+    assert!(
+        error_reason(code).starts_with("rfx progressive decode failed"),
+        "{}",
+        error_reason(code)
+    );
     assert!(worker.placements().is_empty(), "a failed job leaves no result");
 }

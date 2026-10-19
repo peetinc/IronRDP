@@ -103,6 +103,16 @@ export function avcThinClient(enable: boolean): Extension {
 }
 
 /**
+ * Decode RemoteFX Progressive in a Web Worker instead of on the page's main thread. Off by
+ * default; takes effect only with `gpuRendering(true)`. Keeps Windows' sharp mode from
+ * stalling the page (and the audio) while it decodes. If the Worker cannot start, RemoteFX
+ * decodes on the main thread as before; if it fails mid-session, the session ends.
+ */
+export function rfxWorkers(enable: boolean): Extension {
+    return new Extension('rfx_workers', enable);
+}
+
+/**
  * Play remote session audio (RDPSND) in the browser through Web Audio. Off by default.
  * Browsers only start audio after a user gesture on the page; connecting from a click satisfies that.
  */

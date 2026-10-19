@@ -46,6 +46,7 @@ ironrdp-cliprdr-format.path = "../ironrdp-cliprdr-format"
 # wasm-clean codecs (progressive RFX, ClearCodec, planar, uncompressed) are
 # negotiated.
 ironrdp-egfx.path = "../ironrdp-egfx"
+ironrdp-rfx-worker.path = "../ironrdp-rfx-worker"
 ironrdp-futures.path = "../ironrdp-futures"
 ironrdp-pdu.path = "../ironrdp-pdu"
 ironrdp-propertyset.path = "../ironrdp-propertyset"
@@ -66,7 +67,9 @@ web-sys = { version = "0.3", features = [
     "AudioNode",
     "AudioScheduledSourceNode",
     "Blob",
+    "BlobPropertyBag",
     "CanvasRenderingContext2d",
+    "ErrorEvent",
     "EventTarget",
     "File",
     "FileSystemCreateWritableOptions",
@@ -79,13 +82,17 @@ web-sys = { version = "0.3", features = [
     "FileSystemWritableFileStream",
     "HtmlCanvasElement",
     "ImageData",
+    "MessageEvent",
     "Navigator",
     "Performance",
+    "Url",
     "WebGl2RenderingContext",
+    "WebGlBuffer",
     "WebGlContextAttributes",
     "WebGlFramebuffer",
     "WebGlTexture",
     "Window",
+    "Worker",
     "WritableStream",
 ] }
 js-sys = "0.3"

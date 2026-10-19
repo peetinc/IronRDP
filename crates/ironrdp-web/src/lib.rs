@@ -35,6 +35,7 @@ mod input;
 mod network_client;
 mod printer;
 mod rdp_file;
+mod rfx_worker;
 mod session;
 mod tls;
 

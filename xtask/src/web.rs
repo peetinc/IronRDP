@@ -50,7 +50,23 @@ pub fn run(sh: &Shell) -> anyhow::Result<()> {
 }
 
 pub fn build(sh: &Shell, wasm_pack_dev: bool) -> anyhow::Result<()> {
+    // The RemoteFX decode Worker's module, embedded into ironrdp-web by its build script.
+    let worker_profile = if wasm_pack_dev { "debug" } else { "release" };
+    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_owned());
+    let worker_wasm = sh
+        .current_dir()
+        .join(target_dir)
+        .join("wasm32-unknown-unknown")
+        .join(worker_profile)
+        .join("ironrdp_rfx_worker.wasm");
+    let _worker_guard = sh.push_env("IRONRDP_RFX_WORKER_WASM", &worker_wasm);
+
     if wasm_pack_dev {
+        cmd!(
+            sh,
+            "{CARGO} build -p ironrdp-rfx-worker --target wasm32-unknown-unknown"
+        )
+        .run()?;
         run_cmd_in!(sh, IRONRDP_WEB_PATH, "wasm-pack build --dev --target web")?;
     } else {
         let _env_guard = sh.push_env(
@@ -58,6 +74,11 @@ pub fn build(sh: &Shell, wasm_pack_dev: bool) -> anyhow::Result<()> {
             "-Ctarget-feature=+simd128,+bulk-memory --cfg getrandom_backend=\"wasm_js\"
                 -Copt-level=3 -Ccodegen-units=1 -Cllvm-args=-enable-dfa-jump-thread",
         );
+        cmd!(
+            sh,
+            "{CARGO} build -p ironrdp-rfx-worker --target wasm32-unknown-unknown --release"
+        )
+        .run()?;
         run_cmd_in!(sh, IRONRDP_WEB_PATH, "wasm-pack build --target web")?;
     }
 

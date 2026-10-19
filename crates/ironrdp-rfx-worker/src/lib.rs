@@ -193,7 +193,14 @@ mod abi {
     ///
     /// `ptr` must point to `len` initialized bytes, as from [`rfx_alloc`] filled by the caller.
     #[unsafe(no_mangle)]
-    pub(crate) unsafe extern "C" fn rfx_submit(surface: u32, context: u32, width: u32, height: u32, ptr: *const u8, len: usize) -> u32 {
+    pub(crate) unsafe extern "C" fn rfx_submit(
+        surface: u32,
+        context: u32,
+        width: u32,
+        height: u32,
+        ptr: *const u8,
+        len: usize,
+    ) -> u32 {
         // SAFETY: the caller guarantees `len` initialized bytes at `ptr`.
         let data = unsafe { core::slice::from_raw_parts(ptr, len) };
         let narrow = |value: u32| u16::try_from(value).unwrap_or(u16::MAX);

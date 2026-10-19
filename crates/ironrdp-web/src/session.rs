@@ -36,7 +36,7 @@ use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_core::WriteBuf;
 use ironrdp_egfx::client::{FrameAckPolicy, GraphicsPipelineClient, GraphicsPipelineHandler};
-use ironrdp_egfx::decode::H264Decoder;
+use ironrdp_egfx::decode::{H264Decoder, ProgressiveBackend};
 use ironrdp_egfx::pdu::{CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet};
 use ironrdp_futures::{FramedWrite as _, single_sequence_step, single_sequence_step_read};
 use rgb::AsPixels as _;
@@ -150,6 +150,9 @@ struct SessionBuilderInner {
     /// instead of mixing H.264 video with RemoteFX and ClearCodec, which keeps motion
     /// smooth but softens the picture. Ignored unless H.264 is in use.
     avc_thin_client: bool,
+    /// Decode RemoteFX Progressive in a Web Worker. Off by default, set by the `rfx_workers`
+    /// extension. Used only with GPU rendering; otherwise RemoteFX decodes on the main thread.
+    rfx_workers: bool,
     enable_audio_playback: bool,
     /// Same-origin URL of `playout_worklet.js`, for pages whose CSP `script-src` does not
     /// allow `blob:`; set by the `audio_worklet_url` extension.
@@ -213,6 +216,7 @@ impl Default for SessionBuilderInner {
             use_gpu_rendering: false,
             frame_ack_suspend: false,
             avc_thin_client: false,
+            rfx_workers: false,
             enable_audio_playback: false,
             audio_worklet_url: None,
             performance_flags: None,
@@ -343,6 +347,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |gpu_rendering: bool| { self.0.borrow_mut().use_gpu_rendering = gpu_rendering };
             |frame_ack_suspend: bool| { self.0.borrow_mut().frame_ack_suspend = frame_ack_suspend };
             |avc_thin_client: bool| { self.0.borrow_mut().avc_thin_client = avc_thin_client };
+            |rfx_workers: bool| { self.0.borrow_mut().rfx_workers = rfx_workers };
 
             |enable_audio_playback: bool| { self.0.borrow_mut().enable_audio_playback = enable_audio_playback };
             |audio_worklet_url: String| { self.0.borrow_mut().audio_worklet_url = Some(audio_worklet_url) };
@@ -655,6 +660,18 @@ impl SessionBuilder {
             crate::h264::FrameOutput::Readback
         };
 
+        let progressive_backend: Option<Box<dyn ProgressiveBackend>> =
+            if use_egfx && gpu_backend.is_some() && self.0.borrow().rfx_workers {
+                let wake_tx = input_events_tx.clone();
+                crate::rfx_worker::WorkerProgressiveBackend::new(move || {
+                    // The session loop owns the receiver; a closed channel means the session ended.
+                    let _ = wake_tx.unbounded_send(RdpInputEvent::GraphicsDecoded);
+                })
+                .map(|backend| -> Box<dyn ProgressiveBackend> { Box::new(backend) })
+            } else {
+                None
+            };
+
         // Probed after the AudioContext so audio keeps the Connect click's user activation.
         let h264_decoder: Option<Box<dyn H264Decoder>> = if use_egfx && self.0.borrow().use_h264 {
             if crate::h264::probe_support().await {
@@ -799,6 +816,7 @@ impl SessionBuilder {
             use_display_control,
             use_egfx,
             h264_decoder,
+            progressive_backend,
             gpu_backend: gpu_backend.clone(),
             frame_ack_policy: if self.0.borrow().frame_ack_suspend {
                 FrameAckPolicy::SuspendWhenCaughtUp
@@ -2345,6 +2363,8 @@ struct ConnectParams {
     use_egfx: bool,
     /// WebCodecs H.264 decoder for EGFX; `None` keeps AVC unadvertised.
     h264_decoder: Option<Box<dyn H264Decoder>>,
+    /// Worker decoding for RemoteFX Progressive; `None` decodes it on the main thread.
+    progressive_backend: Option<Box<dyn ProgressiveBackend>>,
     /// GPU surface backend for EGFX; `None` keeps the CPU compositor.
     gpu_backend: Option<crate::gpu::GlBackend>,
     frame_ack_policy: FrameAckPolicy,
@@ -2405,6 +2425,7 @@ async fn connect(
         use_display_control,
         use_egfx,
         h264_decoder,
+        progressive_backend,
         gpu_backend,
         frame_ack_policy,
         avc_thin_client,
@@ -2580,6 +2601,10 @@ async fn connect(
                 .with_frame_ack_policy(frame_ack_policy, crate::clock_ms);
             let graphics = match gpu_backend {
                 Some(gl) => graphics.with_surface_backend(Box::new(gl)),
+                None => graphics,
+            };
+            let graphics = match progressive_backend {
+                Some(backend) => graphics.with_progressive_backend(backend),
                 None => graphics,
             };
             drdynvc = drdynvc.with_dynamic_channel(graphics);

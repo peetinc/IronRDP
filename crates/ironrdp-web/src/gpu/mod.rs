@@ -22,7 +22,7 @@ use ironrdp_egfx::decode::DecodedFrame;
 use ironrdp_egfx::pdu::{Color, Point};
 use tracing::warn;
 use wasm_bindgen::prelude::*;
-use web_sys::{HtmlCanvasElement, WebGl2RenderingContext as Gl, WebGlFramebuffer, WebGlTexture};
+use web_sys::{HtmlCanvasElement, WebGl2RenderingContext as Gl, WebGlBuffer, WebGlFramebuffer, WebGlTexture};
 
 pub(crate) use self::frames::{insert as hold_frame, release as release_frames};
 use self::geometry::{BlitRect, clip, clip_copy, exceeds_texture_limit, present_blit};
@@ -104,6 +104,9 @@ impl Drop for SlotGuard {
             if let Some(scratch) = state.scratch.take() {
                 scratch.delete(&state.gl);
             }
+            if let Some(unpack) = state.unpack.take() {
+                state.gl.delete_buffer(Some(&unpack));
+            }
             if let Some((texture, framebuffer)) = state.video.take() {
                 state.gl.delete_texture(Some(&texture));
                 state.gl.delete_framebuffer(Some(&framebuffer));
@@ -141,6 +144,8 @@ struct GlState {
     video: Option<(WebGlTexture, WebGlFramebuffer)>,
     /// Staging for copies within one surface, which WebGL cannot blit directly.
     scratch: Option<Target>,
+    /// Pixel-unpack buffer for RemoteFX tiles decoded in a Worker, created on first use.
+    unpack: Option<WebGlBuffer>,
     allocated: usize,
     max_texture_size: u32,
     /// Why the backend stopped drawing, once it has; the session ends with this.
@@ -209,6 +214,7 @@ impl GlBackend {
             cache: BTreeMap::new(),
             video: None,
             scratch: None,
+            unpack: None,
             allocated: 0,
             max_texture_size,
             failure,
@@ -505,6 +511,62 @@ impl GlState {
     fn upload(&self, surface_id: u16, rect: &ExclusiveRectangle, pixels: &[u8], stride: u32, origin: (u16, u16)) {
         if let Some(surface) = self.surfaces.get(&surface_id) {
             upload_into(&self.gl, &surface.target, rect, pixels, stride, origin);
+        }
+    }
+
+    /// Uploads a Worker's packed RemoteFX tiles into the surface through the pixel-unpack
+    /// buffer: one buffer upload, then one texture upload per placement from its offset.
+    /// That costs the main thread about a sixth of uploading from client memory per tile
+    /// (stage 0 of `docs/plans/2026-10-19-web-rfx-workers-design.md`).
+    fn upload_packed(&mut self, surface_id: u16, tiles: &crate::rfx_worker::ExternalTiles) {
+        let started = UPLOAD_TIMING.get().then(now_ms);
+        if self.unpack.is_none() {
+            self.unpack = self.gl.create_buffer();
+        }
+        let (Some(surface), Some(unpack)) = (self.surfaces.get(&surface_id), self.unpack.as_ref()) else {
+            return;
+        };
+        let (gl, target) = (&self.gl, &surface.target);
+        gl.bind_buffer(Gl::PIXEL_UNPACK_BUFFER, Some(unpack));
+        let pixels = js_sys::Uint8Array::new_with_byte_offset_and_length(&tiles.pixels, 0, tiles.length);
+        gl.buffer_data_with_array_buffer_view(Gl::PIXEL_UNPACK_BUFFER, &pixels, Gl::STREAM_DRAW);
+        gl.bind_texture(Gl::TEXTURE_2D, Some(&target.texture));
+        let mut uploads = 0u32;
+        for placement in &tiles.placements {
+            let rect = &placement.rect;
+            let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+            let bytes = u64::from(width) * u64::from(height) * 4;
+            // The Worker clipped every placement to the surface; one that does not fit was
+            // not packed for this surface, and its offset would read the wrong pixels.
+            let fits = clip(rect, target.width, target.height).as_ref() == Some(rect)
+                && u64::from(placement.offset) + bytes <= u64::from(tiles.length);
+            let Ok(offset) = i32::try_from(placement.offset) else {
+                continue;
+            };
+            if !fits {
+                warn!(surface_id, ?rect, "Skipping a RemoteFX placement outside its surface");
+                continue;
+            }
+            if let Err(error) = gl.tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_i32(
+                Gl::TEXTURE_2D,
+                0,
+                i32::from(rect.left),
+                i32::from(rect.top),
+                i32::from(width),
+                i32::from(height),
+                Gl::RGBA,
+                Gl::UNSIGNED_BYTE,
+                offset,
+            ) {
+                warn!(?error, "Failed to upload RemoteFX tiles");
+            }
+            uploads += 1;
+        }
+        // Unbound, so the other uploads read client memory again rather than buffer offsets.
+        gl.bind_buffer(Gl::PIXEL_UNPACK_BUFFER, None);
+        if let Some(started) = started {
+            let (ms, calls) = UPLOAD_STATS.get();
+            UPLOAD_STATS.set((ms + now_ms() - started, calls + uploads));
         }
     }
 
@@ -867,6 +929,15 @@ impl SurfaceBackend for GlBackend {
                 state.release(tile);
             }
         });
+    }
+
+    fn write_external_tiles(&mut self, surface_id: u16, handle: u64) {
+        let Some(tiles) = crate::rfx_worker::take_tiles(handle) else {
+            warn!(surface_id, handle, "RemoteFX tiles are gone before drawing");
+            return;
+        };
+        self.with(|state| state.upload_packed(surface_id, &tiles));
+        crate::rfx_worker::return_buffer(tiles);
     }
 
     fn end_frame(&mut self) {

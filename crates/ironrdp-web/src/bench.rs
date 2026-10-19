@@ -8,6 +8,7 @@ use futures_util::StreamExt as _;
 use ironrdp::dvc::DvcProcessor as _;
 use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
+use ironrdp_egfx::decode::{DecodedTiles, ProgressiveBackend, ProgressiveControl, ProgressiveJobError};
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
@@ -69,6 +70,73 @@ pub(crate) fn percentiles(values: &mut [f64]) -> Percentiles {
     }
 }
 
+/// An in-thread decode of one job: packed pixels and placements, or an error code.
+type ExpectedJob = Result<(Vec<u8>, Vec<i32>), u32>;
+
+/// Wraps the Worker backend for `verify=workers`: decodes every job in-thread too, with the
+/// same decoder the Worker runs, and compares the Worker's packed pixels and placements with
+/// it byte for byte.
+struct VerifyingBackend {
+    inner: Box<dyn ProgressiveBackend>,
+    shadow: ironrdp_rfx_worker::WorkerDecoder,
+    expected: std::collections::BTreeMap<u32, ExpectedJob>,
+    /// Jobs compared, and how many differed.
+    counts: Arc<Mutex<(u32, u32)>>,
+}
+
+impl ProgressiveBackend for VerifyingBackend {
+    fn max_in_flight(&self) -> usize {
+        self.inner.max_in_flight()
+    }
+
+    fn submit(&mut self, job: u32, surface_id: u16, codec_context_id: u32, width: u16, height: u16, data: &[u8]) {
+        let expected = self
+            .shadow
+            .submit(surface_id, codec_context_id, width, height, data)
+            .map(|()| (self.shadow.pixels().to_vec(), self.shadow.placements().to_vec()));
+        self.expected.insert(job, expected);
+        self.inner
+            .submit(job, surface_id, codec_context_id, width, height, data);
+    }
+
+    fn control(&mut self, control: ProgressiveControl) {
+        let (kind, surface_id, codec_context_id) = match control {
+            ProgressiveControl::StartFrame => (ironrdp_rfx_worker::CONTROL_START_FRAME, 0, 0),
+            ProgressiveControl::EndFrame => (ironrdp_rfx_worker::CONTROL_END_FRAME, 0, 0),
+            ProgressiveControl::DeleteContext {
+                surface_id,
+                codec_context_id,
+            } => (ironrdp_rfx_worker::CONTROL_DELETE_CONTEXT, surface_id, codec_context_id),
+            ProgressiveControl::DeleteSurface { surface_id } => {
+                (ironrdp_rfx_worker::CONTROL_DELETE_SURFACE, surface_id, 0)
+            }
+        };
+        self.shadow.control(kind, surface_id, codec_context_id);
+        self.inner.control(control);
+    }
+
+    fn poll(&mut self, job: u32) -> Option<Result<DecodedTiles, ProgressiveJobError>> {
+        let result = self.inner.poll(job)?;
+        let expected = self.expected.remove(&job);
+        let matches = match (&result, &expected) {
+            (Ok(tiles), Some(Ok((pixels, placements)))) => tiles.external.is_some_and(|handle| {
+                crate::rfx_worker::with_tiles(handle, |actual| {
+                    let actual_pixels = Uint8Array::new_with_byte_offset_and_length(&actual.pixels, 0, actual.length);
+                    actual.placements == crate::rfx_worker::placements(placements) && actual_pixels.to_vec() == *pixels
+                })
+                .unwrap_or(false)
+            }),
+            (Err(error), Some(Err(code))) => error.reason == ironrdp_rfx_worker::error_reason(*code),
+            _ => false,
+        };
+        if let Ok(mut counts) = self.counts.lock() {
+            counts.0 += 1;
+            counts.1 += u32::from(!matches);
+        }
+        Some(result)
+    }
+}
+
 /// Records when each frame completes.
 struct BenchHandler {
     frame_ends: Arc<Mutex<Vec<f64>>>,
@@ -87,14 +155,26 @@ impl GraphicsPipelineHandler for BenchHandler {
 pub struct EgfxBench {
     presenter: Presenter,
     h264: bool,
+    /// RemoteFX Progressive decodes in a Web Worker (GPU rendering only).
+    workers: bool,
+    /// With `workers`, every job is also decoded in-thread and compared.
+    verify_workers: bool,
 }
 
 #[wasm_bindgen]
 impl EgfxBench {
     /// A bench drawing to `canvas`. With `h264`, AVC frames decode through WebCodecs, as in a
-    /// session with H.264 on; with `gpu`, EGFX renders through the WebGL2 backend.
+    /// session with H.264 on; with `gpu`, EGFX renders through the WebGL2 backend; with
+    /// `workers` (and `gpu`), RemoteFX Progressive decodes in a Web Worker, and with
+    /// `verify_workers` every Worker job is compared with in-thread decoding.
     #[wasm_bindgen(js_name = create)]
-    pub async fn create(canvas: HtmlCanvasElement, h264: bool, gpu: bool) -> Result<EgfxBench, JsValue> {
+    pub async fn create(
+        canvas: HtmlCanvasElement,
+        h264: bool,
+        gpu: bool,
+        workers: bool,
+        verify_workers: bool,
+    ) -> Result<EgfxBench, JsValue> {
         let h264 = h264 && crate::h264::probe_support().await;
         let presenter = if gpu {
             Presenter::Gl(crate::gpu::GlBackend::new(&canvas, 1, 1).map_err(|error| error.to_string())?)
@@ -103,7 +183,12 @@ impl EgfxBench {
                 Canvas::new(canvas, NonZeroU32::MIN, NonZeroU32::MIN).map_err(|error| error.to_string())?,
             )
         };
-        Ok(Self { presenter, h264 })
+        Ok(Self {
+            presenter,
+            h264,
+            workers: workers && gpu,
+            verify_workers,
+        })
     }
 
     /// Replays `capture` as fast as the pipeline allows and returns
@@ -124,6 +209,26 @@ impl EgfxBench {
             frame_ends: Arc::clone(&frame_ends),
         };
         let (wake_tx, mut wake_rx) = futures_channel::mpsc::unbounded::<()>();
+        let worker_counts = Arc::new(Mutex::new((0u32, 0u32)));
+        let progressive: Option<Box<dyn ProgressiveBackend>> = if self.workers {
+            let wake_tx = wake_tx.clone();
+            let backend = crate::rfx_worker::WorkerProgressiveBackend::new(move || {
+                let _ = wake_tx.unbounded_send(());
+            })
+            .ok_or_else(|| JsValue::from_str("RemoteFX worker unavailable"))?;
+            Some(if self.verify_workers {
+                Box::new(VerifyingBackend {
+                    inner: Box::new(backend),
+                    shadow: ironrdp_rfx_worker::WorkerDecoder::new(),
+                    expected: std::collections::BTreeMap::new(),
+                    counts: Arc::clone(&worker_counts),
+                })
+            } else {
+                Box::new(backend)
+            })
+        } else {
+            None
+        };
         let decoder: Option<Box<dyn ironrdp_egfx::decode::H264Decoder>> = if self.h264 {
             Some(Box::new(crate::h264::WebCodecsH264Decoder::new(
                 move || {
@@ -145,6 +250,9 @@ impl EgfxBench {
         );
         if let Presenter::Gl(gl) = &self.presenter {
             client = client.with_surface_backend(Box::new(gl.clone()));
+        }
+        if let Some(progressive) = progressive {
+            client = client.with_progressive_backend(progressive);
         }
         client.start(0).map_err(|error| error.to_string())?;
         let samples = Array::new();
@@ -230,6 +338,7 @@ impl EgfxBench {
         let over = |limit: f64| message_ms.iter().filter(|ms| limit < **ms).count();
         let (over_budget, over_limit) = (over(50.0), over(150.0));
         let message = percentiles(&mut message_ms);
+        let (worker_jobs, worker_mismatches) = worker_counts.lock().map(|counts| *counts).unwrap_or_default();
 
         let result = Object::new();
         let frames = frame_ends.len();
@@ -256,6 +365,8 @@ impl EgfxBench {
             ("uploadMs", upload_ms),
             ("uploadCalls", f64::from(upload_calls)),
             ("uploadMsMaxPerMessage", upload_ms_max),
+            ("workerJobs", f64::from(worker_jobs)),
+            ("workerMismatches", f64::from(worker_mismatches)),
         ];
         for (key, value) in fields {
             Reflect::set(&result, &JsValue::from_str(key), &JsValue::from_f64(value))?;
