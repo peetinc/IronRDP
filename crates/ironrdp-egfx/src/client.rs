@@ -449,6 +449,8 @@ pub struct GraphicsPipelineClient {
     pending: VecDeque<Pending>,
     /// How many [`Pending::Avc420`] entries `pending` holds.
     in_flight: usize,
+    /// How many `EndFrame` commands `pending` holds: whole frames the client is behind.
+    queued_frames: usize,
     /// Set by [`Self::submit_avc420`] when a picture is not applied at once, for the caller
     /// to queue.
     just_deferred: Option<DeferredAvc420>,
@@ -465,6 +467,12 @@ pub struct GraphicsPipelineClient {
     /// resume.
     acked_frames: u32,
     last_applied_frame: Option<u32>,
+    /// The server rejects a second acknowledgement of a frame, so a resume may only name a
+    /// frame not acknowledged yet.
+    last_acked_frame: Option<u32>,
+    /// A resume found every applied frame already acknowledged: the next acknowledgement
+    /// carries this queue depth instead.
+    resume_queue_depth: Option<QueueDepth>,
     /// When each frame's `StartFrame` and `EndFrame` arrived, in clock milliseconds.
     frame_times: BTreeMap<u32, (u64, Option<u64>)>,
 }
@@ -489,8 +497,14 @@ pub enum FrameAckPolicy {
 /// after each resume. Windows App suspends after about this many.
 const SUSPEND_AFTER: u32 = 50;
 
-/// Queued entries at which suspended acknowledgements resume.
-const RESUME_AT: usize = 32;
+/// Whole frames queued behind the H.264 decoder at which suspended acknowledgements resume:
+/// about a quarter second at 30 fps. A few frames queued is normal with pictures decoding
+/// ahead.
+const RESUME_AFTER_FRAMES: usize = 8;
+
+/// Queued entries at which suspended acknowledgements resume regardless of frames: a
+/// backstop for one huge frame.
+const RESUME_AT: usize = 512;
 
 /// Frames whose receipt times are kept for QoE acknowledgements.
 const MAX_FRAME_TIMES: usize = 256;
@@ -548,6 +562,7 @@ impl GraphicsPipelineClient {
             pending_output_reset: None,
             pending: VecDeque::new(),
             in_flight: 0,
+            queued_frames: 0,
             just_deferred: None,
             submitting_ahead: false,
             ack_policy: FrameAckPolicy::EveryFrame,
@@ -555,6 +570,8 @@ impl GraphicsPipelineClient {
             acks_suspended: false,
             acked_frames: 0,
             last_applied_frame: None,
+            last_acked_frame: None,
+            resume_queue_depth: None,
             frame_times: BTreeMap::new(),
         }
     }
@@ -688,6 +705,9 @@ impl GraphicsPipelineClient {
                     let Some(Pending::Pdu(pdu)) = self.pending.pop_front() else {
                         break;
                     };
+                    if matches!(pdu, GfxPdu::EndFrame(_)) {
+                        self.queued_frames -= 1;
+                    }
                     replies.extend(self.handle_pdu(pdu)?);
                     if let Some(deferred) = self.just_deferred.take() {
                         // It was next in wire order, so it goes in front of what follows it.
@@ -731,13 +751,16 @@ impl GraphicsPipelineClient {
         if MAX_DEFERRED_BACKLOG <= self.pending.len() - self.in_flight {
             return Err(pdu_other_err!("too many PDUs held behind a deferred H.264 decode"));
         }
+        if matches!(pdu, GfxPdu::EndFrame(_)) {
+            self.queued_frames += 1;
+        }
         self.pending.push_back(Pending::Pdu(pdu));
         self.submit_ahead()?;
 
         // Resume here, as commands arrive, not when they apply: by the time a held EndFrame
         // applies, an unthrottled server has queued far more.
         let mut replies = Vec::new();
-        if self.acks_suspended && RESUME_AT <= self.pending.len() {
+        if self.acks_suspended && (RESUME_AFTER_FRAMES <= self.queued_frames || RESUME_AT <= self.pending.len()) {
             let queued_bytes: usize = self
                 .pending
                 .iter()
@@ -747,21 +770,24 @@ impl GraphicsPipelineClient {
                 })
                 .sum();
             let queue_depth = QueueDepth::AvailableBytes(u32::try_from(queued_bytes).unwrap_or(u32::MAX - 1).max(1));
-            let frame_id = self.last_applied_frame.unwrap_or(0);
             info!(
-                frame_id,
                 queued = self.pending.len(),
-                queued_bytes,
-                "Resumed frame acknowledgements"
+                queued_bytes, "Resumed frame acknowledgements"
             );
             self.acks_suspended = false;
             self.acked_frames = 0;
-            #[expect(clippy::as_conversions, reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion")]
-            replies.push(Box::new(GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
-                queue_depth,
-                frame_id,
-                total_frames_decoded: self.total_frames_decoded,
-            })) as DvcMessage);
+            match self.last_applied_frame {
+                Some(frame_id) if self.last_acked_frame != Some(frame_id) => {
+                    self.last_acked_frame = Some(frame_id);
+                    #[expect(clippy::as_conversions, reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion")]
+                    replies.push(Box::new(GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
+                        queue_depth,
+                        frame_id,
+                        total_frames_decoded: self.total_frames_decoded,
+                    })) as DvcMessage);
+                }
+                _ => self.resume_queue_depth = Some(queue_depth),
+            }
         }
         Ok(replies)
     }
@@ -1654,11 +1680,12 @@ impl GraphicsPipelineClient {
                 queue_depth: if suspend {
                     QueueDepth::Suspend
                 } else {
-                    QueueDepth::Unavailable
+                    self.resume_queue_depth.take().unwrap_or(QueueDepth::Unavailable)
                 },
                 frame_id,
                 total_frames_decoded: self.total_frames_decoded,
             });
+            self.last_acked_frame = Some(frame_id);
             trace!(frame_id, suspend, "Sending FrameAcknowledge");
             replies.push(Box::new(ack) as DvcMessage);
             self.acked_frames = self.acked_frames.saturating_add(1);
@@ -1730,6 +1757,7 @@ impl DvcProcessor for GraphicsPipelineClient {
         self.state = ClientState::Closed;
         self.pending.clear();
         self.in_flight = 0;
+        self.queued_frames = 0;
         self.just_deferred = None;
         self.handler.on_close();
     }
@@ -3761,11 +3789,48 @@ mod tests {
     }
 
     #[test]
-    fn suspended_client_resumes_with_a_queue_depth_when_the_queue_builds() {
+    fn resuming_never_acknowledges_a_frame_twice() {
         let (mut client, state) = policy_client(FrameAckPolicy::SuspendWhenCaughtUp);
         suspend(&mut client);
 
+        // Frame 50 carried the suspension; the queue builds before another frame applies.
         let mut replies = client.dispatch_pdu(deferred_start_frame(51)).expect("start");
+        replies.extend(
+            client
+                .dispatch_pdu(avc420_update(&deferred_rect(0, 0, 16, 16)))
+                .expect("deferred decode"),
+        );
+        for _ in 0..RESUME_AT {
+            replies.extend(
+                client
+                    .dispatch_pdu(red_fill(&deferred_rect(0, 0, 1, 1)))
+                    .expect("held fill"),
+            );
+        }
+        assert_eq!(
+            ack_depth(&decode_replies(&replies)),
+            None,
+            "frame 50 is already acknowledged, so nothing can be sent for it again"
+        );
+
+        state.lock().expect("state lock").ready.push_back(Ok(solid_frame(1)));
+        client.resume().expect("resume");
+        let replies = decode_replies(&client.dispatch_pdu(end_frame_pdu(51)).expect("end"));
+        assert!(
+            matches!(ack_depth(&replies), Some(QueueDepth::AvailableBytes(bytes)) if 0 < bytes),
+            "the next frame's acknowledgement resumes, with the queue depth seen, got {:?}",
+            ack_depth(&replies)
+        );
+    }
+
+    #[test]
+    fn suspended_client_resumes_with_a_queue_depth_when_the_queue_builds() {
+        let (mut client, state) = policy_client(FrameAckPolicy::SuspendWhenCaughtUp);
+        suspend(&mut client);
+        // Applied while suspended, so never acknowledged.
+        empty_frame(&mut client, 51);
+
+        let mut replies = client.dispatch_pdu(deferred_start_frame(52)).expect("start");
         replies.extend(
             client
                 .dispatch_pdu(avc420_update(&deferred_rect(0, 0, 16, 16)))
@@ -3786,7 +3851,10 @@ mod tests {
             })
             .collect();
         assert_eq!(resumed.len(), 1, "one acknowledgement resumes flow control");
-        assert_eq!(resumed[0].frame_id, 50, "it names the last applied frame");
+        assert_eq!(
+            resumed[0].frame_id, 51,
+            "it names the last applied, unacknowledged frame"
+        );
         assert!(
             matches!(resumed[0].queue_depth, QueueDepth::AvailableBytes(bytes) if 0 < bytes),
             "it reports the queued bytes, got {:?}",
@@ -3795,11 +3863,41 @@ mod tests {
 
         state.lock().expect("state lock").ready.push_back(Ok(solid_frame(1)));
         client.resume().expect("resume");
-        let replies = decode_replies(&client.dispatch_pdu(end_frame_pdu(51)).expect("end"));
+        let replies = decode_replies(&client.dispatch_pdu(end_frame_pdu(52)).expect("end"));
         assert_eq!(
             ack_depth(&replies),
             Some(QueueDepth::Unavailable),
             "frames are acknowledged again"
+        );
+    }
+
+    #[test]
+    fn suspended_client_resumes_when_whole_frames_queue_behind_the_decoder() {
+        let (mut client, _state) = policy_client(FrameAckPolicy::SuspendWhenCaughtUp);
+        suspend(&mut client);
+        empty_frame(&mut client, 51);
+
+        client.dispatch_pdu(deferred_start_frame(52)).expect("start");
+        client
+            .dispatch_pdu(avc420_update(&deferred_rect(0, 0, 16, 16)))
+            .expect("deferred decode");
+        let mut acks = Vec::new();
+        for frame_id in 52..52 + u32::try_from(RESUME_AFTER_FRAMES).expect("small") {
+            if frame_id != 52 {
+                acks.extend(decode_replies(
+                    &client.dispatch_pdu(deferred_start_frame(frame_id)).expect("start"),
+                ));
+            }
+            let replies = decode_replies(&client.dispatch_pdu(end_frame_pdu(frame_id)).expect("end"));
+            let behind = usize::try_from(frame_id - 51).expect("small");
+            if behind < RESUME_AFTER_FRAMES {
+                assert_eq!(ack_depth(&replies), None, "{behind} frames behind is normal");
+            }
+            acks.extend(replies);
+        }
+        assert!(
+            matches!(ack_depth(&acks), Some(QueueDepth::AvailableBytes(_))),
+            "{RESUME_AFTER_FRAMES} frames behind resumes acknowledgements"
         );
     }
 

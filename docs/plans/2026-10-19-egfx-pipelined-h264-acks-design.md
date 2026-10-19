@@ -132,10 +132,15 @@ in milliseconds, injected because `ironrdp-egfx` must not read a wall clock (was
   frames are applied.
 - **Suspend:** after that, at an `EndFrame` with an empty queue, send the acknowledgement with
   `QueueDepth::Suspend`, then send no more `FrameAcknowledge`.
-- **Resume:** while suspended, if the queue reaches `RESUME_AT = 32` entries at dispatch, send a
+- **Resume:** while suspended, if `RESUME_AFTER_FRAMES = 8` whole frames (queued
+  `EndFrame`s) are queued at dispatch, or `RESUME_AT = 512` entries as a backstop, send a
   `FrameAcknowledge` immediately. It carries the last applied frame id and
   `QueueDepth::AvailableBytes(queued bytes)`. Acknowledgements then resume, and the client
   suspends again after another 50 applied frames with an empty queue.
+- **No repeated acknowledgement.** The server rejects a second acknowledgement of a frame: it
+  logs `RDP_GFX … PipeEventOnError` and disconnects with "graphics subsystem in an error
+  state". So the immediate resume acknowledgement goes out only when the last applied frame has
+  not been acknowledged yet. Otherwise the next frame's acknowledgement carries the queue depth.
 - **Dispatch-time resume.** The resume check runs when PDUs arrive, not when they apply. The live
   test showed that checking at apply time is too late.
 - **QoE:** each applied `EndFrame` also sends `QoeFrameAcknowledge` (MS-RDPEGFX 2.2.2.21), when
