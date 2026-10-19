@@ -55,7 +55,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use ironrdp_core::{Decode as _, ReadCursor, impl_as_any};
+use ironrdp_core::{Decode as _, Encode as _, ReadCursor, impl_as_any};
 use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
 use ironrdp_graphics::clearcodec::ClearCodecDecoder;
 use ironrdp_graphics::progressive::{ProgressiveDecodeError, ProgressiveDecoder, TILE_BYTES_PER_PIXEL, TILE_DIM};
@@ -63,7 +63,7 @@ use ironrdp_graphics::rdp6::BitmapStreamDecoder;
 use ironrdp_graphics::zgfx;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_pdu::{PduResult, decode_cursor, decode_err, pdu_other_err};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::CHANNEL_NAME;
 use crate::compositor::{Compositor, OutputUpdate, SurfaceBackend};
@@ -92,7 +92,7 @@ fn capture_hook() -> Option<CaptureHook> {
 use crate::decode::{DecodedFrame, H264Decode, H264Decoder};
 use crate::pdu::{
     Avc420BitmapStream, Avc444BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu,
-    CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type,
+    CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, CapabilityVersion, Codec1Type,
     DeleteEncodingContextPdu, Encoding, EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu, MapSurfaceToScaledOutputPdu,
     MapSurfaceToScaledWindowPdu, MapSurfaceToWindowPdu, PixelFormat, QueueDepth, RawCapabilitySet, SolidFillPdu,
     SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface2Pdu,
@@ -455,7 +455,45 @@ pub struct GraphicsPipelineClient {
     /// Set while [`Self::submit_ahead`] submits a queued picture: one the decoder returns at
     /// once must still wait for the commands ahead of it.
     submitting_ahead: bool,
+
+    ack_policy: FrameAckPolicy,
+    /// Milliseconds, for QoE acknowledgements; set with [`Self::with_frame_ack_policy`].
+    clock: Option<fn() -> u64>,
+    /// The server was told to stop expecting `FrameAcknowledge`.
+    acks_suspended: bool,
+    /// Frames acknowledged since the policy was set, the last `ResetGraphics` or the last
+    /// resume.
+    acked_frames: u32,
+    last_applied_frame: Option<u32>,
+    /// When each frame's `StartFrame` and `EndFrame` arrived, in clock milliseconds.
+    frame_times: BTreeMap<u32, (u64, Option<u64>)>,
 }
+
+/// How [`GraphicsPipelineClient`] acknowledges frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrameAckPolicy {
+    /// Acknowledge every frame once applied ([MS-RDPEGFX] 3.3.5.12).
+    #[default]
+    EveryFrame,
+    /// What Windows App does: acknowledge the first frames, then, once caught up, suspend
+    /// acknowledgements (`SUSPEND_FRAME_ACKNOWLEDGEMENT`) so the server does not pace itself
+    /// to them, and send a QoE acknowledgement ([MS-RDPEGFX] 2.2.2.21) for every frame
+    /// instead. When commands queue up behind the H.264 decoder, it resumes acknowledging,
+    /// with the queued bytes, so the server slows down; it suspends again once caught up.
+    ///
+    /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/
+    SuspendWhenCaughtUp,
+}
+
+/// Frames acknowledged before [`FrameAckPolicy::SuspendWhenCaughtUp`] suspends, at start and
+/// after each resume. Windows App suspends after about this many.
+const SUSPEND_AFTER: u32 = 50;
+
+/// Queued entries at which suspended acknowledgements resume.
+const RESUME_AT: usize = 32;
+
+/// Frames whose receipt times are kept for QoE acknowledgements.
+const MAX_FRAME_TIMES: usize = 256;
 
 /// One entry of [`GraphicsPipelineClient`]'s pending queue.
 enum Pending {
@@ -512,7 +550,23 @@ impl GraphicsPipelineClient {
             in_flight: 0,
             just_deferred: None,
             submitting_ahead: false,
+            ack_policy: FrameAckPolicy::EveryFrame,
+            clock: None,
+            acks_suspended: false,
+            acked_frames: 0,
+            last_applied_frame: None,
+            frame_times: BTreeMap::new(),
         }
+    }
+
+    /// Acknowledges frames according to `policy`. `clock` reads milliseconds from any
+    /// fixed origin; it times the QoE acknowledgements.
+    #[must_use]
+    pub fn with_frame_ack_policy(mut self, policy: FrameAckPolicy, clock: fn() -> u64) -> Self {
+        self.ack_policy = policy;
+        self.clock = Some(clock);
+        self.acked_frames = 0;
+        self
     }
 
     /// Applies surface commands to `backend` instead of the default CPU [`Compositor`].
@@ -642,6 +696,23 @@ impl GraphicsPipelineClient {
 
     /// Handle `pdu`, or hold it while an earlier H.264 frame is still decoding.
     fn dispatch_pdu(&mut self, pdu: GfxPdu) -> PduResult<Vec<DvcMessage>> {
+        if let (FrameAckPolicy::SuspendWhenCaughtUp, Some(clock)) = (self.ack_policy, self.clock) {
+            match &pdu {
+                GfxPdu::StartFrame(start) => {
+                    if MAX_FRAME_TIMES <= self.frame_times.len() {
+                        self.frame_times.pop_first();
+                    }
+                    self.frame_times.insert(start.frame_id, (clock(), None));
+                }
+                GfxPdu::EndFrame(end) => {
+                    if let Some(times) = self.frame_times.get_mut(&end.frame_id) {
+                        times.1 = Some(clock());
+                    }
+                }
+                _ => {}
+            }
+        }
+
         if self.pending.is_empty() {
             let replies = self.handle_pdu(pdu)?;
             if let Some(deferred) = self.just_deferred.take() {
@@ -655,7 +726,37 @@ impl GraphicsPipelineClient {
         }
         self.pending.push_back(Pending::Pdu(pdu));
         self.submit_ahead()?;
-        Ok(Vec::new())
+
+        // Resume here, as commands arrive, not when they apply: by the time a held EndFrame
+        // applies, an unthrottled server has queued far more.
+        let mut replies = Vec::new();
+        if self.acks_suspended && RESUME_AT <= self.pending.len() {
+            let queued_bytes: usize = self
+                .pending
+                .iter()
+                .map(|entry| match entry {
+                    Pending::Pdu(pdu) => pdu.size(),
+                    Pending::Avc420(_) => 0,
+                })
+                .sum();
+            let queue_depth = QueueDepth::AvailableBytes(u32::try_from(queued_bytes).unwrap_or(u32::MAX - 1).max(1));
+            let frame_id = self.last_applied_frame.unwrap_or(0);
+            info!(
+                frame_id,
+                queued = self.pending.len(),
+                queued_bytes,
+                "Resumed frame acknowledgements"
+            );
+            self.acks_suspended = false;
+            self.acked_frames = 0;
+            #[expect(clippy::as_conversions, reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion")]
+            replies.push(Box::new(GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
+                queue_depth,
+                frame_id,
+                total_frames_decoded: self.total_frames_decoded,
+            })) as DvcMessage);
+        }
+        Ok(replies)
     }
 
     /// Submits queued H.264 pictures to the decoder ahead of the commands in front of them,
@@ -903,6 +1004,7 @@ impl GraphicsPipelineClient {
         // per spec, capabilities are negotiated via CapabilitiesConfirm before
         // ResetGraphics, and a ResetGraphics does not re-negotiate capabilities.
         self.current_frame_id = None;
+        self.acked_frames = 0;
 
         // Reset decoder state for new stream
         if let Some(ref mut decoder) = self.h264_decoder {
@@ -1531,17 +1633,52 @@ impl GraphicsPipelineClient {
 
         self.handler.on_frame_complete(frame_id);
 
-        // Per [3.3.5.12]: client MUST send FrameAcknowledge after EndFrame.
-        // QueueDepth counts queued bytes, not decoded/queued frames. This client
-        // does not measure queued bytes, so report Unavailable (not Suspend).
-        let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
-            queue_depth: QueueDepth::Unavailable,
-            frame_id,
-            total_frames_decoded: self.total_frames_decoded,
-        });
+        self.last_applied_frame = Some(frame_id);
+        let mut replies = Vec::new();
 
-        trace!(frame_id, "Sending FrameAcknowledge");
-        Ok(vec![Box::new(ack) as DvcMessage])
+        // Per [3.3.5.12]: client MUST send FrameAcknowledge after EndFrame, unless it has
+        // suspended them. QueueDepth counts queued bytes, not decoded/queued frames. This
+        // client measures queued bytes only when resuming, so it reports Unavailable here.
+        if !self.acks_suspended {
+            let suspend = self.ack_policy == FrameAckPolicy::SuspendWhenCaughtUp
+                && SUSPEND_AFTER <= self.acked_frames.saturating_add(1)
+                && self.pending.is_empty();
+            let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
+                queue_depth: if suspend {
+                    QueueDepth::Suspend
+                } else {
+                    QueueDepth::Unavailable
+                },
+                frame_id,
+                total_frames_decoded: self.total_frames_decoded,
+            });
+            trace!(frame_id, suspend, "Sending FrameAcknowledge");
+            replies.push(Box::new(ack) as DvcMessage);
+            self.acked_frames = self.acked_frames.saturating_add(1);
+            if suspend {
+                self.acks_suspended = true;
+                info!(frame_id, "Suspended frame acknowledgements");
+            }
+        }
+
+        // [MS-RDPEGFX] 2.2.2.21: QoE acknowledgements exist from version 10.
+        let qoe_capable = self
+            .negotiated_caps
+            .as_ref()
+            .is_some_and(|caps| CapabilityVersion::V10.0 <= caps.version().0);
+        if let (FrameAckPolicy::SuspendWhenCaughtUp, Some(clock), true) = (self.ack_policy, self.clock, qoe_capable) {
+            let now = clock();
+            let (started, ended) = self.frame_times.remove(&frame_id).unwrap_or((now, None));
+            let ended = ended.unwrap_or(now);
+            let qoe = GfxPdu::QoeFrameAcknowledge(crate::pdu::QoeFrameAcknowledgePdu {
+                frame_id,
+                timestamp: u32::try_from(started & u64::from(u32::MAX)).unwrap_or(0),
+                time_diff_se: u16::try_from(ended.saturating_sub(started)).unwrap_or(u16::MAX),
+                time_diff_dr: u16::try_from(now.saturating_sub(ended)).unwrap_or(u16::MAX),
+            });
+            replies.push(Box::new(qoe) as DvcMessage);
+        }
+        Ok(replies)
     }
 }
 
@@ -3526,6 +3663,195 @@ mod tests {
             "only the good frame paints"
         );
         assert_eq!(pixel_at(&updates[0], 40, 40), [2, 2, 2, 0xFF]);
+    }
+
+    // ========================================================================
+    // Frame-acknowledgement policy
+    // ========================================================================
+
+    static TEST_CLOCK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    fn test_clock() -> u64 {
+        TEST_CLOCK.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A pipelined client that has confirmed EGFX 10.7, with `policy`.
+    fn policy_client(policy: FrameAckPolicy) -> (GraphicsPipelineClient, Arc<Mutex<PipelineState>>) {
+        let (client, state) = pipeline_client(4);
+        let mut client = client.with_frame_ack_policy(policy, test_clock);
+        client
+            .dispatch_pdu(GfxPdu::CapabilitiesConfirm(
+                crate::pdu::CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V10_7 {
+                    flags: CapabilitiesV107Flags::SMALL_CACHE,
+                }),
+            ))
+            .expect("confirm caps");
+        (client, state)
+    }
+
+    fn decode_replies(replies: &[DvcMessage]) -> Vec<GfxPdu> {
+        replies
+            .iter()
+            .map(|reply| {
+                let bytes = ironrdp_core::encode_vec(reply.as_ref()).expect("encode reply");
+                ironrdp_core::decode::<GfxPdu>(&bytes).expect("decode reply")
+            })
+            .collect()
+    }
+
+    /// Runs one frame with no content and returns the replies it produced.
+    fn empty_frame(client: &mut GraphicsPipelineClient, frame_id: u32) -> Vec<GfxPdu> {
+        let mut replies = client.dispatch_pdu(deferred_start_frame(frame_id)).expect("start");
+        replies.extend(client.dispatch_pdu(end_frame_pdu(frame_id)).expect("end"));
+        decode_replies(&replies)
+    }
+
+    fn ack_depth(pdus: &[GfxPdu]) -> Option<QueueDepth> {
+        pdus.iter().find_map(|pdu| match pdu {
+            GfxPdu::FrameAcknowledge(ack) => Some(ack.queue_depth),
+            _ => None,
+        })
+    }
+
+    fn qoe_count(pdus: &[GfxPdu]) -> usize {
+        pdus.iter()
+            .filter(|pdu| matches!(pdu, GfxPdu::QoeFrameAcknowledge(_)))
+            .count()
+    }
+
+    #[test]
+    fn every_frame_policy_acks_each_frame_without_qoe() {
+        let (mut client, _state) = policy_client(FrameAckPolicy::EveryFrame);
+        for frame_id in 1..=3 {
+            let replies = empty_frame(&mut client, frame_id);
+            assert_eq!(replies.len(), 1, "frame {frame_id}");
+            assert_eq!(ack_depth(&replies), Some(QueueDepth::Unavailable));
+        }
+    }
+
+    #[test]
+    fn suspend_policy_suspends_after_50_caught_up_frames() {
+        let (mut client, _state) = policy_client(FrameAckPolicy::SuspendWhenCaughtUp);
+        for frame_id in 1..=49 {
+            let replies = empty_frame(&mut client, frame_id);
+            assert_eq!(ack_depth(&replies), Some(QueueDepth::Unavailable), "frame {frame_id}");
+            assert_eq!(qoe_count(&replies), 1, "frame {frame_id}");
+        }
+        let replies = empty_frame(&mut client, 50);
+        assert_eq!(ack_depth(&replies), Some(QueueDepth::Suspend));
+        assert_eq!(qoe_count(&replies), 1);
+
+        let replies = empty_frame(&mut client, 51);
+        assert_eq!(ack_depth(&replies), None, "no frame acknowledgement once suspended");
+        assert_eq!(qoe_count(&replies), 1, "QoE still goes out");
+    }
+
+    /// Suspends `client`'s acknowledgements by running 50 caught-up frames.
+    fn suspend(client: &mut GraphicsPipelineClient) {
+        for frame_id in 1..=50 {
+            empty_frame(client, frame_id);
+        }
+    }
+
+    #[test]
+    fn suspended_client_resumes_with_a_queue_depth_when_the_queue_builds() {
+        let (mut client, state) = policy_client(FrameAckPolicy::SuspendWhenCaughtUp);
+        suspend(&mut client);
+
+        let mut replies = client.dispatch_pdu(deferred_start_frame(51)).expect("start");
+        replies.extend(
+            client
+                .dispatch_pdu(avc420_update(&deferred_rect(0, 0, 16, 16)))
+                .expect("deferred decode"),
+        );
+        for _ in 0..RESUME_AT {
+            replies.extend(
+                client
+                    .dispatch_pdu(red_fill(&deferred_rect(0, 0, 1, 1)))
+                    .expect("held fill"),
+            );
+        }
+        let resumed: Vec<_> = decode_replies(&replies)
+            .into_iter()
+            .filter_map(|pdu| match pdu {
+                GfxPdu::FrameAcknowledge(ack) => Some(ack),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resumed.len(), 1, "one acknowledgement resumes flow control");
+        assert_eq!(resumed[0].frame_id, 50, "it names the last applied frame");
+        assert!(
+            matches!(resumed[0].queue_depth, QueueDepth::AvailableBytes(bytes) if 0 < bytes),
+            "it reports the queued bytes, got {:?}",
+            resumed[0].queue_depth
+        );
+
+        state.lock().expect("state lock").ready.push_back(Ok(solid_frame(1)));
+        client.resume().expect("resume");
+        let replies = decode_replies(&client.dispatch_pdu(end_frame_pdu(51)).expect("end"));
+        assert_eq!(
+            ack_depth(&replies),
+            Some(QueueDepth::Unavailable),
+            "frames are acknowledged again"
+        );
+    }
+
+    #[test]
+    fn suspend_policy_resuspends_after_catching_up() {
+        let (mut client, state) = policy_client(FrameAckPolicy::SuspendWhenCaughtUp);
+        suspend(&mut client);
+
+        client.dispatch_pdu(deferred_start_frame(51)).expect("start");
+        client
+            .dispatch_pdu(avc420_update(&deferred_rect(0, 0, 16, 16)))
+            .expect("deferred decode");
+        for _ in 0..RESUME_AT {
+            client
+                .dispatch_pdu(red_fill(&deferred_rect(0, 0, 1, 1)))
+                .expect("held fill");
+        }
+        state.lock().expect("state lock").ready.push_back(Ok(solid_frame(1)));
+        client.resume().expect("resume");
+        client.dispatch_pdu(end_frame_pdu(51)).expect("end");
+
+        for frame_id in 52..=99 {
+            let replies = empty_frame(&mut client, frame_id);
+            assert_eq!(ack_depth(&replies), Some(QueueDepth::Unavailable), "frame {frame_id}");
+        }
+        let replies = empty_frame(&mut client, 100);
+        assert_eq!(
+            ack_depth(&replies),
+            Some(QueueDepth::Suspend),
+            "the 50th acknowledged frame since resuming suspends again"
+        );
+    }
+
+    #[test]
+    fn qoe_ack_carries_receipt_times_from_the_clock() {
+        let (mut client, state) = policy_client(FrameAckPolicy::SuspendWhenCaughtUp);
+
+        TEST_CLOCK.store(1000, core::sync::atomic::Ordering::Relaxed);
+        client.dispatch_pdu(deferred_start_frame(1)).expect("start");
+        client
+            .dispatch_pdu(avc420_update(&deferred_rect(0, 0, 16, 16)))
+            .expect("deferred decode");
+        TEST_CLOCK.store(1007, core::sync::atomic::Ordering::Relaxed);
+        client.dispatch_pdu(end_frame_pdu(1)).expect("end");
+        TEST_CLOCK.store(1010, core::sync::atomic::Ordering::Relaxed);
+        state.lock().expect("state lock").ready.push_back(Ok(solid_frame(1)));
+        let replies = decode_replies(&client.resume().expect("resume"));
+
+        let qoe = replies
+            .iter()
+            .find_map(|pdu| match pdu {
+                GfxPdu::QoeFrameAcknowledge(qoe) => Some(qoe),
+                _ => None,
+            })
+            .expect("a QoE acknowledgement");
+        assert_eq!(
+            (qoe.frame_id, qoe.timestamp, qoe.time_diff_se, qoe.time_diff_dr),
+            (1, 1000, 7, 3)
+        );
     }
 
     fn avc444_update(rect: &ExclusiveRectangle, encoding: Encoding) -> GfxPdu {
