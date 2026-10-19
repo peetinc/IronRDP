@@ -220,7 +220,8 @@ pub trait H264Decoder: Send {
     /// The default decodes synchronously with [`Self::decode`]. A decoder that finishes
     /// asynchronously (a browser's WebCodecs, for example) returns [`H264Decode::Pending`]:
     /// the client then holds every later command until [`Self::poll_frame`] yields the
-    /// frame, so commands still apply in order.
+    /// frame, so commands still apply in order. Up to [`Self::max_in_flight`] submissions
+    /// may be pending at once.
     fn submit(&mut self, data: &[u8], regions: &[ExclusiveRectangle]) -> DecoderResult<H264Decode> {
         let _ = regions;
         self.decode(data).map(H264Decode::Frame)
@@ -233,11 +234,24 @@ pub trait H264Decoder: Send {
         self.decode(data).map(drop)
     }
 
-    /// The frame for the last [`H264Decode::Pending`] submission, once it has decoded.
+    /// The result for the oldest [`H264Decode::Pending`] submission not yet returned, once it
+    /// has decoded.
     ///
-    /// `None` while it is still decoding. Called by `GraphicsPipelineClient::resume`.
+    /// Results come back in submission order, one per pending submission; a submission that
+    /// failed yields its error in its own place. `None` while the oldest is still decoding.
+    /// Called by `GraphicsPipelineClient::resume`.
     fn poll_frame(&mut self) -> Option<DecoderResult<DecodedFrame>> {
         None
+    }
+
+    /// How many [`H264Decode::Pending`] submissions the client may have outstanding.
+    ///
+    /// With more than one, the client submits later H.264 pictures while earlier ones are
+    /// still decoding, instead of holding them behind the oldest. Such a decoder should
+    /// return [`H264Decode::Pending`] from [`Self::submit`]; a frame it returns at once is
+    /// still applied in wire order. The default, `1`, decodes one picture at a time.
+    fn max_in_flight(&self) -> usize {
+        1
     }
 
     /// Reset the decoder state

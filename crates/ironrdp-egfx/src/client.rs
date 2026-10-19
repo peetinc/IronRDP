@@ -444,10 +444,25 @@ pub struct GraphicsPipelineClient {
     total_frames_decoded: u32,
     pending_output_reset: Option<(u16, u16)>,
 
-    /// An AVC420 command whose frame the H.264 decoder is still producing.
-    deferred_avc420: Option<DeferredAvc420>,
-    /// PDUs that arrived after `deferred_avc420`, held so they apply after it, in order.
-    backlog: VecDeque<GfxPdu>,
+    /// Commands not yet applied, in wire order: H.264 pictures the decoder is still
+    /// producing, and the commands held behind them.
+    pending: VecDeque<Pending>,
+    /// How many [`Pending::Avc420`] entries `pending` holds.
+    in_flight: usize,
+    /// Set by [`Self::submit_avc420`] when a picture is not applied at once, for the caller
+    /// to queue.
+    just_deferred: Option<DeferredAvc420>,
+    /// Set while [`Self::submit_ahead`] submits a queued picture: one the decoder returns at
+    /// once must still wait for the commands ahead of it.
+    submitting_ahead: bool,
+}
+
+/// One entry of [`GraphicsPipelineClient`]'s pending queue.
+enum Pending {
+    /// An H.264 picture submitted to the decoder, applied when the decoder returns it.
+    Avc420(DeferredAvc420),
+    /// A command held because something ahead of it is still decoding.
+    Pdu(GfxPdu),
 }
 
 /// Most PDUs held behind a deferred H.264 decode.
@@ -462,6 +477,11 @@ struct DeferredAvc420 {
     surface_id: u16,
     destination_rectangle: ExclusiveRectangle,
     regions: Vec<ExclusiveRectangle>,
+    /// The frame, when the decoder returned it at once for a picture submitted ahead.
+    frame: Option<DecodedFrame>,
+    /// Submitted ahead of the commands before it, so its `WireToSurface1` checks still run,
+    /// when it applies: a surface it targets may be created by a command ahead of it.
+    check_on_apply: bool,
 }
 
 impl GraphicsPipelineClient {
@@ -488,8 +508,10 @@ impl GraphicsPipelineClient {
             current_frame_id: None,
             total_frames_decoded: 0,
             pending_output_reset: None,
-            deferred_avc420: None,
-            backlog: VecDeque::new(),
+            pending: VecDeque::new(),
+            in_flight: 0,
+            just_deferred: None,
+            submitting_ahead: false,
         }
     }
 
@@ -558,58 +580,131 @@ impl GraphicsPipelineClient {
     /// Whether an H.264 frame is still decoding, holding back the commands after it.
     #[must_use]
     pub fn is_awaiting_decoder(&self) -> bool {
-        self.deferred_avc420.is_some()
+        0 < self.in_flight
     }
 
     /// Continue after an asynchronous H.264 decoder finishes a frame.
     ///
-    /// Applies the frame, then replays the commands held behind it, in order, until they
-    /// run out or another decode defers. Returns the replies those commands produced, such
-    /// as `FrameAcknowledge`, for the caller to send. A failed decode drops only that frame.
-    /// Does nothing while the decoder is still busy, or when no decode is deferred.
+    /// Applies the decoded frames at the front of the queue, and the commands held behind
+    /// them, in order, until it reaches a frame still decoding or the queue runs out. Returns
+    /// the replies those commands produced, such as `FrameAcknowledge`, for the caller to send.
+    /// A failed decode drops only that frame.
     pub fn resume(&mut self) -> PduResult<Vec<DvcMessage>> {
-        if self.deferred_avc420.is_none() {
-            return Ok(Vec::new());
-        }
-        let Some(result) = self.h264_decoder.as_mut().and_then(|decoder| decoder.poll_frame()) else {
-            return Ok(Vec::new());
-        };
-        let Some(deferred) = self.deferred_avc420.take() else {
-            return Ok(Vec::new());
-        };
-
-        match result {
-            Ok(frame) => self.apply_avc420(
-                deferred.surface_id,
-                &deferred.destination_rectangle,
-                &deferred.regions,
-                &frame,
-            )?,
-            Err(error) => {
-                warn!(%error, surface_id = deferred.surface_id, "Dropping an AVC420 frame that failed to decode")
+        let mut replies = Vec::new();
+        loop {
+            match self.pending.front_mut() {
+                None => break,
+                Some(Pending::Avc420(deferred)) => {
+                    let result = match deferred.frame.take() {
+                        Some(frame) => Ok(frame),
+                        None => match self.h264_decoder.as_mut().and_then(|decoder| decoder.poll_frame()) {
+                            Some(result) => result,
+                            None => break,
+                        },
+                    };
+                    let Some(Pending::Avc420(deferred)) = self.pending.pop_front() else {
+                        break;
+                    };
+                    self.in_flight -= 1;
+                    match result {
+                        Ok(frame) => {
+                            if deferred.check_on_apply {
+                                self.check_wire_to_surface1(deferred.surface_id, &deferred.destination_rectangle)?;
+                            }
+                            self.apply_avc420(
+                                deferred.surface_id,
+                                &deferred.destination_rectangle,
+                                &deferred.regions,
+                                &frame,
+                            )?;
+                        }
+                        Err(error) => {
+                            warn!(%error, surface_id = deferred.surface_id, "Dropping an AVC420 frame that failed to decode")
+                        }
+                    }
+                }
+                Some(Pending::Pdu(_)) => {
+                    let Some(Pending::Pdu(pdu)) = self.pending.pop_front() else {
+                        break;
+                    };
+                    replies.extend(self.handle_pdu(pdu)?);
+                    if let Some(deferred) = self.just_deferred.take() {
+                        // It was next in wire order, so it goes in front of what follows it.
+                        self.pending.push_front(Pending::Avc420(deferred));
+                        self.in_flight += 1;
+                    }
+                }
             }
         }
-
-        let mut replies = Vec::new();
-        while self.deferred_avc420.is_none() {
-            let Some(pdu) = self.backlog.pop_front() else {
-                break;
-            };
-            replies.extend(self.handle_pdu(pdu)?);
-        }
+        self.submit_ahead()?;
         Ok(replies)
     }
 
     /// Handle `pdu`, or hold it while an earlier H.264 frame is still decoding.
     fn dispatch_pdu(&mut self, pdu: GfxPdu) -> PduResult<Vec<DvcMessage>> {
-        if self.deferred_avc420.is_none() {
-            return self.handle_pdu(pdu);
+        if self.pending.is_empty() {
+            let replies = self.handle_pdu(pdu)?;
+            if let Some(deferred) = self.just_deferred.take() {
+                self.pending.push_back(Pending::Avc420(deferred));
+                self.in_flight += 1;
+            }
+            return Ok(replies);
         }
-        if MAX_DEFERRED_BACKLOG <= self.backlog.len() {
+        if MAX_DEFERRED_BACKLOG <= self.pending.len() - self.in_flight {
             return Err(pdu_other_err!("too many PDUs held behind a deferred H.264 decode"));
         }
-        self.backlog.push_back(pdu);
+        self.pending.push_back(Pending::Pdu(pdu));
+        self.submit_ahead()?;
         Ok(Vec::new())
+    }
+
+    /// Submits queued H.264 pictures to the decoder ahead of the commands in front of them,
+    /// in wire order, while the decoder has room ([`H264Decoder::max_in_flight`]).
+    ///
+    /// Each submitted `WireToSurface1` is replaced in the queue by its picture, which applies
+    /// in the same place. The walk stops at a command that resets the decoder when it
+    /// applies (`ResetGraphics`, `CapabilitiesConfirm`): what follows it must decode after
+    /// the reset.
+    fn submit_ahead(&mut self) -> PduResult<()> {
+        let Some(limit) = self.h264_decoder.as_ref().map(|decoder| decoder.max_in_flight()) else {
+            return Ok(());
+        };
+        let mut index = 0;
+        while index < self.pending.len() && self.in_flight < limit {
+            let is_h264 = match &self.pending[index] {
+                Pending::Avc420(_) => false,
+                Pending::Pdu(GfxPdu::ResetGraphics(_) | GfxPdu::CapabilitiesConfirm(_)) => break,
+                Pending::Pdu(GfxPdu::WireToSurface1(wire)) => matches!(
+                    wire.codec_id,
+                    Codec1Type::Avc420 | Codec1Type::Avc444 | Codec1Type::Avc444v2
+                ),
+                Pending::Pdu(_) => false,
+            };
+            if !is_h264 {
+                index += 1;
+                continue;
+            }
+            let Some(Pending::Pdu(GfxPdu::WireToSurface1(wire))) = self.pending.remove(index) else {
+                break;
+            };
+
+            self.submitting_ahead = true;
+            let submitted = if wire.codec_id == Codec1Type::Avc420 {
+                self.decode_avc420(wire.surface_id, &wire.destination_rectangle, &wire.bitmap_data)
+            } else {
+                self.decode_avc444(wire.surface_id, &wire.destination_rectangle, &wire.bitmap_data)
+            };
+            self.submitting_ahead = false;
+            submitted?;
+
+            // A chroma-only AVC444 update leaves no picture to apply.
+            if let Some(deferred) = self.just_deferred.take() {
+                self.pending.insert(index, Pending::Avc420(deferred));
+                self.in_flight += 1;
+                index += 1;
+            }
+        }
+        Ok(())
     }
 
     // ========================================================================
@@ -913,14 +1008,15 @@ impl GraphicsPipelineClient {
         }
     }
 
-    fn handle_wire_to_surface1(&mut self, pdu: crate::pdu::WireToSurface1Pdu) -> PduResult<()> {
+    /// The checks every `WireToSurface1` passes before it applies: a known surface and a
+    /// well-ordered destination rectangle (one past the surface's bounds is only logged).
+    fn check_wire_to_surface1(&self, surface_id: u16, rect: &ExclusiveRectangle) -> PduResult<()> {
         let surface = self
             .surfaces
-            .get(&pdu.surface_id)
+            .get(&surface_id)
             .ok_or_else(|| pdu_other_err!("unknown surface in WireToSurface1"))?;
 
         // Validate rectangle ordering (left <= right, top <= bottom)
-        let rect = &pdu.destination_rectangle;
         if rect.left > rect.right || rect.top > rect.bottom {
             warn!(
                 left = rect.left,
@@ -937,7 +1033,7 @@ impl GraphicsPipelineClient {
         // `right == surface.width` and `bottom == surface.height`, which is valid.
         if rect.right > surface.width || rect.bottom > surface.height {
             warn!(
-                surface_id = pdu.surface_id,
+                surface_id,
                 rect_right = rect.right,
                 rect_bottom = rect.bottom,
                 surface_width = surface.width,
@@ -945,6 +1041,11 @@ impl GraphicsPipelineClient {
                 "WireToSurface1 destination rectangle exceeds surface bounds"
             );
         }
+        Ok(())
+    }
+
+    fn handle_wire_to_surface1(&mut self, pdu: crate::pdu::WireToSurface1Pdu) -> PduResult<()> {
+        self.check_wire_to_surface1(pdu.surface_id, &pdu.destination_rectangle)?;
 
         match pdu.codec_id {
             Codec1Type::Avc420 => {
@@ -1159,20 +1260,24 @@ impl GraphicsPipelineClient {
             return Ok(());
         };
 
-        match decoder
+        let frame = match decoder
             .submit(stream.data, &stream.rectangles)
             .map_err(|e| pdu_other_err!("H.264 decode", source: e))?
         {
-            H264Decode::Frame(frame) => self.apply_avc420(surface_id, dest_rect, &stream.rectangles, &frame),
-            H264Decode::Pending => {
-                self.deferred_avc420 = Some(DeferredAvc420 {
-                    surface_id,
-                    destination_rectangle: dest_rect.clone(),
-                    regions: stream.rectangles,
-                });
-                Ok(())
+            H264Decode::Frame(frame) if !self.submitting_ahead => {
+                return self.apply_avc420(surface_id, dest_rect, &stream.rectangles, &frame);
             }
-        }
+            H264Decode::Frame(frame) => Some(frame),
+            H264Decode::Pending => None,
+        };
+        self.just_deferred = Some(DeferredAvc420 {
+            surface_id,
+            destination_rectangle: dest_rect.clone(),
+            regions: stream.rectangles,
+            frame,
+            check_on_apply: self.submitting_ahead,
+        });
+        Ok(())
     }
 
     /// Apply a decoded AVC420 frame: one surface update per region rectangle.
@@ -1479,8 +1584,9 @@ impl DvcProcessor for GraphicsPipelineClient {
 
     fn close(&mut self, _channel_id: u32) {
         self.state = ClientState::Closed;
-        self.deferred_avc420 = None;
-        self.backlog.clear();
+        self.pending.clear();
+        self.in_flight = 0;
+        self.just_deferred = None;
         self.handler.on_close();
     }
 
@@ -2993,12 +3099,16 @@ mod tests {
     /// with the surface's own first-frame delta already drained.
     fn deferred_client() -> (GraphicsPipelineClient, Arc<Mutex<DeferredState>>) {
         let state = Arc::new(Mutex::new(DeferredState::default()));
-        let mut client = GraphicsPipelineClient::new(
-            Box::new(TestHandler),
-            Some(Box::new(DeferredDecoder {
-                state: Arc::clone(&state),
-            })),
-        );
+        let client = client_with_decoder(Box::new(DeferredDecoder {
+            state: Arc::clone(&state),
+        }));
+        (client, state)
+    }
+
+    /// A client with `decoder` and one 64x64 surface mapped at the output origin, with the
+    /// surface's own first-frame delta already drained.
+    fn client_with_decoder(decoder: Box<dyn H264Decoder>) -> GraphicsPipelineClient {
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), Some(decoder));
         for pdu in [
             GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
                 width: u32::from(DEFERRED_SIZE),
@@ -3021,7 +3131,7 @@ mod tests {
             client.dispatch_pdu(pdu).expect("set up surface");
         }
         let _ = client.drain_output();
-        (client, state)
+        client
     }
 
     fn deferred_start_frame(frame_id: u32) -> GfxPdu {
@@ -3201,6 +3311,221 @@ mod tests {
         DvcProcessor::close(&mut client, 0);
 
         assert!(!client.is_awaiting_decoder());
+    }
+
+    /// What a [`PipelineDecoder`] has been asked to do, and the results it hands back in order.
+    #[derive(Default)]
+    struct PipelineState {
+        submitted: usize,
+        ready: VecDeque<crate::decode::DecoderResult<DecodedFrame>>,
+    }
+
+    /// An asynchronous decoder that keeps up to `limit` submissions in flight and returns
+    /// results in submission order, as WebCodecs does.
+    struct PipelineDecoder {
+        state: Arc<Mutex<PipelineState>>,
+        limit: usize,
+    }
+
+    impl H264Decoder for PipelineDecoder {
+        fn decode(&mut self, _data: &[u8]) -> crate::decode::DecoderResult<DecodedFrame> {
+            Err(crate::decode::DecoderError::msg("synchronous decode is not supported"))
+        }
+
+        fn submit(
+            &mut self,
+            _data: &[u8],
+            _regions: &[ExclusiveRectangle],
+        ) -> crate::decode::DecoderResult<H264Decode> {
+            self.state.lock().expect("state lock").submitted += 1;
+            Ok(H264Decode::Pending)
+        }
+
+        fn poll_frame(&mut self) -> Option<crate::decode::DecoderResult<DecodedFrame>> {
+            self.state.lock().expect("state lock").ready.pop_front()
+        }
+
+        fn max_in_flight(&self) -> usize {
+            self.limit
+        }
+    }
+
+    fn pipeline_client(limit: usize) -> (GraphicsPipelineClient, Arc<Mutex<PipelineState>>) {
+        let state = Arc::new(Mutex::new(PipelineState::default()));
+        let client = client_with_decoder(Box::new(PipelineDecoder {
+            state: Arc::clone(&state),
+            limit,
+        }));
+        (client, state)
+    }
+
+    /// A frame of the deferred surface's size filled with `value` in R, G and B.
+    fn solid_frame(value: u8) -> DecodedFrame {
+        let side = u32::from(DEFERRED_SIZE);
+        let pixels = usize::from(DEFERRED_SIZE) * usize::from(DEFERRED_SIZE);
+        DecodedFrame::new([value, value, value, 0xFF].repeat(pixels), side, side)
+    }
+
+    fn end_frame_pdu(frame_id: u32) -> GfxPdu {
+        GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id })
+    }
+
+    #[test]
+    fn two_h264_frames_decode_at_once_and_apply_in_order() {
+        let (mut client, state) = pipeline_client(4);
+        let region = deferred_rect(0, 0, 16, 16);
+        for pdu in [
+            deferred_start_frame(1),
+            avc420_update(&region),
+            end_frame_pdu(1),
+            deferred_start_frame(2),
+            avc420_update(&region),
+            end_frame_pdu(2),
+        ] {
+            client.dispatch_pdu(pdu).expect("dispatch");
+        }
+
+        assert_eq!(
+            state.lock().expect("state lock").submitted,
+            2,
+            "the second frame is submitted before the first returns"
+        );
+
+        state
+            .lock()
+            .expect("state lock")
+            .ready
+            .extend([Ok(solid_frame(1)), Ok(solid_frame(2))]);
+        let replies = client.resume().expect("resume");
+
+        assert_eq!(replies.len(), 2, "both frames are acknowledged");
+        assert!(!client.is_awaiting_decoder());
+        let updates = client.drain_output();
+        assert_eq!(updates.len(), 2, "one output update per frame");
+        assert_eq!(pixel_at(&updates[0], 3, 3), [1, 1, 1, 0xFF]);
+        assert_eq!(
+            pixel_at(&updates[1], 3, 3),
+            [2, 2, 2, 0xFF],
+            "the later frame lands last"
+        );
+    }
+
+    #[test]
+    fn commands_between_h264_frames_apply_between_them() {
+        let (mut client, state) = pipeline_client(4);
+        for pdu in [
+            deferred_start_frame(1),
+            avc420_update(&deferred_rect(0, 0, 16, 16)),
+            red_fill(&deferred_rect(0, 0, 16, 16)),
+            avc420_update(&deferred_rect(0, 0, 8, 8)),
+            end_frame_pdu(1),
+        ] {
+            client.dispatch_pdu(pdu).expect("dispatch");
+        }
+        assert_eq!(state.lock().expect("state lock").submitted, 2);
+
+        state
+            .lock()
+            .expect("state lock")
+            .ready
+            .extend([Ok(solid_frame(1)), Ok(solid_frame(2))]);
+        client.resume().expect("resume");
+
+        let updates = client.drain_output();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            pixel_at(&updates[0], 3, 3),
+            [2, 2, 2, 0xFF],
+            "the second frame is on top"
+        );
+        assert_eq!(
+            pixel_at(&updates[0], 12, 12),
+            [0xFF, 0, 0, 0xFF],
+            "the fill covers the first frame"
+        );
+    }
+
+    #[test]
+    fn submit_ahead_stops_at_reset_graphics() {
+        let (mut client, state) = pipeline_client(4);
+        for pdu in [
+            deferred_start_frame(1),
+            avc420_update(&deferred_rect(0, 0, 16, 16)),
+            end_frame_pdu(1),
+            GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+                width: u32::from(DEFERRED_SIZE),
+                height: u32::from(DEFERRED_SIZE),
+                monitors: vec![],
+            }),
+            GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id: DEFERRED_SURFACE,
+                width: DEFERRED_SIZE,
+                height: DEFERRED_SIZE,
+                pixel_format: PixelFormat::XRgb,
+            }),
+            deferred_start_frame(2),
+            avc420_update(&deferred_rect(0, 0, 16, 16)),
+            end_frame_pdu(2),
+        ] {
+            client.dispatch_pdu(pdu).expect("dispatch");
+        }
+        assert_eq!(
+            state.lock().expect("state lock").submitted,
+            1,
+            "nothing after ResetGraphics is decoded before the reset"
+        );
+
+        state.lock().expect("state lock").ready.push_back(Ok(solid_frame(1)));
+        client.resume().expect("resume");
+
+        assert_eq!(state.lock().expect("state lock").submitted, 2);
+        assert!(client.is_awaiting_decoder());
+    }
+
+    #[test]
+    fn submit_ahead_respects_the_decoders_in_flight_limit() {
+        let (mut client, state) = pipeline_client(2);
+        client.dispatch_pdu(deferred_start_frame(1)).expect("start frame");
+        for _ in 0..3 {
+            client
+                .dispatch_pdu(avc420_update(&deferred_rect(0, 0, 16, 16)))
+                .expect("dispatch");
+        }
+        assert_eq!(state.lock().expect("state lock").submitted, 2);
+
+        state.lock().expect("state lock").ready.push_back(Ok(solid_frame(1)));
+        client.resume().expect("resume");
+
+        assert_eq!(state.lock().expect("state lock").submitted, 3);
+    }
+
+    #[test]
+    fn a_failed_frame_ahead_of_a_good_one_drops_only_itself() {
+        let (mut client, state) = pipeline_client(4);
+        for pdu in [
+            deferred_start_frame(1),
+            avc420_update(&deferred_rect(0, 0, 16, 16)),
+            avc420_update(&deferred_rect(32, 32, 48, 48)),
+            end_frame_pdu(1),
+        ] {
+            client.dispatch_pdu(pdu).expect("dispatch");
+        }
+
+        state.lock().expect("state lock").ready.extend([
+            Err(crate::decode::DecoderError::msg("decoder error")),
+            Ok(solid_frame(2)),
+        ]);
+        let replies = client.resume().expect("a failed decode does not fail the channel");
+
+        assert_eq!(replies.len(), 1);
+        let updates = client.drain_output();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].region,
+            deferred_rect(32, 32, 48, 48),
+            "only the good frame paints"
+        );
+        assert_eq!(pixel_at(&updates[0], 40, 40), [2, 2, 2, 0xFF]);
     }
 
     fn avc444_update(rect: &ExclusiveRectangle, encoding: Encoding) -> GfxPdu {
