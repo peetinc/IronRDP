@@ -265,6 +265,85 @@ pub trait H264Decoder: Send {
 }
 
 // ============================================================================
+// RemoteFX Progressive backend
+// ============================================================================
+
+/// A progressive-stream event a [`ProgressiveBackend`] must see, in stream order, besides the
+/// bitmaps themselves.
+///
+/// `ResetGraphics` is deliberately absent: progressive state survives it, because Windows does
+/// not resend the SYNC and CONTEXT blocks a reset decoder would need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressiveControl {
+    StartFrame,
+    EndFrame,
+    /// `RDPGFX_DELETE_ENCODING_CONTEXT_PDU`.
+    DeleteContext {
+        surface_id: u16,
+        codec_context_id: u32,
+    },
+    /// `RDPGFX_DELETE_SURFACE_PDU`.
+    DeleteSurface {
+        surface_id: u16,
+    },
+}
+
+/// The tiles a progressive job decoded.
+pub struct DecodedTiles {
+    /// Pixels held outside this crate (for example in a browser Worker's buffer), drawn by
+    /// the surface backend through [`SurfaceBackend::write_external_tiles`].
+    ///
+    /// [`SurfaceBackend::write_external_tiles`]: crate::compositor::SurfaceBackend::write_external_tiles
+    pub external: Option<u64>,
+    /// In-memory tiles, written through the surface backend like in-thread decoding's.
+    pub tiles: Vec<ironrdp_graphics::progressive::DecodedTile>,
+}
+
+/// A progressive job that could not be decoded. Fatal to the session, as an in-thread
+/// progressive decode error is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressiveJobError {
+    pub reason: &'static str,
+}
+
+impl fmt::Display for ProgressiveJobError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.reason)
+    }
+}
+
+impl core::error::Error for ProgressiveJobError {}
+
+/// Decodes RemoteFX Progressive bitmaps ([MS-RDPEGFX] 2.2.4.2) away from the caller, for
+/// example on other threads.
+///
+/// Without one, `GraphicsPipelineClient` decodes progressive bitmaps itself, synchronously.
+/// With one, each `WireToSurface2` becomes a job: later commands wait behind it, and its
+/// tiles are written when it reaches the front of the queue, so drawing order is unchanged.
+///
+/// The backend sees every progressive input in stream order: [`Self::submit`] for each
+/// bitmap and [`Self::control`] for the events between them. It holds all progressive
+/// state.
+///
+/// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/
+pub trait ProgressiveBackend: Send {
+    /// How many submitted jobs the client may have outstanding.
+    fn max_in_flight(&self) -> usize;
+
+    /// Starts decoding `data`, a `WireToSurface2` bitmap for a `width` by `height` surface.
+    fn submit(&mut self, job: u32, surface_id: u16, codec_context_id: u32, width: u16, height: u16, data: &[u8]);
+
+    /// Applies a stream event at its place among the submitted jobs.
+    fn control(&mut self, control: ProgressiveControl);
+
+    /// The result of `job` once it has decoded; `None` while it is still decoding.
+    ///
+    /// Jobs complete in submission order. Called by `GraphicsPipelineClient::resume` for the
+    /// oldest outstanding job.
+    fn poll(&mut self, job: u32) -> Option<Result<DecodedTiles, ProgressiveJobError>>;
+}
+
+// ============================================================================
 // OpenH264 Implementation
 // ============================================================================
 

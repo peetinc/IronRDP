@@ -89,7 +89,7 @@ pub fn set_capture_hook(hook: Option<CaptureHook>) {
 fn capture_hook() -> Option<CaptureHook> {
     *CAPTURE_HOOK.read().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
-use crate::decode::{DecodedFrame, H264Decode, H264Decoder};
+use crate::decode::{DecodedFrame, H264Decode, H264Decoder, ProgressiveBackend, ProgressiveControl};
 use crate::pdu::{
     Avc420BitmapStream, Avc444BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu,
     CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, CapabilityVersion, Codec1Type,
@@ -430,6 +430,9 @@ pub struct GraphicsPipelineClient {
     clearcodec_decoder: Option<ClearCodecDecoder>,
     planar_decoder: BitmapStreamDecoder,
     progressive_decoder: ProgressiveDecoder,
+    /// Decodes progressive bitmaps away from this client; `None` decodes them here, with
+    /// `progressive_decoder`.
+    progressive_backend: Option<Box<dyn ProgressiveBackend>>,
 
     decompressor: zgfx::Decompressor,
     decompressed_buffer: Vec<u8>,
@@ -457,6 +460,14 @@ pub struct GraphicsPipelineClient {
     /// Set while [`Self::submit_ahead`] submits a queued picture: one the decoder returns at
     /// once must still wait for the commands ahead of it.
     submitting_ahead: bool,
+    /// How many [`Pending::Progressive`] entries `pending` holds.
+    progressive_in_flight: usize,
+    /// The id the next progressive job gets.
+    next_progressive_job: u32,
+    /// Set when a `WireToSurface2` became a job, for the caller to queue.
+    just_deferred_progressive: Option<DeferredProgressive>,
+    /// Set while a [`Pending::Forwarded`] command applies: the backend already has it.
+    applying_forwarded: bool,
 
     ack_policy: FrameAckPolicy,
     /// Milliseconds, for QoE acknowledgements; set with [`Self::with_frame_ack_policy`].
@@ -515,6 +526,18 @@ enum Pending {
     Avc420(DeferredAvc420),
     /// A command held because something ahead of it is still decoding.
     Pdu(GfxPdu),
+    /// A progressive bitmap submitted to the [`ProgressiveBackend`], applied when its job
+    /// completes.
+    Progressive(DeferredProgressive),
+    /// A held command already given to the [`ProgressiveBackend`] by [`Self::submit_ahead`],
+    /// applied without forwarding it again.
+    Forwarded(GfxPdu),
+}
+
+/// A progressive job waiting for its tiles.
+struct DeferredProgressive {
+    job: u32,
+    surface_id: u16,
 }
 
 /// Most PDUs held behind a deferred H.264 decode.
@@ -550,6 +573,7 @@ impl GraphicsPipelineClient {
             clearcodec_decoder: None,
             planar_decoder: BitmapStreamDecoder::default(),
             progressive_decoder: ProgressiveDecoder::new(),
+            progressive_backend: None,
             decompressor: zgfx::Decompressor::new(),
             decompressed_buffer: Vec::new(),
             state: ClientState::WaitingForConfirm,
@@ -565,6 +589,10 @@ impl GraphicsPipelineClient {
             queued_frames: 0,
             just_deferred: None,
             submitting_ahead: false,
+            progressive_in_flight: 0,
+            next_progressive_job: 1,
+            just_deferred_progressive: None,
+            applying_forwarded: false,
             ack_policy: FrameAckPolicy::EveryFrame,
             clock: None,
             acks_suspended: false,
@@ -583,6 +611,13 @@ impl GraphicsPipelineClient {
         self.ack_policy = policy;
         self.clock = Some(clock);
         self.acked_frames = 0;
+        self
+    }
+
+    /// Decodes RemoteFX Progressive bitmaps with `backend` instead of in this client.
+    #[must_use]
+    pub fn with_progressive_backend(mut self, backend: Box<dyn ProgressiveBackend>) -> Self {
+        self.progressive_backend = Some(backend);
         self
     }
 
@@ -648,10 +683,11 @@ impl GraphicsPipelineClient {
         self.pending_output_reset.take()
     }
 
-    /// Whether an H.264 frame is still decoding, holding back the commands after it.
+    /// Whether an H.264 frame or a progressive job is still decoding, holding back the
+    /// commands after it.
     #[must_use]
     pub fn is_awaiting_decoder(&self) -> bool {
-        0 < self.in_flight
+        0 < self.in_flight || 0 < self.progressive_in_flight
     }
 
     /// Entries not yet applied: H.264 pictures still decoding and the commands held behind
@@ -701,18 +737,39 @@ impl GraphicsPipelineClient {
                         }
                     }
                 }
-                Some(Pending::Pdu(_)) => {
-                    let Some(Pending::Pdu(pdu)) = self.pending.pop_front() else {
+                Some(Pending::Progressive(deferred)) => {
+                    let job = deferred.job;
+                    let Some(result) = self.progressive_backend.as_mut().and_then(|backend| backend.poll(job)) else {
                         break;
+                    };
+                    let Some(Pending::Progressive(deferred)) = self.pending.pop_front() else {
+                        break;
+                    };
+                    self.progressive_in_flight -= 1;
+                    let tiles = result.map_err(|error| pdu_other_err!("rfx progressive job", error.reason))?;
+                    self.apply_progressive_tiles(deferred.surface_id, tiles)?;
+                }
+                Some(Pending::Pdu(_) | Pending::Forwarded(_)) => {
+                    let (pdu, forwarded) = match self.pending.pop_front() {
+                        Some(Pending::Pdu(pdu)) => (pdu, false),
+                        Some(Pending::Forwarded(pdu)) => (pdu, true),
+                        _ => break,
                     };
                     if matches!(pdu, GfxPdu::EndFrame(_)) {
                         self.queued_frames -= 1;
                     }
-                    replies.extend(self.handle_pdu(pdu)?);
+                    self.applying_forwarded = forwarded;
+                    let handled = self.handle_pdu(pdu);
+                    self.applying_forwarded = false;
+                    replies.extend(handled?);
+                    // It was next in wire order, so it goes in front of what follows it.
                     if let Some(deferred) = self.just_deferred.take() {
-                        // It was next in wire order, so it goes in front of what follows it.
                         self.pending.push_front(Pending::Avc420(deferred));
                         self.in_flight += 1;
+                    }
+                    if let Some(deferred) = self.just_deferred_progressive.take() {
+                        self.pending.push_front(Pending::Progressive(deferred));
+                        self.progressive_in_flight += 1;
                     }
                 }
             }
@@ -746,9 +803,13 @@ impl GraphicsPipelineClient {
                 self.pending.push_back(Pending::Avc420(deferred));
                 self.in_flight += 1;
             }
+            if let Some(deferred) = self.just_deferred_progressive.take() {
+                self.pending.push_back(Pending::Progressive(deferred));
+                self.progressive_in_flight += 1;
+            }
             return Ok(replies);
         }
-        if MAX_DEFERRED_BACKLOG <= self.pending.len() - self.in_flight {
+        if MAX_DEFERRED_BACKLOG <= self.pending.len() - self.in_flight - self.progressive_in_flight {
             return Err(pdu_other_err!("too many PDUs held behind a deferred H.264 decode"));
         }
         if matches!(pdu, GfxPdu::EndFrame(_)) {
@@ -765,8 +826,8 @@ impl GraphicsPipelineClient {
                 .pending
                 .iter()
                 .map(|entry| match entry {
-                    Pending::Pdu(pdu) => pdu.size(),
-                    Pending::Avc420(_) => 0,
+                    Pending::Pdu(pdu) | Pending::Forwarded(pdu) => pdu.size(),
+                    Pending::Avc420(_) | Pending::Progressive(_) => 0,
                 })
                 .sum();
             let queue_depth = QueueDepth::AvailableBytes(u32::try_from(queued_bytes).unwrap_or(u32::MAX - 1).max(1));
@@ -806,7 +867,7 @@ impl GraphicsPipelineClient {
         let mut index = 0;
         while index < self.pending.len() && self.in_flight < limit {
             let is_h264 = match &self.pending[index] {
-                Pending::Avc420(_) => false,
+                Pending::Avc420(_) | Pending::Progressive(_) | Pending::Forwarded(_) => false,
                 Pending::Pdu(GfxPdu::ResetGraphics(_) | GfxPdu::CapabilitiesConfirm(_)) => break,
                 Pending::Pdu(GfxPdu::WireToSurface1(wire)) => matches!(
                     wire.codec_id,
@@ -869,7 +930,9 @@ impl GraphicsPipelineClient {
             }
             GfxPdu::StartFrame(start) => {
                 self.current_frame_id = Some(start.frame_id);
-                self.progressive_decoder.begin_frame();
+                if !self.forward_progressive(ProgressiveControl::StartFrame) {
+                    self.progressive_decoder.begin_frame();
+                }
                 trace!(frame_id = start.frame_id, "StartFrame");
                 Ok(vec![])
             }
@@ -880,7 +943,11 @@ impl GraphicsPipelineClient {
             GfxPdu::WireToSurface2(pdu) => {
                 trace!("WireToSurface2 (progressive codec)");
                 self.handler.on_wire_to_surface2(&pdu);
-                self.handle_wire_to_surface2(pdu)?;
+                if self.progressive_backend.is_some() {
+                    self.just_deferred_progressive = Some(self.submit_progressive(&pdu)?);
+                } else {
+                    self.handle_wire_to_surface2(pdu)?;
+                }
                 Ok(vec![])
             }
             GfxPdu::EndFrame(end) => self.handle_end_frame(end.frame_id),
@@ -973,8 +1040,13 @@ impl GraphicsPipelineClient {
                     codec_context_id = pdu.codec_context_id,
                     "DeleteEncodingContext"
                 );
-                self.progressive_decoder
-                    .delete_context(pdu.surface_id, pdu.codec_context_id);
+                if !self.forward_progressive(ProgressiveControl::DeleteContext {
+                    surface_id: pdu.surface_id,
+                    codec_context_id: pdu.codec_context_id,
+                }) {
+                    self.progressive_decoder
+                        .delete_context(pdu.surface_id, pdu.codec_context_id);
+                }
                 self.handler.on_delete_encoding_context(&pdu);
                 Ok(vec![])
             }
@@ -1090,7 +1162,9 @@ impl GraphicsPipelineClient {
     }
 
     fn handle_delete_surface(&mut self, surface_id: u16) {
-        self.progressive_decoder.delete_surface(surface_id);
+        if !self.forward_progressive(ProgressiveControl::DeleteSurface { surface_id }) {
+            self.progressive_decoder.delete_surface(surface_id);
+        }
         if self.surfaces.remove(&surface_id).is_some() {
             self.compositor.delete_surface(surface_id);
             debug!(surface_id, "Surface deleted");
@@ -1281,6 +1355,70 @@ impl GraphicsPipelineClient {
                 })
             })?;
 
+        self.write_progressive_tiles(pdu.surface_id, surface_width, surface_height, tiles);
+        Ok(())
+    }
+
+    /// With a [`ProgressiveBackend`]: starts decoding `pdu` as the next job.
+    fn submit_progressive(&mut self, pdu: &WireToSurface2Pdu) -> PduResult<DeferredProgressive> {
+        let surface = self
+            .surfaces
+            .get(&pdu.surface_id)
+            .ok_or_else(|| pdu_other_err!("unknown surface in WireToSurface2"))?;
+        let (width, height) = (surface.width, surface.height);
+        let job = self.next_progressive_job;
+        self.next_progressive_job = job.wrapping_add(1);
+        if let Some(backend) = self.progressive_backend.as_mut() {
+            backend.submit(
+                job,
+                pdu.surface_id,
+                pdu.codec_context_id,
+                width,
+                height,
+                &pdu.bitmap_data,
+            );
+        }
+        Ok(DeferredProgressive {
+            job,
+            surface_id: pdu.surface_id,
+        })
+    }
+
+    /// Writes a completed progressive job's tiles to their surface.
+    fn apply_progressive_tiles(&mut self, surface_id: u16, decoded: crate::decode::DecodedTiles) -> PduResult<()> {
+        let surface = self
+            .surfaces
+            .get(&surface_id)
+            .ok_or_else(|| pdu_other_err!("unknown surface in WireToSurface2"))?;
+        let (surface_width, surface_height) = (surface.width, surface.height);
+        if let Some(handle) = decoded.external {
+            self.compositor.write_external_tiles(surface_id, handle);
+        }
+        self.write_progressive_tiles(surface_id, surface_width, surface_height, decoded.tiles);
+        Ok(())
+    }
+
+    /// Hands `control` to the [`ProgressiveBackend`], unless it already has it. `false`
+    /// without a backend: the caller then applies it to `progressive_decoder`.
+    fn forward_progressive(&mut self, control: ProgressiveControl) -> bool {
+        let Some(backend) = self.progressive_backend.as_mut() else {
+            return false;
+        };
+        if !self.applying_forwarded {
+            backend.control(control);
+        }
+        true
+    }
+
+    /// Writes decoded progressive tiles to a `surface_width` by `surface_height` surface,
+    /// each clipped to its update rectangles.
+    fn write_progressive_tiles(
+        &mut self,
+        surface_id: u16,
+        surface_width: u16,
+        surface_height: u16,
+        tiles: Vec<ironrdp_graphics::progressive::DecodedTile>,
+    ) {
         for tile in tiles {
             let tile_left = tile.x_idx.saturating_mul(TILE_DIM);
             let tile_top = tile.y_idx.saturating_mul(TILE_DIM);
@@ -1300,7 +1438,7 @@ impl GraphicsPipelineClient {
                 let width = destination_rectangle.right - destination_rectangle.left;
                 let height = destination_rectangle.bottom - destination_rectangle.top;
                 let update = BitmapUpdate {
-                    surface_id: pdu.surface_id,
+                    surface_id,
                     destination_rectangle,
                     codec_id: Codec1Type::Uncompressed,
                     data,
@@ -1343,8 +1481,6 @@ impl GraphicsPipelineClient {
                 emit_update(destination_rectangle, data);
             }
         }
-
-        Ok(())
     }
 
     fn decode_avc420(&mut self, surface_id: u16, dest_rect: &ExclusiveRectangle, bitmap_data: &[u8]) -> PduResult<()> {
@@ -1659,7 +1795,9 @@ impl GraphicsPipelineClient {
         self.total_frames_decoded = self.total_frames_decoded.wrapping_add(1);
         self.current_frame_id = None;
 
-        self.progressive_decoder.end_frame();
+        if !self.forward_progressive(ProgressiveControl::EndFrame) {
+            self.progressive_decoder.end_frame();
+        }
 
         // Commit the frame's compositor deltas so `drain_output` can surface them.
         self.compositor.end_frame();
@@ -4255,6 +4393,217 @@ mod tests {
                 "surface_to_surface 1->1 1".to_owned(),
                 "end_frame".to_owned(),
             ]
+        );
+    }
+
+    /// What a [`FakeProgressive`] was asked, in order, and the results the test hands it.
+    #[derive(Default)]
+    struct ProgressiveState {
+        calls: Vec<String>,
+        ready: BTreeMap<u32, Result<crate::decode::DecodedTiles, crate::decode::ProgressiveJobError>>,
+    }
+
+    /// An asynchronous progressive backend whose jobs complete when the test says.
+    struct FakeProgressive {
+        state: Arc<Mutex<ProgressiveState>>,
+        limit: usize,
+    }
+
+    impl ProgressiveBackend for FakeProgressive {
+        fn max_in_flight(&self) -> usize {
+            self.limit
+        }
+
+        fn submit(&mut self, job: u32, surface_id: u16, codec_context_id: u32, width: u16, height: u16, _data: &[u8]) {
+            self.state.lock().expect("state lock").calls.push(format!(
+                "submit {job} s{surface_id} c{codec_context_id} {width}x{height}"
+            ));
+        }
+
+        fn control(&mut self, control: ProgressiveControl) {
+            let call = match control {
+                ProgressiveControl::StartFrame => "start".to_owned(),
+                ProgressiveControl::EndFrame => "end".to_owned(),
+                ProgressiveControl::DeleteContext {
+                    surface_id,
+                    codec_context_id,
+                } => format!("delete_context s{surface_id} c{codec_context_id}"),
+                ProgressiveControl::DeleteSurface { surface_id } => {
+                    format!("delete_surface s{surface_id}")
+                }
+            };
+            self.state.lock().expect("state lock").calls.push(call);
+        }
+
+        fn poll(
+            &mut self,
+            job: u32,
+        ) -> Option<Result<crate::decode::DecodedTiles, crate::decode::ProgressiveJobError>> {
+            self.state.lock().expect("state lock").ready.remove(&job)
+        }
+    }
+
+    /// A client with a [`FakeProgressive`] of `limit` and, for holding commands back, an H.264
+    /// decoder that returns pictures only when the test says.
+    fn async_progressive_client(
+        limit: usize,
+    ) -> (
+        GraphicsPipelineClient,
+        Arc<Mutex<ProgressiveState>>,
+        Arc<Mutex<PipelineState>>,
+    ) {
+        let (client, h264) = pipeline_client(4);
+        let state = Arc::new(Mutex::new(ProgressiveState::default()));
+        let client = client.with_progressive_backend(Box::new(FakeProgressive {
+            state: Arc::clone(&state),
+            limit,
+        }));
+        (client, state, h264)
+    }
+
+    fn progressive_update(codec_context_id: u32) -> GfxPdu {
+        GfxPdu::WireToSurface2(WireToSurface2Pdu {
+            surface_id: DEFERRED_SURFACE,
+            codec_id: crate::pdu::Codec2Type::RemoteFxProgressive,
+            codec_context_id,
+            pixel_format: PixelFormat::XRgb,
+            bitmap_data: vec![0xAB; 8],
+        })
+    }
+
+    /// One whole 64x64 tile filled with `value` in R, G and B.
+    fn solid_tiles(value: u8) -> crate::decode::DecodedTiles {
+        crate::decode::DecodedTiles {
+            external: None,
+            tiles: vec![ironrdp_graphics::progressive::DecodedTile {
+                x_idx: 0,
+                y_idx: 0,
+                pixels: [value, value, value, 0xFF].repeat(64 * 64),
+                update_rectangles: vec![deferred_rect(0, 0, DEFERRED_SIZE, DEFERRED_SIZE)],
+            }],
+        }
+    }
+
+    fn complete(state: &Arc<Mutex<ProgressiveState>>, job: u32, value: u8) {
+        state
+            .lock()
+            .expect("state lock")
+            .ready
+            .insert(job, Ok(solid_tiles(value)));
+    }
+
+    fn calls(state: &Arc<Mutex<ProgressiveState>>) -> Vec<String> {
+        state.lock().expect("state lock").calls.clone()
+    }
+
+    fn has_frame_ack(replies: &[DvcMessage]) -> bool {
+        decode_replies(replies)
+            .iter()
+            .any(|pdu| matches!(pdu, GfxPdu::FrameAcknowledge(_)))
+    }
+
+    #[test]
+    fn progressive_jobs_apply_in_stream_order_when_completed_out_of_order() {
+        let (mut client, state, _h264) = async_progressive_client(4);
+        for pdu in [
+            deferred_start_frame(1),
+            progressive_update(1),
+            progressive_update(1),
+            end_frame_pdu(1),
+        ] {
+            client.dispatch_pdu(pdu).expect("dispatch");
+        }
+
+        complete(&state, 2, 2);
+        client.resume().expect("resume");
+        assert!(client.drain_output().is_empty(), "the second job waits for the first");
+        assert!(client.is_awaiting_decoder());
+
+        complete(&state, 1, 1);
+        client.resume().expect("resume");
+        let updates = client.drain_output();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(pixel_at(&updates[0], 3, 3), [2, 2, 2, 0xFF], "the later job lands last");
+        assert!(!client.is_awaiting_decoder());
+    }
+
+    #[test]
+    fn commands_behind_a_progressive_job_wait_for_it() {
+        let (mut client, state, _h264) = async_progressive_client(4);
+        for pdu in [
+            deferred_start_frame(1),
+            progressive_update(1),
+            red_fill(&deferred_rect(8, 8, 16, 16)),
+            end_frame_pdu(1),
+        ] {
+            client.dispatch_pdu(pdu).expect("dispatch");
+        }
+        assert!(client.drain_output().is_empty());
+
+        complete(&state, 1, 1);
+        client.resume().expect("resume");
+        let updates = client.drain_output();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(pixel_at(&updates[0], 3, 3), [1, 1, 1, 0xFF]);
+        assert_eq!(
+            pixel_at(&updates[0], 10, 10),
+            [0xFF, 0, 0, 0xFF],
+            "the fill lands on top"
+        );
+    }
+
+    #[test]
+    fn a_failed_progressive_job_is_a_session_error() {
+        let (mut client, state, _h264) = async_progressive_client(4);
+        client.dispatch_pdu(deferred_start_frame(1)).expect("dispatch");
+        client.dispatch_pdu(progressive_update(1)).expect("dispatch");
+
+        state.lock().expect("state lock").ready.insert(
+            1,
+            Err(crate::decode::ProgressiveJobError {
+                reason: "rfx progressive decode failed: RLGR",
+            }),
+        );
+        assert!(client.resume().is_err());
+    }
+
+    #[test]
+    fn frame_ack_waits_for_the_frames_progressive_job() {
+        let (mut client, state, _h264) = async_progressive_client(4);
+        let mut replies = Vec::new();
+        for pdu in [deferred_start_frame(1), progressive_update(1), end_frame_pdu(1)] {
+            replies.extend(client.dispatch_pdu(pdu).expect("dispatch"));
+        }
+        assert!(!has_frame_ack(&replies), "no acknowledgement before the job applies");
+
+        complete(&state, 1, 1);
+        let replies = client.resume().expect("resume");
+        assert!(has_frame_ack(&replies));
+    }
+
+    #[test]
+    fn progressive_controls_reach_the_backend_when_applied() {
+        let (mut client, state, _h264) = async_progressive_client(4);
+        for pdu in [
+            deferred_start_frame(1),
+            GfxPdu::DeleteEncodingContext(DeleteEncodingContextPdu {
+                surface_id: DEFERRED_SURFACE,
+                codec_context_id: 7,
+            }),
+            end_frame_pdu(1),
+            GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+                width: u32::from(DEFERRED_SIZE),
+                height: u32::from(DEFERRED_SIZE),
+                monitors: vec![],
+            }),
+        ] {
+            client.dispatch_pdu(pdu).expect("dispatch");
+        }
+
+        assert_eq!(
+            calls(&state),
+            ["start", "delete_context s1 c7", "end"].map(str::to_owned),
+            "ResetGraphics leaves progressive state alone"
         );
     }
 }

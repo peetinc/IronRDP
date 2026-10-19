@@ -160,6 +160,18 @@ pub trait SurfaceBackend: Send {
     fn surface_to_cache(&mut self, surface_id: u16, cache_slot: u16, src_rect: &ExclusiveRectangle);
     fn cache_to_surface(&mut self, cache_slot: u16, surface_id: u16, dst_points: &[Point]);
     fn evict_cache_entry(&mut self, cache_slot: u16);
+    /// Draws the tiles of a progressive job whose pixels live outside this crate
+    /// ([`DecodedTiles::external`]). The default warns and draws nothing: only a backend that
+    /// owns such pixels can draw them.
+    ///
+    /// [`DecodedTiles::external`]: crate::decode::DecodedTiles::external
+    fn write_external_tiles(&mut self, surface_id: u16, handle: u64) {
+        let _ = handle;
+        warn!(
+            surface_id,
+            "Ignoring external progressive tiles: this surface backend cannot draw them"
+        );
+    }
     /// Commits the frame built since the last call.
     fn end_frame(&mut self);
     /// The output regions that changed in committed frames, as pixels, emptied by each call.
