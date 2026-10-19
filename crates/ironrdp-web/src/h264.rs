@@ -26,6 +26,10 @@ const PROBE_CODEC: &str = "avc1.640034";
 /// A decode slower than this is logged: the EGFX pipeline waits on every frame.
 const SLOW_DECODE_MS: f64 = 500.0;
 
+/// Pictures the EGFX client may have decoding at once. Hardware decoders have few output
+/// buffers, and the client holds each decoded frame until it applies.
+const MAX_IN_FLIGHT: usize = 4;
+
 /// NAL `nal_unit_type` values ([ITU-T H.264] Table 7-1).
 ///
 /// [ITU-T H.264]: https://www.itu.int/rec/T-REC-H.264
@@ -196,8 +200,12 @@ impl H264Decoder for WebCodecsH264Decoder {
     }
 
     fn poll_frame(&mut self) -> Option<DecoderResult<DecodedFrame>> {
-        self.with_slot(|slot| slot.shared.borrow_mut().finished.take())
+        self.with_slot(|slot| slot.shared.borrow_mut().in_flight.pop_ready())
             .flatten()
+    }
+
+    fn max_in_flight(&self) -> usize {
+        MAX_IN_FLIGHT
     }
 
     fn reset(&mut self) {
@@ -216,14 +224,12 @@ struct Slot {
 
 /// State the WebCodecs callbacks share with the slot.
 struct Shared {
-    /// `regionRects` of the frame in flight: the only pixels read back.
-    regions: Vec<ExclusiveRectangle>,
-    finished: Option<DecoderResult<DecodedFrame>>,
+    /// Shown pictures submitted and not yet returned to the EGFX client, oldest first.
+    in_flight: InFlight,
     readback: Option<Readback>,
     output: FrameOutput,
     /// The decoder's slot, which owns the frames it holds for the GPU backend.
     owner: u32,
-    submitted_at: f64,
     /// Per decoded chunk, oldest first: whether its picture is shown (`false` for AVC444
     /// chroma views). WebCodecs outputs pictures in decode order.
     shown: VecDeque<bool>,
@@ -239,6 +245,77 @@ struct ActiveDecoder {
     _on_error: Closure<dyn FnMut(JsValue)>,
 }
 
+/// Shown pictures submitted to the decoder and not yet returned, in submission order, which
+/// is the order WebCodecs outputs them in.
+#[derive(Default)]
+struct InFlight {
+    entries: VecDeque<InFlightEntry>,
+}
+
+struct InFlightEntry {
+    /// `regionRects` of the picture: the only pixels read back.
+    regions: Vec<ExclusiveRectangle>,
+    submitted_at: f64,
+    /// `None` while decoding.
+    result: Option<DecoderResult<DecodedFrame>>,
+}
+
+impl InFlight {
+    fn push(&mut self, regions: &[ExclusiveRectangle], submitted_at: f64) {
+        self.entries.push_back(InFlightEntry {
+            regions: regions.to_vec(),
+            submitted_at,
+            result: None,
+        });
+    }
+
+    /// A submission that failed at once; its error is returned in its place.
+    fn push_failed(&mut self, error: DecoderError) {
+        self.entries.push_back(InFlightEntry {
+            regions: Vec::new(),
+            submitted_at: 0.0,
+            result: Some(Err(error)),
+        });
+    }
+
+    /// The regions and submit time of the oldest picture still decoding.
+    fn next_waiting(&self) -> Option<(&[ExclusiveRectangle], f64)> {
+        self.entries
+            .iter()
+            .find(|entry| entry.result.is_none())
+            .map(|entry| (entry.regions.as_slice(), entry.submitted_at))
+    }
+
+    /// Completes the oldest picture still decoding; `false` when none is.
+    fn fill_next(&mut self, result: DecoderResult<DecodedFrame>) -> bool {
+        match self.entries.iter_mut().find(|entry| entry.result.is_none()) {
+            Some(entry) => {
+                entry.result = Some(result);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Fails every picture still decoding, returning how many.
+    fn fail_waiting(&mut self, message: &str) -> usize {
+        let mut failed = 0;
+        for entry in self.entries.iter_mut().filter(|entry| entry.result.is_none()) {
+            entry.result = Some(Err(DecoderError::msg(message)));
+            failed += 1;
+        }
+        failed
+    }
+
+    /// The oldest entry's result, once it has one.
+    fn pop_ready(&mut self) -> Option<DecoderResult<DecodedFrame>> {
+        if self.entries.front()?.result.is_none() {
+            return None;
+        }
+        self.entries.pop_front().and_then(|entry| entry.result)
+    }
+}
+
 /// Canvas a `VideoFrame` is drawn to so its pixels can be read back as RGBA.
 struct Readback {
     canvas: OffscreenCanvas,
@@ -250,12 +327,10 @@ impl Slot {
         Self {
             decoder: None,
             shared: Rc::new(RefCell::new(Shared {
-                regions: Vec::new(),
-                finished: None,
+                in_flight: InFlight::default(),
                 readback: None,
                 output,
                 owner,
-                submitted_at: 0.0,
                 shown: VecDeque::new(),
             })),
             wake,
@@ -264,15 +339,13 @@ impl Slot {
     }
 
     fn submit(&mut self, data: &[u8], regions: &[ExclusiveRectangle]) {
-        {
-            let mut shared = self.shared.borrow_mut();
-            shared.finished = None;
-            shared.regions.clear();
-            shared.regions.extend_from_slice(regions);
-        }
-        if let Err(error) = self.decode_chunk(data, true) {
-            self.shared.borrow_mut().finished = Some(Err(error));
-            (self.wake)();
+        // WebCodecs never outputs during `decode`, so the entry can follow the chunk.
+        match self.decode_chunk(data, true) {
+            Ok(()) => self.shared.borrow_mut().in_flight.push(regions, js_sys::Date::now()),
+            Err(error) => {
+                self.shared.borrow_mut().in_flight.push_failed(error);
+                (self.wake)();
+            }
         }
     }
 
@@ -322,21 +395,22 @@ impl Slot {
             .decoder
             .decode(&chunk)
             .map_err(|error| js_error("decode H.264 chunk", &error))?;
-        {
-            let mut shared = self.shared.borrow_mut();
-            shared.shown.push_back(shown);
-            if shown {
-                shared.submitted_at = js_sys::Date::now();
-            }
-        }
+        self.shared.borrow_mut().shown.push_back(shown);
         active.awaiting_key = false;
         self.timestamp += 1.0;
         Ok(())
     }
 
     fn close(&mut self) {
-        // A closed decoder outputs nothing more.
-        self.shared.borrow_mut().shown.clear();
+        // A closed decoder outputs nothing more, so the pictures still decoding never arrive.
+        let failed = {
+            let mut shared = self.shared.borrow_mut();
+            shared.shown.clear();
+            shared.in_flight.fail_waiting("H.264 decoder closed")
+        };
+        if 0 < failed {
+            (self.wake)();
+        }
         if let Some(active) = self.decoder.take()
             && active.decoder.state() != "closed"
             && let Err(error) = active.decoder.close()
@@ -358,20 +432,31 @@ impl ActiveDecoder {
                 }
                 {
                     let mut shared = shared.borrow_mut();
-                    let latency = js_sys::Date::now() - shared.submitted_at;
+                    let Some((regions, submitted_at)) = shared
+                        .in_flight
+                        .next_waiting()
+                        .map(|(regions, submitted_at)| (regions.to_vec(), submitted_at))
+                    else {
+                        // Its entry was already failed (the decoder closed): nothing waits for it.
+                        frame.close();
+                        return;
+                    };
+                    let latency = js_sys::Date::now() - submitted_at;
                     if SLOW_DECODE_MS < latency {
                         warn!(latency, "Slow H.264 decode");
                     }
                     if shared.output == FrameOutput::Gpu {
                         let (width, height) = (frame.display_width(), frame.display_height());
                         let handle = crate::gpu::hold_frame(shared.owner, frame);
-                        shared.finished = Some(Ok(DecodedFrame::external(handle, width, height)));
+                        shared
+                            .in_flight
+                            .fill_next(Ok(DecodedFrame::external(handle, width, height)));
                         drop(shared);
                         wake();
                         return;
                     }
-                    let result = shared.read_back(&frame);
-                    shared.finished = Some(result);
+                    let result = shared.read_back(&frame, &regions);
+                    shared.in_flight.fill_next(result);
                 }
                 frame.close();
                 wake();
@@ -386,7 +471,7 @@ impl ActiveDecoder {
             Closure::<dyn FnMut(JsValue)>::new(move |error: JsValue| {
                 warn!(?error, "H.264 decoder error");
                 failed.set(true);
-                shared.borrow_mut().finished = Some(Err(DecoderError::msg("H.264 decoder error")));
+                shared.borrow_mut().in_flight.fail_waiting("H.264 decoder error");
                 wake();
             })
         };
@@ -412,16 +497,16 @@ impl ActiveDecoder {
 }
 
 impl Shared {
-    /// Reads the in-flight frame's changed regions (or the whole frame, if it listed none)
-    /// into a frame-sized RGBA buffer. The rest of the buffer stays zero: the client copies
-    /// only the regions.
-    fn read_back(&mut self, frame: &VideoFrame) -> DecoderResult<DecodedFrame> {
+    /// Reads a frame's changed `regions` (or the whole frame, if it listed none) into a
+    /// frame-sized RGBA buffer. The rest of the buffer stays zero: the client copies only the
+    /// regions.
+    fn read_back(&mut self, frame: &VideoFrame, regions: &[ExclusiveRectangle]) -> DecoderResult<DecodedFrame> {
         let (width, height) = (frame.display_width(), frame.display_height());
         let readback = match self.readback.take() {
             Some(readback) if readback.canvas.width() == width && readback.canvas.height() == height => readback,
             _ => Readback::new(width, height)?,
         };
-        let result = read_regions(&readback.context, frame, width, height, &self.regions);
+        let result = read_regions(&readback.context, frame, width, height, regions);
         self.readback = Some(readback);
         result
     }
@@ -644,6 +729,78 @@ mod tests {
             stream.extend_from_slice(nal);
         }
         stream
+    }
+
+    fn rect(left: u16) -> ExclusiveRectangle {
+        ExclusiveRectangle {
+            left,
+            top: 0,
+            right: left + 1,
+            bottom: 1,
+        }
+    }
+
+    fn frame(value: u8) -> DecodedFrame {
+        DecodedFrame::new(vec![value; 4], 1, 1)
+    }
+
+    fn frame_value(result: Option<DecoderResult<DecodedFrame>>) -> Result<u8, String> {
+        match result {
+            Some(Ok(frame)) => Ok(frame.data().first().copied().unwrap_or_default()),
+            Some(Err(error)) => Err(error.to_string()),
+            None => Err("pending".to_owned()),
+        }
+    }
+
+    #[test]
+    fn in_flight_entries_complete_in_submission_order() {
+        let mut in_flight = InFlight::default();
+        in_flight.push(&[rect(1)], 0.0);
+        in_flight.push(&[rect(2)], 0.0);
+
+        assert_eq!(
+            in_flight.next_waiting().map(|(regions, _)| regions.to_vec()),
+            Some(vec![rect(1)])
+        );
+        assert!(in_flight.fill_next(Ok(frame(1))));
+        assert_eq!(
+            in_flight.next_waiting().map(|(regions, _)| regions.to_vec()),
+            Some(vec![rect(2)])
+        );
+
+        assert_eq!(frame_value(in_flight.pop_ready()), Ok(1));
+        assert_eq!(frame_value(in_flight.pop_ready()), Err("pending".to_owned()));
+        assert!(in_flight.fill_next(Ok(frame(2))));
+        assert_eq!(frame_value(in_flight.pop_ready()), Ok(2));
+        assert!(!in_flight.fill_next(Ok(frame(3))), "nothing is waiting");
+    }
+
+    #[test]
+    fn a_failed_submission_keeps_its_place() {
+        let mut in_flight = InFlight::default();
+        in_flight.push(&[rect(1)], 0.0);
+        in_flight.push_failed(DecoderError::msg("no key frame"));
+
+        assert_eq!(frame_value(in_flight.pop_ready()), Err("pending".to_owned()));
+        in_flight.fill_next(Ok(frame(1)));
+        assert_eq!(frame_value(in_flight.pop_ready()), Ok(1));
+        assert!(frame_value(in_flight.pop_ready()).is_err_and(|error| error.contains("no key frame")));
+    }
+
+    #[test]
+    fn failing_all_fails_only_waiting_entries() {
+        let mut in_flight = InFlight::default();
+        in_flight.push(&[rect(1)], 0.0);
+        in_flight.fill_next(Ok(frame(1)));
+        in_flight.push(&[rect(2)], 0.0);
+        in_flight.push(&[rect(3)], 0.0);
+
+        assert_eq!(in_flight.fail_waiting("decoder closed"), 2);
+
+        assert_eq!(frame_value(in_flight.pop_ready()), Ok(1), "a decoded frame survives");
+        assert!(frame_value(in_flight.pop_ready()).is_err_and(|error| error.contains("decoder closed")));
+        assert!(frame_value(in_flight.pop_ready()).is_err_and(|error| error.contains("decoder closed")));
+        assert_eq!(frame_value(in_flight.pop_ready()), Err("pending".to_owned()));
     }
 
     #[test]

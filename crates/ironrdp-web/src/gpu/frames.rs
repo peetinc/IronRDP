@@ -8,6 +8,10 @@ use std::collections::BTreeMap;
 
 use crate::h264::VideoFrame;
 
+/// Frames one decoder may hold at once. It has a few decoding at a time and the backend
+/// draws each as it applies, so more than this are frames its pipeline dropped.
+const MAX_HELD_PER_OWNER: usize = 8;
+
 /// Items by handle, each handed out once, and by the owner that inserted them.
 struct Store<T> {
     next: u64,
@@ -24,12 +28,21 @@ impl<T> Default for Store<T> {
 }
 
 impl<T> Store<T> {
-    /// Holds `item` for `owner`, handing back the owner's items still held.
+    /// Holds `item` for `owner`, handing back the owner's oldest items beyond
+    /// [`MAX_HELD_PER_OWNER`].
     fn insert(&mut self, owner: u32, item: T) -> (u64, Vec<T>) {
-        let stale = self.release(owner);
         let handle = self.next;
         self.next = self.next.wrapping_add(1);
         self.items.insert(handle, (owner, item));
+
+        let held: Vec<u64> = self
+            .items
+            .iter()
+            .filter(|(_, (item_owner, _))| *item_owner == owner)
+            .map(|(handle, _)| *handle)
+            .collect();
+        let excess = held.len().saturating_sub(MAX_HELD_PER_OWNER);
+        let stale = held[..excess].iter().filter_map(|handle| self.take(*handle)).collect();
         (handle, stale)
     }
 
@@ -55,10 +68,10 @@ thread_local! {
 
 /// Holds `frame`, from the decoder `owner`, until the backend draws it, returning its handle.
 ///
-/// Each decoder has one H.264 frame in flight, so any frame it still holds is one its
-/// pipeline dropped (a failed or closed decode). It is closed here: an unclosed `VideoFrame`
-/// holds a decoder buffer, and enough of them stall the decoder. Other decoders' frames, from
-/// other sessions on the page, are left alone.
+/// A decoder has a few H.264 frames in flight, so beyond [`MAX_HELD_PER_OWNER`] its oldest
+/// frames are ones its pipeline dropped (a failed or closed decode). They are closed here: an
+/// unclosed `VideoFrame` holds a decoder buffer, and enough of them stall the decoder. Other
+/// decoders' frames, from other sessions on the page, are left alone.
 pub(crate) fn insert(owner: u32, frame: VideoFrame) -> u64 {
     let (handle, stale) = FRAMES.with(|frames| frames.borrow_mut().insert(owner, frame));
     for frame in stale {
@@ -97,17 +110,34 @@ mod tests {
     }
 
     #[test]
-    fn insert_hands_back_only_the_same_owners_stale_items() {
+    fn an_owner_can_hold_several_frames() {
         let mut store = Store::default();
-        let (a_first, _) = store.insert(1, "a1");
-        let (b_first, _) = store.insert(2, "b1");
+        let (first, stale) = store.insert(1, "a1");
+        assert!(stale.is_empty());
+        let (second, stale) = store.insert(1, "a2");
+        assert!(stale.is_empty(), "frames in flight are not stale");
 
-        let (a_second, stale) = store.insert(1, "a2");
+        assert_eq!(store.take(first), Some("a1"));
+        assert_eq!(store.take(second), Some("a2"));
+    }
 
-        assert_eq!(stale, vec!["a1"]);
-        assert_eq!(store.take(a_first), None);
-        assert_eq!(store.take(b_first), Some("b1"));
-        assert_eq!(store.take(a_second), Some("a2"));
+    #[test]
+    fn insert_closes_only_beyond_the_cap() {
+        let mut store = Store::default();
+        let (other, _) = store.insert(2, 1000);
+        let mut handles = Vec::new();
+        for item in 0..MAX_HELD_PER_OWNER {
+            let (handle, stale) = store.insert(1, item);
+            assert!(stale.is_empty());
+            handles.push(handle);
+        }
+
+        let (_, stale) = store.insert(1, MAX_HELD_PER_OWNER);
+
+        assert_eq!(stale, vec![0], "the owner's oldest frame goes");
+        assert_eq!(store.take(handles[0]), None);
+        assert_eq!(store.take(handles[1]), Some(1));
+        assert_eq!(store.take(other), Some(1000), "other owners' frames stay");
     }
 
     #[test]
