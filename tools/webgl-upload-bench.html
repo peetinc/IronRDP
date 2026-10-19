@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebGL2 tile upload bench</title>
+<style>
+    body { font: 14px/1.4 system-ui, sans-serif; margin: 16px; background: #fff; color: #111; }
+    pre { background: #f4f4f4; padding: 12px; overflow-x: auto; }
+    table { border-collapse: collapse; }
+    td, th { border: 1px solid #ccc; padding: 4px 8px; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+</style>
+</head>
+<body>
+<h1>WebGL2 tile upload bench</h1>
+<p>Uploads RemoteFX-sized tiles (64×64 RGBA) into a 3840×2176 texture four ways and times
+what the main thread pays to issue the calls (<b>issue</b>) and until the GPU has finished
+(<b>done</b>, forced by a 1-pixel <code>readPixels</code>). Query: <code>?placements=2040</code>,
+<code>?runs=30</code>, <code>?check=1</code> (verifies every variant writes the right pixels; use
+with a small <code>placements</code>).</p>
+<p id="status">running…</p>
+<div id="table"></div>
+<pre id="json"></pre>
+<script>
+'use strict';
+// Variants:
+// A: today's IronRDP pattern: per tile bind + 3 pixelStorei + texSubImage2D + 3 pixelStorei reset.
+// B: all tiles packed in one buffer; one bind, then texSubImage2D(..., buffer, srcOffset) per tile.
+// C: the packed buffer in a PIXEL_UNPACK_BUFFER; texSubImage2D(..., byteOffset) per tile.
+// D: the packed buffer as a texture array (one layer per tile, one texSubImage3D), then one
+//    instanced draw of every tile into the target.
+const params = new URLSearchParams(location.search);
+const PLACEMENTS = Number(params.get('placements') ?? 2040);
+const RUNS = Number(params.get('runs') ?? 30);
+const WARMUP = 5;
+const CHECK = params.get('check') === '1';
+const TILE = 64;
+const WIDTH = 3840;
+const HEIGHT = 2176; // 34 rows of 64: a 2160-tall surface ends inside the last row
+const COLUMNS = WIDTH / TILE;
+const TILE_BYTES = TILE * TILE * 4;
+
+const canvas = document.createElement('canvas');
+canvas.width = 1;
+canvas.height = 1;
+const gl = canvas.getContext('webgl2', { antialias: false, depth: false, stencil: false });
+if (!gl) throw new Error('WebGL2 unavailable');
+
+const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+const renderer = debugInfo ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+
+const target = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, target);
+gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, WIDTH, HEIGHT);
+const framebuffer = gl.createFramebuffer();
+gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, target, 0);
+if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('framebuffer incomplete');
+
+const positions = [];
+for (let i = 0; i < PLACEMENTS; i++) {
+    positions.push([(i % COLUMNS) * TILE, Math.floor(i / COLUMNS) * TILE % HEIGHT]);
+}
+
+// Distinct pseudo-random pixels per run, so no layer can skip or dedupe an upload.
+const packed = new Uint8Array(PLACEMENTS * TILE_BYTES);
+const words = new Uint32Array(packed.buffer);
+function fill(seed) {
+    let x = seed >>> 0 || 1;
+    for (let i = 0; i < words.length; i++) {
+        x ^= x << 13; x >>>= 0;
+        x ^= x >>> 17;
+        x ^= x << 5; x >>>= 0;
+        words[i] = x;
+    }
+}
+const views = positions.map((_, i) => packed.subarray(i * TILE_BYTES, (i + 1) * TILE_BYTES));
+
+// D: texture array and instanced program.
+const maxLayers = gl.getParameter(gl.MAX_ARRAY_TEXTURE_LAYERS);
+const layerTextures = [];
+for (let first = 0; first < PLACEMENTS; first += maxLayers) {
+    const layers = Math.min(maxLayers, PLACEMENTS - first);
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
+    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA8, TILE, TILE, layers);
+    layerTextures.push({ texture, first, layers });
+}
+function compile(type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader));
+    return shader;
+}
+const program = gl.createProgram();
+gl.attachShader(program, compile(gl.VERTEX_SHADER, `#version 300 es
+in ivec3 placement; // destination x, y in pixels, and layer
+uniform vec2 size;
+flat out ivec3 vPlacement;
+void main() {
+    // Two triangles covering the tile, from gl_VertexID.
+    int corner = gl_VertexID % 6;
+    vec2 unit = vec2(corner == 1 || corner == 2 || corner == 4 ? 1.0 : 0.0,
+                     corner == 2 || corner == 4 || corner == 5 ? 1.0 : 0.0);
+    vec2 pixel = vec2(placement.xy) + unit * ${TILE}.0;
+    gl_Position = vec4(pixel / size * 2.0 - 1.0, 0.0, 1.0);
+    vPlacement = placement;
+}`));
+gl.attachShader(program, compile(gl.FRAGMENT_SHADER, `#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+uniform sampler2DArray tiles;
+uniform int firstLayer;
+flat in ivec3 vPlacement;
+out vec4 color;
+void main() {
+    ivec2 texel = ivec2(gl_FragCoord.xy) - vPlacement.xy;
+    color = texelFetch(tiles, ivec3(texel, vPlacement.z - firstLayer), 0);
+}`));
+gl.linkProgram(program);
+if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+const vao = gl.createVertexArray();
+const instanceBuffer = gl.createBuffer();
+const instances = new Int32Array(PLACEMENTS * 3);
+positions.forEach(([x, y], i) => instances.set([x, y, i], i * 3));
+gl.bindVertexArray(vao);
+gl.bindBuffer(gl.ARRAY_BUFFER, instanceBuffer);
+gl.bufferData(gl.ARRAY_BUFFER, instances.byteLength, gl.DYNAMIC_DRAW);
+const placementLocation = gl.getAttribLocation(program, 'placement');
+gl.enableVertexAttribArray(placementLocation);
+gl.vertexAttribIPointer(placementLocation, 3, gl.INT, 12, 0);
+gl.vertexAttribDivisor(placementLocation, 1);
+gl.bindVertexArray(null);
+
+const pbo = gl.createBuffer();
+
+let calls = 0;
+const variants = {
+    A() {
+        for (let i = 0; i < PLACEMENTS; i++) {
+            const [x, y] = positions[i];
+            gl.bindTexture(gl.TEXTURE_2D, target);
+            gl.pixelStorei(gl.UNPACK_ROW_LENGTH, TILE);
+            gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, 0);
+            gl.pixelStorei(gl.UNPACK_SKIP_ROWS, 0);
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, TILE, TILE, gl.RGBA, gl.UNSIGNED_BYTE, views[i]);
+            gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+            gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, 0);
+            gl.pixelStorei(gl.UNPACK_SKIP_ROWS, 0);
+            calls += 9;
+        }
+    },
+    B() {
+        gl.bindTexture(gl.TEXTURE_2D, target);
+        calls += 1;
+        for (let i = 0; i < PLACEMENTS; i++) {
+            const [x, y] = positions[i];
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, TILE, TILE, gl.RGBA, gl.UNSIGNED_BYTE, packed, i * TILE_BYTES);
+            calls += 1;
+        }
+    },
+    C() {
+        gl.bindTexture(gl.TEXTURE_2D, target);
+        gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, pbo);
+        gl.bufferData(gl.PIXEL_UNPACK_BUFFER, packed, gl.STREAM_DRAW);
+        calls += 3;
+        for (let i = 0; i < PLACEMENTS; i++) {
+            const [x, y] = positions[i];
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, TILE, TILE, gl.RGBA, gl.UNSIGNED_BYTE, i * TILE_BYTES);
+            calls += 1;
+        }
+        gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
+        calls += 1;
+    },
+    D() {
+        gl.useProgram(program);
+        gl.bindVertexArray(vao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, instanceBuffer);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, instances);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+        gl.viewport(0, 0, WIDTH, HEIGHT);
+        gl.uniform2f(gl.getUniformLocation(program, 'size'), WIDTH, HEIGHT);
+        gl.uniform1i(gl.getUniformLocation(program, 'tiles'), 0);
+        gl.activeTexture(gl.TEXTURE0);
+        calls += 9;
+        for (const { texture, first, layers } of layerTextures) {
+            gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
+            gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, 0, TILE, TILE, layers, gl.RGBA, gl.UNSIGNED_BYTE, packed, first * TILE_BYTES);
+            gl.uniform1i(gl.getUniformLocation(program, 'firstLayer'), first);
+            gl.vertexAttribIPointer(placementLocation, 3, gl.INT, 12, first * 12);
+            gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, layers);
+            calls += 5;
+        }
+        gl.bindVertexArray(null);
+        gl.useProgram(null);
+        calls += 2;
+    },
+};
+
+function percentile(values, fraction) {
+    const sorted = [...values].sort((a, b) => a - b);
+    return sorted[Math.round((sorted.length - 1) * fraction)];
+}
+
+const probe = new Uint8Array(4);
+function finish() {
+    // A 1-pixel readback waits for every queued command, uploads included.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, probe);
+}
+
+function check(name) {
+    const read = new Uint8Array(TILE_BYTES);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    for (let i = 0; i < PLACEMENTS; i++) {
+        const [x, y] = positions[i];
+        gl.readPixels(x, y, TILE, TILE, gl.RGBA, gl.UNSIGNED_BYTE, read);
+        const expected = views[i];
+        for (let b = 0; b < TILE_BYTES; b++) {
+            if (read[b] !== expected[b]) return `${name}: placement ${i} byte ${b}: ${read[b]} != ${expected[b]}`;
+        }
+    }
+    return null;
+}
+
+function run() {
+    const result = { userAgent: navigator.userAgent, renderer, placements: PLACEMENTS, runs: RUNS, maxArrayLayers: maxLayers, variants: {} };
+    const failures = [];
+    let seed = 1;
+    for (const [name, variant] of Object.entries(variants)) {
+        const issue = [];
+        const done = [];
+        let variantCalls = 0;
+        for (let r = 0; r < WARMUP + RUNS; r++) {
+            fill(seed++);
+            finish();
+            calls = 0;
+            const start = performance.now();
+            variant();
+            const issued = performance.now();
+            finish();
+            const finished = performance.now();
+            if (WARMUP <= r) {
+                issue.push(issued - start);
+                done.push(finished - start);
+            }
+            variantCalls = calls;
+        }
+        const error = gl.getError();
+        if (error !== gl.NO_ERROR) failures.push(`${name}: GL error 0x${error.toString(16)}`);
+        if (CHECK) {
+            const failure = check(name);
+            if (failure) failures.push(failure);
+        }
+        result.variants[name] = {
+            issueMsP50: +percentile(issue, 0.5).toFixed(2),
+            issueMsP95: +percentile(issue, 0.95).toFixed(2),
+            doneMsP50: +percentile(done, 0.5).toFixed(2),
+            doneMsP95: +percentile(done, 0.95).toFixed(2),
+            calls: variantCalls,
+        };
+    }
+    if (CHECK) result.check = failures.length === 0 ? 'pass' : failures;
+    else if (failures.length) result.errors = failures;
+    return result;
+}
+
+setTimeout(() => {
+    try {
+        const result = run();
+        window.__uploadBench = result;
+        document.getElementById('status').textContent = `done: ${renderer}`;
+        const rows = Object.entries(result.variants)
+            .map(([name, v]) => `<tr><td>${name}</td><td>${v.issueMsP50}</td><td>${v.issueMsP95}</td><td>${v.doneMsP50}</td><td>${v.doneMsP95}</td><td>${v.calls}</td></tr>`)
+            .join('');
+        document.getElementById('table').innerHTML =
+            `<table><tr><th>variant</th><th>issue p50 ms</th><th>issue p95 ms</th><th>done p50 ms</th><th>done p95 ms</th><th>GL calls</th></tr>${rows}</table>`;
+        document.getElementById('json').textContent = JSON.stringify(result, null, 2);
+    } catch (error) {
+        window.__uploadBench = { error: String(error) };
+        document.getElementById('status').textContent = `failed: ${error}`;
+    }
+}, 50);
+</script>
+</body>
+</html>
