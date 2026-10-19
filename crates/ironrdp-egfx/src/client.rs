@@ -853,6 +853,66 @@ impl GraphicsPipelineClient {
         Ok(replies)
     }
 
+    /// Submits queued H.264 pictures and progressive bitmaps ahead of the commands in front of
+    /// them, while their decoders have room.
+    fn submit_ahead(&mut self) -> PduResult<()> {
+        self.submit_h264_ahead()?;
+        self.submit_progressive_ahead()
+    }
+
+    /// Submits queued `WireToSurface2` bitmaps to the [`ProgressiveBackend`] ahead of the
+    /// commands in front of them, while it has room ([`ProgressiveBackend::max_in_flight`]).
+    ///
+    /// INVARIANT: the backend sees progressive inputs in stream order. So the walk hands it
+    /// each progressive control it passes (`StartFrame`, `EndFrame`,
+    /// `DeleteEncodingContext`), marking it [`Pending::Forwarded`], and stops at a bitmap it
+    /// has no room for. It also stops at a command that changes surfaces or resets the
+    /// pipeline (`CreateSurface`, `DeleteSurface`, `ResetGraphics`, `CapabilitiesConfirm`):
+    /// a bitmap is submitted with its surface's size, which must be the size it has when the
+    /// bitmap applies.
+    fn submit_progressive_ahead(&mut self) -> PduResult<()> {
+        let Some(limit) = self.progressive_backend.as_ref().map(|backend| backend.max_in_flight()) else {
+            return Ok(());
+        };
+        for index in 0..self.pending.len() {
+            let control = match &self.pending[index] {
+                Pending::Pdu(
+                    GfxPdu::ResetGraphics(_)
+                    | GfxPdu::CapabilitiesConfirm(_)
+                    | GfxPdu::CreateSurface(_)
+                    | GfxPdu::DeleteSurface(_),
+                ) => break,
+                Pending::Pdu(GfxPdu::WireToSurface2(_)) => {
+                    if limit <= self.progressive_in_flight {
+                        break;
+                    }
+                    let Some(Pending::Pdu(GfxPdu::WireToSurface2(pdu))) = self.pending.remove(index) else {
+                        break;
+                    };
+                    self.handler.on_wire_to_surface2(&pdu);
+                    let deferred = self.submit_progressive(&pdu)?;
+                    self.pending.insert(index, Pending::Progressive(deferred));
+                    self.progressive_in_flight += 1;
+                    continue;
+                }
+                Pending::Pdu(GfxPdu::StartFrame(_)) => ProgressiveControl::StartFrame,
+                Pending::Pdu(GfxPdu::EndFrame(_)) => ProgressiveControl::EndFrame,
+                Pending::Pdu(GfxPdu::DeleteEncodingContext(delete)) => ProgressiveControl::DeleteContext {
+                    surface_id: delete.surface_id,
+                    codec_context_id: delete.codec_context_id,
+                },
+                Pending::Pdu(_) | Pending::Avc420(_) | Pending::Progressive(_) | Pending::Forwarded(_) => continue,
+            };
+            if let Some(backend) = self.progressive_backend.as_mut() {
+                backend.control(control);
+            }
+            if let Some(Pending::Pdu(pdu)) = self.pending.remove(index) {
+                self.pending.insert(index, Pending::Forwarded(pdu));
+            }
+        }
+        Ok(())
+    }
+
     /// Submits queued H.264 pictures to the decoder ahead of the commands in front of them,
     /// in wire order, while the decoder has room ([`H264Decoder::max_in_flight`]).
     ///
@@ -860,7 +920,7 @@ impl GraphicsPipelineClient {
     /// in the same place. The walk stops at a command that resets the decoder when it
     /// applies (`ResetGraphics`, `CapabilitiesConfirm`): what follows it must decode after
     /// the reset.
-    fn submit_ahead(&mut self) -> PduResult<()> {
+    fn submit_h264_ahead(&mut self) -> PduResult<()> {
         let Some(limit) = self.h264_decoder.as_ref().map(|decoder| decoder.max_in_flight()) else {
             return Ok(());
         };
@@ -4462,8 +4522,12 @@ mod tests {
     }
 
     fn progressive_update(codec_context_id: u32) -> GfxPdu {
+        progressive_update_on(DEFERRED_SURFACE, codec_context_id)
+    }
+
+    fn progressive_update_on(surface_id: u16, codec_context_id: u32) -> GfxPdu {
         GfxPdu::WireToSurface2(WireToSurface2Pdu {
-            surface_id: DEFERRED_SURFACE,
+            surface_id,
             codec_id: crate::pdu::Codec2Type::RemoteFxProgressive,
             codec_context_id,
             pixel_format: PixelFormat::XRgb,
@@ -4605,5 +4669,125 @@ mod tests {
             ["start", "delete_context s1 c7", "end"].map(str::to_owned),
             "ResetGraphics leaves progressive state alone"
         );
+    }
+
+    fn submit_call(job: u32, surface_id: u16, codec_context_id: u32, side: u16) -> String {
+        format!("submit {job} s{surface_id} c{codec_context_id} {side}x{side}")
+    }
+
+    /// Returns the H.264 picture holding the queue, then resumes.
+    fn release_h264(client: &mut GraphicsPipelineClient, h264: &Arc<Mutex<PipelineState>>) {
+        h264.lock().expect("state lock").ready.push_back(Ok(solid_frame(9)));
+        client.resume().expect("resume");
+    }
+
+    #[test]
+    fn progressive_commands_submit_ahead_up_to_the_limit() {
+        let (client, _h264) = pipeline_client(4);
+        let state = Arc::new(Mutex::new(ProgressiveState::default()));
+        let mut client = client.with_progressive_backend(Box::new(FakeProgressive {
+            state: Arc::clone(&state),
+            limit: 2,
+        }));
+        for pdu in [
+            avc420_update(&deferred_rect(0, 0, 16, 16)),
+            progressive_update(1),
+            progressive_update(1),
+            progressive_update(1),
+        ] {
+            client.dispatch_pdu(pdu).expect("dispatch");
+        }
+
+        assert_eq!(
+            calls(&state),
+            [submit_call(1, 1, 1, 64), submit_call(2, 1, 1, 64)],
+            "two submitted while the H.264 picture holds the queue"
+        );
+    }
+
+    #[test]
+    fn progressive_controls_reach_the_backend_in_stream_order_across_submit_ahead() {
+        let (mut client, state, h264) = async_progressive_client(4);
+        for pdu in [
+            avc420_update(&deferred_rect(0, 0, 16, 16)),
+            deferred_start_frame(1),
+            progressive_update(1),
+            GfxPdu::DeleteEncodingContext(DeleteEncodingContextPdu {
+                surface_id: DEFERRED_SURFACE,
+                codec_context_id: 1,
+            }),
+            progressive_update(2),
+            end_frame_pdu(1),
+            deferred_start_frame(2),
+            progressive_update(2),
+            end_frame_pdu(2),
+        ] {
+            client.dispatch_pdu(pdu).expect("dispatch");
+        }
+        let expected = [
+            "start".to_owned(),
+            submit_call(1, 1, 1, 64),
+            "delete_context s1 c1".to_owned(),
+            submit_call(2, 1, 2, 64),
+            "end".to_owned(),
+            "start".to_owned(),
+            submit_call(3, 1, 2, 64),
+            "end".to_owned(),
+        ];
+        assert_eq!(calls(&state), expected, "everything reaches the backend while held");
+
+        for job in 1..=3 {
+            complete(&state, job, 1);
+        }
+        release_h264(&mut client, &h264);
+        assert!(!client.is_awaiting_decoder());
+        assert_eq!(calls(&state), expected, "nothing is forwarded twice when it applies");
+    }
+
+    #[test]
+    fn surface_changes_stop_progressive_submit_ahead() {
+        let (mut client, state, h264) = async_progressive_client(4);
+        for pdu in [
+            avc420_update(&deferred_rect(0, 0, 16, 16)),
+            GfxPdu::DeleteSurface(crate::pdu::DeleteSurfacePdu {
+                surface_id: DEFERRED_SURFACE,
+            }),
+            GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id: DEFERRED_SURFACE,
+                width: 32,
+                height: 32,
+                pixel_format: PixelFormat::XRgb,
+            }),
+            progressive_update(1),
+        ] {
+            client.dispatch_pdu(pdu).expect("dispatch");
+        }
+        assert!(calls(&state).is_empty(), "nothing passes a surface change");
+
+        release_h264(&mut client, &h264);
+        assert_eq!(
+            calls(&state),
+            ["delete_surface s1".to_owned(), submit_call(1, 1, 1, 32)],
+            "submitted at the new size"
+        );
+    }
+
+    #[test]
+    fn reset_graphics_stops_progressive_submit_ahead() {
+        let (mut client, state, _h264) = async_progressive_client(4);
+        for pdu in [
+            avc420_update(&deferred_rect(0, 0, 16, 16)),
+            GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+                width: u32::from(DEFERRED_SIZE),
+                height: u32::from(DEFERRED_SIZE),
+                monitors: vec![],
+            }),
+            progressive_update(1),
+        ] {
+            client.dispatch_pdu(pdu).expect("dispatch");
+        }
+
+        // The surface it names exists now, but not after the reset applies.
+        assert!(calls(&state).is_empty(), "nothing passes ResetGraphics");
     }
 }
