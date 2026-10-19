@@ -10,6 +10,7 @@
         displayControl,
         egfx,
         h264,
+        avcThinClient,
         gpuRendering,
         enableAudioPlayback,
         enableCredssp,
@@ -51,6 +52,7 @@
     let enable_egfx = true;
     let enable_h264 = import.meta.env.VITE_RIG_H264 === 'true';
     let enable_gpu = import.meta.env.VITE_RIG_GPU === 'true';
+    let enable_thin_client = import.meta.env.VITE_RIG_THIN_CLIENT === 'true';
     let enable_audio = true;
     let visual_effects = import.meta.env.VITE_RIG_VISUAL_EFFECTS === 'true';
     let enable_nla = true;
@@ -217,6 +219,7 @@
             .withExtension(displayControl(true))
             .withExtension(egfx(enable_egfx))
             .withExtension(h264(enable_h264))
+            .withExtension(avcThinClient(enable_thin_client))
             .withExtension(gpuRendering(enable_gpu))
             .withExtension(
                 performanceFlags(
@@ -452,6 +455,15 @@
                                     style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
                                 />
                                 <label for="enable_h264">H.264 (WebCodecs)</label>
+                            </div>
+                            <div class="checkbox-wrapper">
+                                <input
+                                    id="enable_thin_client"
+                                    type="checkbox"
+                                    bind:checked={enable_thin_client}
+                                    style="width: 1.5em; height: 1.5em; margin-right: 0.5em;"
+                                />
+                                <label for="enable_thin_client">Full-screen H.264 (thin client)</label>
                             </div>
                             <div class="checkbox-wrapper">
                                 <input
