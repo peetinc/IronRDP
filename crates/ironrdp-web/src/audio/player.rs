@@ -148,6 +148,11 @@ impl DelayWindow {
         self.max = self.max.max(excess);
     }
 
+    /// The newest block's delay above the best seen, in ms; `None` before the first block.
+    pub(crate) fn latest(&self) -> Option<f64> {
+        self.best.map(|_| self.current)
+    }
+
     /// The window's (min, current, max) delay above the best seen, in ms; starts a new window.
     pub(crate) fn take(&mut self) -> (f64, f64, f64) {
         let window = (self.min.unwrap_or(self.current), self.current, self.max);
@@ -180,7 +185,12 @@ impl Diagnostics {
             field("depthMsMin"),
             field("depthMsMax"),
         );
-        let (underruns, gap_ms_max, dropped_ms) = (field("underruns"), field("gapMsMax"), field("droppedMs"));
+        let (underruns, gap_ms_max, dropped_ms, trimmed_ms) = (
+            field("underruns"),
+            field("gapMsMax"),
+            field("droppedMs"),
+            field("trimmedMs"),
+        );
         debug!(target_ms, depth_mean, depth_min, depth_max, underruns, "Audio playout");
 
         self.stats_received += 1;
@@ -197,6 +207,7 @@ impl Diagnostics {
             underruns,
             gap_ms_max,
             dropped_ms,
+            trimmed_ms,
             delay_min,
             delay_now,
             delay_max,
@@ -336,7 +347,8 @@ impl Player {
         match &mut *self.node.borrow_mut() {
             Node::Loading(pending) => pending.push(audio.clone()),
             Node::Ready { node, .. } => {
-                if let Err(error) = post_block(node, audio) {
+                let late_ms = self.diagnostics.borrow().delay.latest();
+                if let Err(error) = post_block(node, audio, late_ms) {
                     debug!(?error, "Failed to post RDPSND block to the playout worklet");
                 }
             }
@@ -445,7 +457,8 @@ async fn load_worklet(
     if let Node::Loading(pending) = &mut *slot {
         debug!(pending_secs = pending.secs(), "Audio playout worklet ready");
         for block in pending.drain() {
-            if let Err(error) = post_block(&node, &block) {
+            // Their arrival times are gone; the worklet falls back to measuring outages.
+            if let Err(error) = post_block(&node, &block, None) {
                 debug!(?error, "Failed to post RDPSND block to the playout worklet");
             }
         }
@@ -457,8 +470,9 @@ async fn load_worklet(
     };
 }
 
-/// Posts one block as `{ type: 'block', rate, channels }`, transferring the sample buffers.
-fn post_block(node: &AudioWorkletNode, audio: &DecodedAudio) -> Result<(), JsValue> {
+/// Posts one block as `{ type: 'block', rate, channels, lateMs }`, transferring the sample
+/// buffers. `lateMs` is left out when the block's delay is unknown.
+fn post_block(node: &AudioWorkletNode, audio: &DecodedAudio, late_ms: Option<f64>) -> Result<(), JsValue> {
     let channels = Array::new();
     let transfer = Array::new();
     for samples in &audio.channels {
@@ -470,6 +484,9 @@ fn post_block(node: &AudioWorkletNode, audio: &DecodedAudio) -> Result<(), JsVal
     Reflect::set(&message, &JsValue::from_str("type"), &JsValue::from_str("block"))?;
     Reflect::set(&message, &JsValue::from_str("rate"), &JsValue::from(audio.sample_rate))?;
     Reflect::set(&message, &JsValue::from_str("channels"), &channels)?;
+    if let Some(late_ms) = late_ms {
+        Reflect::set(&message, &JsValue::from_str("lateMs"), &JsValue::from(late_ms))?;
+    }
     node.port().post_message(&message, &transfer)
 }
 
@@ -571,6 +588,17 @@ mod tests {
 
         window.observe(1300.0, 700); // 100 ms behind
         assert_eq!(window.take(), (100.0, 100.0, 100.0));
+    }
+
+    #[test]
+    fn delay_window_latest_is_the_newest_delay_above_best() {
+        let mut window = DelayWindow::default();
+        assert_eq!(window.latest(), None);
+        window.observe(1_000.0, 900);
+        window.observe(1_500.0, 1_000);
+        assert_eq!(window.latest(), Some(400.0));
+        window.take();
+        assert_eq!(window.latest(), Some(400.0));
     }
 
     #[test]

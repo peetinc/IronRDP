@@ -1,10 +1,15 @@
 // RDPSND playout, run on the audio rendering thread as an AudioWorklet.
 //
-// The main thread posts decoded planar f32 blocks (`{ type: 'block', rate, channels }`); this
-// module keeps them in a ring buffer and plays them through one continuous fractional reader.
-// Blocks reach the main thread in bursts on a jittery WAN link, so playback waits until the
-// ring holds `target` of audio and, when the ring runs dry, raises `target` to cover the
-// outage that emptied it. Audio is never discarded except when the ring is full.
+// The main thread posts decoded planar f32 blocks (`{ type: 'block', rate, channels, lateMs }`);
+// this module keeps them in a ring buffer and plays them through one continuous fractional
+// reader. Blocks reach the main thread in bursts on a jittery WAN link, so playback waits until
+// the ring holds `target` of audio, and `target` rises to cover the latest arrival seen:
+// `lateMs`, how far behind its server timestamp a block arrived. A pause in the stream (Windows
+// stops sending while nothing plays) resumes with fresh blocks and raises nothing. Without
+// `lateMs`, `target` rises when the ring runs dry, to cover the outage that emptied it. Bursts only refill what a gap drained, so the ring holds about
+// `target` in steady play. More than that means playback stopped while audio kept arriving
+// (a hidden tab, an output device switch): the reader then fades out, skips to the newest
+// `target` of audio and fades back in, so sound stays in step with the picture.
 //
 // `Playout` is pure (no AudioWorklet globals) so it can be unit-tested; the processor at the
 // bottom only adapts it to the AudioWorklet API. See
@@ -15,9 +20,14 @@ const TARGET_CEIL_MS = 2000;
 // Added to the outage that caused an underrun when raising the target.
 const GAP_MARGIN_MS = 100;
 const RING_SECS = 4;
+// A larger `lateMs` is a broken server clock (a wrapped 16-bit timestamp), not a stall.
+const LATE_VALID_MS = 10000;
 const FADE_IN_MS = 5;
 // Playback fades out once less than this much audio remains, so running dry never clicks.
 const FADE_OUT_MS = 2;
+// Depth beyond `target` that makes the reader skip the excess, and the fade around the skip.
+const TRIM_MARGIN_MS = 150;
+const TRIM_FADE_MS = 5;
 const STATS_INTERVAL_SECS = 1;
 
 const BUFFERING = 0;
@@ -42,12 +52,17 @@ export class Playout {
         this.underruns = 0;
         this.gapMsMax = 0;
         this.droppedMs = 0;
+        this.trimming = false;
+        this.trimmedMs = 0;
         this.ignored = 0;
         this.resetStats();
     }
 
-    /** Adds one block of planar samples at `rate`. A mono block plays on both outputs. */
-    push(rate, channels) {
+    /**
+     * Adds one block of planar samples at `rate`. A mono block plays on both outputs. `lateMs`,
+     * when known, is how much later than the earliest block seen this one arrived.
+     */
+    push(rate, channels, lateMs) {
         if (!(rate > 0) || !Array.isArray(channels) || channels.length === 0 || channels[0].length === 0) {
             this.ignored++;
             return;
@@ -56,7 +71,11 @@ export class Playout {
             this.switchRate(rate);
         }
 
-        if (this.awaitingRefill && this.lastPushClock >= 0) {
+        if (Number.isFinite(lateMs) && 0 <= lateMs && lateMs < LATE_VALID_MS) {
+            this.gapMsMax = Math.max(this.gapMsMax, lateMs);
+            this.targetMs = Math.min(TARGET_CEIL_MS, Math.max(this.targetMs, lateMs + GAP_MARGIN_MS));
+            this.awaitingRefill = false;
+        } else if (this.awaitingRefill && this.lastPushClock >= 0) {
             // The outage that emptied the ring: from the last arrival before it to this one.
             const outageMs = ((this.clock - this.lastPushClock) / this.contextRate) * 1000;
             this.gapMsMax = Math.max(this.gapMsMax, outageMs);
@@ -90,11 +109,17 @@ export class Playout {
         const step = this.rate / this.contextRate;
         const fadeInStep = 1000 / (FADE_IN_MS * this.contextRate);
         const fadeOutFrames = (FADE_OUT_MS / 1000) * this.rate;
+        const trimFadeStep = 1000 / (TRIM_FADE_MS * this.contextRate);
+        if (this.state === PLAYING && this.targetMs + TRIM_MARGIN_MS < this.depthMs()) {
+            this.trimming = true;
+        }
 
         for (let i = 0; i < length; i++) {
             if (this.state === BUFFERING && this.rate > 0 && this.targetMs <= this.depthMs()) {
                 this.state = PLAYING;
                 this.gain = 0;
+                // Output is silent here, so a backlog is skipped without a fade.
+                this.skipToTarget();
             }
 
             const remaining = this.written - this.head;
@@ -109,7 +134,16 @@ export class Playout {
                 continue;
             }
 
-            let gain = Math.min(1, this.gain + fadeInStep);
+            let gain;
+            if (this.trimming) {
+                gain = Math.max(0, this.gain - trimFadeStep);
+                if (gain === 0) {
+                    this.skipToTarget();
+                    this.trimming = false;
+                }
+            } else {
+                gain = Math.min(1, this.gain + fadeInStep);
+            }
             if (remaining < fadeOutFrames) {
                 gain = Math.min(gain, remaining / fadeOutFrames);
             }
@@ -146,6 +180,16 @@ export class Playout {
         );
     }
 
+    /** Moves the read position to the newest `target` of audio, counting what it skips. */
+    skipToTarget() {
+        const keep = Math.ceil((this.targetMs / 1000) * this.rate);
+        const skip = this.written - keep - this.head;
+        if (0 < skip) {
+            this.head += skip;
+            this.trimmedMs += (skip / this.rate) * 1000;
+        }
+    }
+
     depthMs() {
         return this.rate > 0 ? (Math.max(0, this.written - this.head) / this.rate) * 1000 : 0;
     }
@@ -162,6 +206,7 @@ export class Playout {
         this.head = 0;
         this.state = BUFFERING;
         this.gain = 0;
+        this.trimming = false;
     }
 
     stats() {
@@ -173,6 +218,7 @@ export class Playout {
             underruns: this.underruns,
             gapMsMax: this.gapMsMax,
             droppedMs: this.droppedMs,
+            trimmedMs: this.trimmedMs,
             ignored: this.ignored,
         };
     }
@@ -196,7 +242,7 @@ if (typeof registerProcessor === 'function') {
             this.port.onmessage = (event) => {
                 const message = event.data;
                 if (message && message.type === 'block') {
-                    this.playout.push(message.rate, message.channels);
+                    this.playout.push(message.rate, message.channels, message.lateMs);
                 }
             };
         }

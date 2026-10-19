@@ -30,8 +30,8 @@ class Rig {
         }
     }
 
-    push(channels: Float32Array[]): void {
-        this.playout.push(STREAM_RATE, channels);
+    push(channels: Float32Array[], lateMs?: number): void {
+        this.playout.push(STREAM_RATE, channels, lateMs);
     }
 }
 
@@ -59,10 +59,11 @@ describe('Playout', () => {
             rig.renderUntil(now);
             produced = Math.floor(now / BLOCK_MS);
             for (; delivered < produced; delivered++) {
-                rig.push(silentBlock());
+                // How late the block arrives: it was produced at the end of its own span.
+                rig.push(silentBlock(), now - (delivered + 1) * BLOCK_MS);
             }
             if (index === 5) {
-                // Warmup: the first stall may underrun once while the target adapts.
+                // Warmup: the target adapts to the first late burst.
                 underrunsAfterWarmup = rig.playout.stats().underruns;
             }
         });
@@ -125,6 +126,109 @@ describe('Playout', () => {
         }
         rig.renderUntil(7600);
         expect(rig.playout.stats().targetMs).toBe(2000);
+    });
+
+    it('backlog above target is trimmed back to target while playing', () => {
+        const rig = new Rig();
+        for (let i = 0; i < blocksFor(500); i++) {
+            rig.push(silentBlock());
+        }
+        rig.renderUntil(100);
+        // Playback stalled elsewhere (hidden tab, output device switch) while audio kept
+        // arriving: 3 s lands on top of what is queued.
+        for (let i = 0; i < blocksFor(3000); i++) {
+            rig.push(silentBlock());
+        }
+        rig.renderUntil(150);
+
+        const stats = rig.playout.stats();
+        expect(rig.playout.depthMs()).toBeLessThanOrEqual(stats.targetMs + 50);
+        expect(stats.trimmedMs).toBeGreaterThan(2900);
+        expect(stats.trimmedMs).toBeLessThan(3200);
+        expect(stats.droppedMs).toBe(0);
+        expect(stats.underruns).toBe(0);
+    });
+
+    it('start-up backlog plays from the newest target of audio', () => {
+        const rig = new Rig();
+        for (let i = 0; i < blocksFor(3000); i++) {
+            rig.push(silentBlock());
+        }
+        rig.renderUntil(50);
+
+        const stats = rig.playout.stats();
+        expect(rig.playout.depthMs()).toBeLessThanOrEqual(stats.targetMs);
+        expect(stats.trimmedMs).toBeGreaterThan(2500);
+        expect(stats.underruns).toBe(0);
+    });
+
+    it('trimming fades out and back in without a click', () => {
+        const rig = new Rig();
+        const frequency = 1000;
+        let phase = 0;
+        const sineBlock = (): Float32Array[] => {
+            const samples = new Float32Array(BLOCK_FRAMES);
+            for (let i = 0; i < BLOCK_FRAMES; i++) {
+                samples[i] = Math.sin(phase);
+                phase += (2 * Math.PI * frequency) / STREAM_RATE;
+            }
+            return [samples, samples.slice()];
+        };
+        for (let i = 0; i < blocksFor(500); i++) {
+            rig.push(sineBlock());
+        }
+        rig.renderUntil(200, true);
+        for (let i = 0; i < blocksFor(2000); i++) {
+            rig.push(sineBlock());
+        }
+        rig.renderUntil(400, true);
+
+        expect(rig.playout.stats().trimmedMs).toBeGreaterThan(1500);
+        // Skip the start-up fade. A jump at full volume would be a step of up to 2.
+        const settled = rig.output.slice(Math.ceil(CONTEXT_RATE * 0.05));
+        const maxStep = (2 * Math.PI * frequency) / CONTEXT_RATE;
+        const fadeStep = 1000 / (5 * CONTEXT_RATE);
+        let worst = 0;
+        for (let i = 1; i < settled.length; i++) {
+            worst = Math.max(worst, Math.abs(settled[i] - settled[i - 1]));
+        }
+        expect(worst).toBeLessThanOrEqual(maxStep * 1.05 + fadeStep);
+    });
+
+    it('a late block raises the target before the ring runs dry', () => {
+        const rig = new Rig();
+        for (let i = 0; i < blocksFor(500); i++) {
+            rig.push(silentBlock(), 0);
+        }
+        rig.renderUntil(100);
+        rig.push(silentBlock(), 900);
+
+        const stats = rig.playout.stats();
+        expect(stats.targetMs).toBe(1000);
+        expect(stats.underruns).toBe(0);
+    });
+
+    it('a pause in the stream leaves the target alone', () => {
+        // Windows stops sending while nothing plays. The first block after a pause is fresh,
+        // unlike the first block after a stall.
+        const rig = new Rig();
+        for (let i = 0; i < blocksFor(500); i++) {
+            rig.push(silentBlock(), 0);
+        }
+        rig.renderUntil(60_000);
+        for (let i = 0; i < blocksFor(500); i++) {
+            rig.push(silentBlock(), 0);
+        }
+        rig.renderUntil(60_100);
+
+        expect(rig.playout.stats().targetMs).toBe(400);
+    });
+
+    it('an implausible lateness is ignored', () => {
+        // A wrapped 16-bit server timestamp reads as a delay of days.
+        const rig = new Rig();
+        rig.push(silentBlock(), 4_294_967_000);
+        expect(rig.playout.stats().targetMs).toBe(400);
     });
 
     it('full ring drops oldest with fade and counts it', () => {

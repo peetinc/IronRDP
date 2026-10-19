@@ -118,6 +118,21 @@ rate drains the ring first (format change), then switches rate.
 - **Overflow:** only when the ring is full (4 s). Discard the oldest samples needed to fit the
   block, with a 5 ms fade, and count the dropped ms. Not expected in normal operation.
 
+**Revision after live testing (2026-10-19).** The first build left audio 4 s behind the picture:
+playback stalled while blocks kept arriving (no underrun, 10 s dropped, the ring pinned full),
+and nothing brought depth back to the target. And raising the target from the local arrival
+gap turned a paused video, where Windows stops sending, into a 2 s target. So:
+
+- **Trim:** bursts only refill what a gap drained, so steady play holds about `target`. When
+  depth exceeds `target + 150 ms`, the reader fades out over 5 ms, skips to the newest
+  `target` of audio and fades back in. A start-up backlog is skipped the same way, silently.
+  Skipped audio is counted as `trimmedMs`, apart from overflow drops.
+- **Lateness:** each block carries `lateMs`, its delay above the best seen this session (the
+  `DelayWindow` of §3). Any block raises `target` to `lateMs + GAP_MARGIN`, capped at
+  `TARGET_CEIL`, before the ring runs dry. The first block after a stall is late; the first
+  after a pause is not. Blocks with no known delay (queued while the worklet loaded) and
+  values over 10 s (a wrapped 16-bit timestamp) fall back to the outage rule above.
+
 **Reader.** The read position advances by a fixed `streamRate / contextRate` per output frame,
 with 4-point cubic (Catmull-Rom) interpolation. That is one continuous fractional reader, so
 there are no per-block resampling ticks. There is no rate skew.
@@ -187,8 +202,8 @@ Accept when:
 
 ## Open risks
 
-- **Latency only ratchets up**, to at most 2 s. A single long outage raises latency for the
-  rest of the session. Silence trimming is the planned remedy, as a separate addition.
+- **Latency only ratchets up**, to at most 2 s. A single long stall raises latency for the
+  rest of the session. Trimming bounds depth to the target, not the target itself.
 - **Clock drift between the server and the AudioContext** (tens of ppm) slowly grows or
   shrinks depth, about 0.2 s per hour. An underrun or the 4 s ring bounds it. Measured
   per session through the delay stats.
