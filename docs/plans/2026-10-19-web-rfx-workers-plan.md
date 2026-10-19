@@ -254,19 +254,138 @@ The client:
   `cargo clippy -p ironrdp-egfx --tests`. Expected: clean.
 - [ ] **Step 5: Commit.** `feat(egfx): submit RemoteFX Progressive commands ahead, controls in stream order`.
 
-## Stages 2–4 (outlined)
+## Stage 2: one Worker (detailed after stage 1)
 
-- **Stage 2:** one Worker, GPU only. Covers:
-  - the `ironrdp-rfx-worker` cdylib and `rfx_worker.js`;
-  - Blob URL and `rfxWorkerUrl`;
-  - external tiles and `SurfaceBackend::write_tiles`;
-  - the stage 0 upload path, and pooled buffers;
-  - the wasm-side per-tile byte comparison.
+**Shared names:**
+- **Crate:** `crates/ironrdp-rfx-worker`, `crate-type = ["cdylib", "rlib"]`, a workspace member.
+  Its pure API:
+  - `pub fn pack_tiles(surface_width: u16, surface_height: u16, tiles: &[DecodedTile], pixels: &mut Vec<u8>, placements: &mut Vec<i32>)`.
+    It produces placements of 5 `i32`s each, `[left, top, width, height, byte_offset]`, with
+    pixels tight (row length = width). These are exactly the rectangles and pixels
+    `GraphicsPipelineClient::write_progressive_tiles` writes, in the same order.
+  - `pub struct WorkerDecoder`, with:
+    - `submit(&mut self, surface_id, codec_context_id, width, height, data) -> Result<(), u32>`
+      (it decodes and packs into its own buffers);
+    - `control(&mut self, kind: u32, surface_id: u16, codec_context_id: u32)`;
+    - `pixels() -> &[u8]` and `placements() -> &[i32]`.
+  - `pub fn error_reason(code: u32) -> &'static str`.
+- **Control kinds:** `0` StartFrame, `1` EndFrame, `2` DeleteContext, `3` DeleteSurface.
+- **Error codes:** one per `ProgressiveDecodeError` variant, in declaration order, starting at
+  1. The reasons are the client's existing "rfx progressive decode failed: …" strings.
+- **wasm exports** (`#[cfg(target_arch = "wasm32")]`, `extern "C"`, one global `WorkerDecoder`):
+  - `rfx_alloc(len) -> *mut u8`;
+  - `rfx_free(ptr, len)`;
+  - `rfx_submit(surface, ctx, width, height, ptr, len) -> u32` (0 = ok);
+  - `rfx_control(kind, surface, ctx)`;
+  - `rfx_pixels_ptr()`, `rfx_pixels_len()`, `rfx_placements_ptr()`, `rfx_placements_len()`
+    (lengths in bytes).
+- **Worker messages:**
+  - main → worker:
+    - `{type:'init', module}`;
+    - `{type:'submit', job, surface, ctx, width, height, data}` (data transferred);
+    - `{type:'control', kind, surface, ctx}`;
+    - `{type:'return', buffer}` (a pixel buffer handed back for reuse);
+  - worker → main: `{type:'result', job, error, pixels, placements}`, with `pixels`
+    (ArrayBuffer, from the pool or new) and `placements` (Int32Array) transferred.
+- **Web side (`crates/ironrdp-web/src/rfx_worker.rs`):** `WorkerProgressiveBackend::new(wake) -> Option<Self>`,
+  a handle to thread-local state like `h264.rs`'s, implementing `ProgressiveBackend`. Its
+  result handles index a thread-local store, which `GlBackend::write_external_tiles` takes
+  from.
+- **Extension:** `rfx_workers` (TS `rfxWorkers(enable)`), off by default, used only with
+  GPU rendering. Test client: a checkbox, plus `VITE_RIG_RFX_WORKERS`.
 
-  Proves:
-  - bench message p95 under 50 ms and none over 150 ms;
-  - tile bytes equal to in-thread;
-  - the user's live 3 minutes with no audio dropouts.
+### Task 6: `ironrdp-rfx-worker` crate: packing, decoder, ABI
+
+- [ ] **Step 1: Write the failing tests** (native, in the crate):
+  - `pack_tiles_reproduces_the_clients_tile_writes`. Decode the win2022 first pass
+    (`ironrdp-graphics/tests/data`) for a 1280×720 surface. Pack it. Draw the placements onto a
+    blank RGBA surface, and draw the tiles with a reference copy of the client's crop rule onto
+    another. The two are identical, and so is the placement count.
+  - `pack_tiles_clips_tiles_at_the_surface_edge`: one tile at x_idx 1 on a 100×100 surface
+    gives a 36×64 placement whose rows are the tile's first 36 columns.
+  - `worker_decoder_matches_progressive_decoder`: first pass then upgrade pass through
+    `WorkerDecoder`, against `ProgressiveDecoder` plus `pack_tiles`. Byte-identical pixels and
+    placements.
+  - `worker_decoder_reports_decode_errors_by_code`: garbage input gives `Err(code)`, with
+    `error_reason(code)` starting with "rfx progressive decode failed".
+- [ ] **Step 2: Run.** `cargo test -p ironrdp-rfx-worker`. Expected: compile failure.
+- [ ] **Step 3: Implement.** The crop rule moves from `client.rs`'s `write_progressive_tiles`. The
+  client keeps its own copy, and the first test pins the two to each other.
+- [ ] **Step 4: Run.** Tests pass. Then
+  `cargo build -p ironrdp-rfx-worker --target wasm32-unknown-unknown --release` (with the
+  CC/AR env). Expected: builds. Its `.wasm` imports nothing, checked with Node:
+  `WebAssembly.Module.imports(new WebAssembly.Module(bytes)).length === 0`.
+- [ ] **Step 5: Commit.** `feat(rfx-worker): RemoteFX Progressive decoding as a standalone wasm module`.
+  `cargo xtask check locks -v` must pass: the new crate enters `Cargo.lock`, intentionally.
+
+### Task 7: build and embed the worker module
+
+- `xtask/src/web.rs` `build`:
+  - first runs `cargo build -p ironrdp-rfx-worker --target wasm32-unknown-unknown --release`
+    with the same `RUSTFLAGS` as the main module (dev: without `--release`);
+  - then sets `IRONRDP_RFX_WORKER_WASM` to its output path for `wasm-pack`.
+- `crates/ironrdp-web/build.rs`:
+  - copies that file to `OUT_DIR/rfx_worker.wasm`, or writes an empty file when the variable
+    is unset (native tests, plain `cargo check`);
+  - declares `rerun-if-env-changed` and `rerun-if-changed`.
+- `rfx_worker.rs` holds `include_bytes!(concat!(env!("OUT_DIR"), "/rfx_worker.wasm"))`. An
+  empty module means Workers are unavailable, so decoding runs in-thread.
+- [ ] Verify: `cargo xtask web build -v` succeeds. `cargo test -p ironrdp-web --lib` still builds
+  without the variable. Commit: `build(web): embed the RemoteFX worker module`.
+
+### Task 8: the Worker backend, PBO upload, extension
+
+**Files:**
+- Create: `crates/ironrdp-web/src/rfx_worker.rs` and `crates/ironrdp-web/src/rfx_worker.js`
+  (embedded with `include_str!`).
+- Modify: `gpu/mod.rs` (`write_external_tiles`, with the pixel-unpack buffer created lazily);
+  `session.rs` (extension, wiring); `lib.rs`; `main.ts` (`rfxWorkers`); the test client's
+  `login.svelte`.
+
+**Behaviour:**
+- `new` compiles the embedded module once per page (`WebAssembly.compile`, cached), starts one
+  classic Worker from a Blob URL of the script, and posts `init`. `None` if the module is
+  empty or `Worker` is unavailable.
+- `submit` copies the data into a fresh `Uint8Array` and transfers it. `control` posts.
+- On `result`: an error code becomes `Err(ProgressiveJobError { reason: error_reason(code) })`.
+  Otherwise the buffers go into the store under a new handle, and the result is
+  `DecodedTiles { external: Some(handle), tiles: vec![] }`. Then `wake()`, once per job.
+- Worker `onerror`: every outstanding and later job yields
+  `Err(ProgressiveJobError { reason: "RemoteFX worker failed" })`.
+- `write_external_tiles(surface, handle)`: take the entry from the store, bind the surface
+  texture and the unpack buffer, `bufferData` the pixels, then one `texSubImage2D` per
+  placement at its byte offset, clipped to the texture. Unbind, then post `return` with the
+  buffer. A missing handle warns.
+- Drop: terminate the Worker, revoke the URL, clear the store.
+
+**Steps:**
+- [ ] **Step 1:** Native unit tests for the pure parts:
+  - `placements_from_i32s_reads_five_per_placement`;
+  - `results_complete_in_order_and_wake_once_per_job`, against the thread-local store with no
+    Worker.
+- [ ] **Step 2:** Implement. `cargo test -p ironrdp-web --lib rfx_worker` passes; wasm clippy is
+  clean for the new and changed files.
+- [ ] **Step 3: Commit.** `feat(web): decode RemoteFX Progressive in a Web Worker (rfxWorkers)`.
+
+### Task 9: bench and acceptance
+
+- [ ] **Bench:**
+  - `EgfxBench.create` gains `workers: bool`. The page reads `workers=1`.
+  - `verify=workers`: the backend also decodes each job in-thread, with a `WorkerDecoder` on
+    the main thread, and compares the Worker's pixels and placements with it byte for byte.
+    The run reports `workerJobs` and `workerMismatches`.
+- [ ] **Run,** on this Mac, `h264=1&gpu=1&workers=1` for rfx-heavy, live-local-4k and mixed-17-31.
+  Expected:
+  - message p95 under 50 ms and none over 150 ms on rfx-heavy and live-local-4k;
+  - `verify=workers` on all three: `workerMismatches` 0.
+
+  Record everything in the ledger and append "Stage 2 results" to the spec.
+- [ ] **Build the dist, commit, push `feat/web-h264`.** Then ask the user for the live test:
+  ac-v4 over Tailscale, Full-screen H.264 unticked, "RemoteFX workers" ticked, 3 minutes of
+  the video, no audio dropouts.
+
+## Stages 3–4 (outlined)
+
 - **Stage 3:** `ProgressiveDecoder::sharded`, with its structural pass, `FrameTile::Elsewhere`
   and union tests for count 1–4, then N = 4. Proves:
   - 3× throughput, byte-identical;
