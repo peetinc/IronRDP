@@ -163,6 +163,7 @@ struct Slot {
     worker: web_sys::Worker,
     url: String,
     results: Rc<RefCell<Results>>,
+    wake: Rc<dyn Fn()>,
     _on_message: Closure<dyn FnMut(web_sys::MessageEvent)>,
     _on_error: Closure<dyn FnMut(web_sys::ErrorEvent)>,
 }
@@ -204,19 +205,21 @@ impl WorkerProgressiveBackend {
     }
 
     fn post(&self, message: &Object, transfer: Option<&Array>) {
-        SLOTS.with_borrow(|slots| {
-            let Some(slot) = slots.get(&self.slot) else {
-                return;
-            };
+        let failed = SLOTS.with_borrow(|slots| {
+            let slot = slots.get(&self.slot)?;
             let sent = match transfer {
                 Some(transfer) => slot.worker.post_message_with_transfer(message, transfer),
                 None => slot.worker.post_message(message),
             };
-            if let Err(error) = sent {
-                warn!(?error, "Failed to post to the RemoteFX worker");
-                slot.results.borrow_mut().fail();
-            }
+            let error = sent.err()?;
+            warn!(?error, "Failed to post to the RemoteFX worker");
+            slot.results.borrow_mut().fail();
+            Some(Rc::clone(&slot.wake))
         });
+        // Its jobs now fail: wake the session so it polls them, as a lost Worker does.
+        if let Some(wake) = failed {
+            wake();
+        }
     }
 }
 
@@ -246,7 +249,7 @@ impl Slot {
             })
         };
         let on_error = {
-            let (results, wake) = (Rc::clone(&results), wake);
+            let (results, wake) = (Rc::clone(&results), Rc::clone(&wake));
             Closure::<dyn FnMut(web_sys::ErrorEvent)>::new(move |event: web_sys::ErrorEvent| {
                 warn!(message = %event.message(), "RemoteFX worker failed");
                 results.borrow_mut().fail();
@@ -265,6 +268,7 @@ impl Slot {
             worker,
             url,
             results,
+            wake,
             _on_message: on_message,
             _on_error: on_error,
         })
