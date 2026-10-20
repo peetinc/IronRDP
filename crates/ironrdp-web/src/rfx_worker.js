@@ -2,7 +2,8 @@
 //
 // Runs `ironrdp-rfx-worker`'s wasm module: one progressive decoder per Worker. The main
 // thread (`rfx_worker.rs`) posts every progressive input in stream order:
-//   { type: 'init', module }                                  the compiled WebAssembly.Module
+//   { type: 'init', module, shard, shards }                   the compiled WebAssembly.Module,
+//                                                             and which tiles this Worker owns
 //   { type: 'submit', job, surface, ctx, width, height, data } data: ArrayBuffer, transferred
 //   { type: 'control', kind, surface, ctx }
 //   { type: 'return', buffer }                                a pixel buffer back for reuse
@@ -19,6 +20,10 @@ const queued = [];
 const pool = [];
 
 function takeBuffer(length) {
+    // An empty result (a job with no tiles of this shard) must not carry off a pooled buffer.
+    if (length === 0) {
+        return new ArrayBuffer(0);
+    }
     for (let i = 0; i < pool.length; i++) {
         if (length <= pool[i].byteLength) {
             return pool.splice(i, 1)[0];
@@ -66,6 +71,7 @@ self.onmessage = (event) => {
     if (message.type === 'init') {
         WebAssembly.instantiate(message.module, {}).then((instance) => {
             wasm = instance.exports;
+            wasm.rfx_shard(message.shard ?? 0, message.shards ?? 1);
             for (const early of queued.splice(0)) {
                 handle(early);
             }

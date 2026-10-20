@@ -115,6 +115,19 @@ impl WorkerDecoder {
         Self::default()
     }
 
+    /// A decoder for shard `index` of `count` ([`ProgressiveDecoder::sharded`]): its
+    /// results hold only that shard's tiles.
+    ///
+    /// # Panics
+    ///
+    /// If `count` is 0 or `index` is not below it.
+    pub fn sharded(index: u8, count: u8) -> Self {
+        Self {
+            decoder: ProgressiveDecoder::sharded(index, count),
+            ..Self::default()
+        }
+    }
+
     /// Decodes a `WireToSurface2` bitmap for a `width` by `height` surface and packs its
     /// tiles. On error, returns a code for [`error_reason`] and leaves no result.
     pub fn submit(
@@ -210,6 +223,22 @@ mod abi {
                 Err(code) => code,
             }
         })
+    }
+
+    /// Makes this instance shard `index` of `count`, with fresh state. Values that do not
+    /// describe a shard (`count` 0 or over 255, `index` not below `count`) keep one unsharded
+    /// decoder: a panic here would trap the Worker, and a trap ends the session.
+    #[unsafe(no_mangle)]
+    pub(crate) extern "C" fn rfx_shard(index: u32, count: u32) {
+        let shard = u8::try_from(count)
+            .ok()
+            .zip(u8::try_from(index).ok())
+            .filter(|&(count, index)| index < count);
+        let decoder = match shard {
+            Some((count, index)) => WorkerDecoder::sharded(index, count),
+            None => WorkerDecoder::new(),
+        };
+        DECODER.with_borrow_mut(|current| *current = decoder);
     }
 
     /// Applies a stream event (`CONTROL_*`).

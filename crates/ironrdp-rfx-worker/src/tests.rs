@@ -155,3 +155,38 @@ fn worker_decoder_reports_decode_errors_by_code() {
     );
     assert!(worker.placements().is_empty(), "a failed job leaves no result");
 }
+
+/// The placements of the last result, each with its pixel bytes, sorted by rectangle.
+fn placed(decoder: &WorkerDecoder) -> Vec<([i32; 4], Vec<u8>)> {
+    let mut placed: Vec<([i32; 4], Vec<u8>)> = decoder
+        .placements()
+        .chunks_exact(5)
+        .map(|p| {
+            let start = usize::try_from(p[4]).expect("offset");
+            let len = usize::try_from(p[2] * p[3] * 4).expect("length");
+            ([p[1], p[0], p[2], p[3]], decoder.pixels()[start..start + len].to_vec())
+        })
+        .collect();
+    placed.sort();
+    placed
+}
+
+#[test]
+fn sharded_workers_pack_the_unsharded_placements() {
+    let mut whole = WorkerDecoder::new();
+    let mut shards: Vec<WorkerDecoder> = (0..3).map(|index| WorkerDecoder::sharded(index, 3)).collect();
+    for pass in [FIRST_PASS, UPGRADE_PASS] {
+        whole.submit(0, 1, WIDTH, HEIGHT, pass).expect("unsharded decode");
+        let mut union = Vec::new();
+        for shard in &mut shards {
+            shard.submit(0, 1, WIDTH, HEIGHT, pass).expect("sharded decode");
+            union.extend(placed(shard));
+        }
+        union.sort();
+        assert!(!union.is_empty());
+        assert!(
+            union == placed(&whole),
+            "the shards' placements differ from the unsharded ones"
+        );
+    }
+}
