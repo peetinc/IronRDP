@@ -109,8 +109,21 @@ thread_local! {
     static SLOTS: RefCell<BTreeMap<u32, Slot>> = const { RefCell::new(BTreeMap::new()) };
     static NEXT_SLOT: Cell<u32> = const { Cell::new(0) };
     static TILES: RefCell<TileStore> = RefCell::new(TileStore::default());
+    // DIAG
+    static DIAG: Cell<(f64, f64, f64, f64)> = const { Cell::new((0.0, 0.0, 0.0, 0.0)) };
+    // DIAG: (submitted, completed, last completed job), and the job being waited on since when.
+    static DIAG_JOBS: Cell<(u32, u32, u32)> = const { Cell::new((0, 0, 0)) };
+    static DIAG_WAIT: Cell<(u32, f64, bool)> = const { Cell::new((u32::MAX, 0.0, false)) };
     /// The compiled Worker module, compiled once per page; `None` once compiling failed.
     static MODULE: RefCell<Option<Option<js_sys::WebAssembly::Module>>> = const { RefCell::new(None) };
+}
+
+// DIAG: tiles held, their bytes, outcomes held, (worker wasm bytes, pool len, pool bytes, last pixels len).
+pub(crate) fn diag() -> String {
+    let (tiles, tile_bytes) = TILES.with_borrow(|store| (store.tiles.len(), store.tiles.values().map(|t| f64::from(t.pixels.byte_length())).sum::<f64>()));
+    let outcomes: usize = SLOTS.with_borrow(|slots| slots.values().map(|slot| slot.results.borrow().outcomes.len()).sum());
+    let (wasm, pool, pool_bytes, last) = DIAG.get();
+    format!("tiles={tiles} tileMB={:.1} outcomes={outcomes} workerWasmMB={:.1} pool={pool} poolMB={:.1} lastPixels={last}", tile_bytes / 1e6, wasm / 1e6, pool_bytes / 1e6)
 }
 
 /// Takes a completed job's pixels for drawing; hand the buffer back with [`return_buffer`].
@@ -283,6 +296,9 @@ fn read_result(owner: u32, data: &JsValue) -> Option<(u32, Result<u64, &'static 
     )]
     let as_u32 = |value: f64| value as u32;
     let job = as_u32(number("job")?);
+    // DIAG
+    DIAG_JOBS.with(|c| { let (s, d, _) = c.get(); c.set((s, d + 1, job)); });
+    DIAG.set((number("wasmBytes").unwrap_or(-1.0), number("pool").unwrap_or(-1.0), number("poolBytes").unwrap_or(-1.0), number("pixelsLength").unwrap_or(-1.0)));
     let error = as_u32(number("error").unwrap_or(0.0));
     if error != 0 {
         return Some((job, Err(ironrdp_rfx_worker::error_reason(error))));
@@ -323,6 +339,8 @@ impl ProgressiveBackend for WorkerProgressiveBackend {
             .and_then(|()| set(&message, "height", &JsValue::from(height)))
             .and_then(|()| set(&message, "data", &bytes.buffer()));
         if built.is_ok() {
+            // DIAG
+            DIAG_JOBS.with(|c| { let (s, d, l) = c.get(); c.set((s + 1, d, l)); });
             self.post(&message, Some(&Array::of1(&bytes.buffer())));
         }
     }
@@ -353,7 +371,24 @@ impl ProgressiveBackend for WorkerProgressiveBackend {
         let outcome = SLOTS.with_borrow(|slots| match slots.get(&self.slot) {
             Some(slot) => slot.results.borrow_mut().poll(job),
             None => Some(Err(WORKER_FAILED)),
-        })?;
+        });
+        // DIAG: a job waited on for over 2 s.
+        let now = js_sys::Date::now();
+        let Some(outcome) = outcome else {
+            let (waiting, since, reported) = DIAG_WAIT.get();
+            if waiting != job {
+                DIAG_WAIT.set((job, now, false));
+            } else if !reported && 2000.0 < now - since {
+                DIAG_WAIT.set((job, since, true));
+                let (submitted, completed, last) = DIAG_JOBS.get();
+                let held: Vec<u32> = SLOTS.with_borrow(|slots| slots.get(&self.slot).map(|slot| slot.results.borrow().outcomes.keys().copied().collect()).unwrap_or_default());
+                warn!(job, submitted, completed, last_completed = last, ?held, waited_ms = now - since, diag = %diag(), "DIAG RemoteFX job not back");
+            }
+            return None;
+        };
+        if DIAG_WAIT.get().2 && DIAG_WAIT.get().0 == job {
+            warn!(job, waited_ms = now - DIAG_WAIT.get().1, "DIAG RemoteFX job finally back");
+        }
         Some(
             outcome
                 .map(|handle| DecodedTiles {
