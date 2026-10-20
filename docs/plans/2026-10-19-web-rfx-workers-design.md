@@ -352,3 +352,25 @@ several unpack buffers.
 **Throughput** is unchanged, as expected for one Worker. The whole replays took about as long
 as before (100 s against 114 s; 36 s against 40 s), so stage 3 is still needed for the sharp
 mode's frame rate.
+
+## Stage 2 live results (2026-10-19)
+
+AC-WIN-micro, 3840x2160, Chrome, GPU + H.264 + one RemoteFX Worker, thin client off.
+
+**Two rig artifacts first.** The EGFX capture hook (`VITE_RIG_DUMP_EGFX=1`) took about 60% of
+the main thread during video; with it off the session was "night and day" better. Bench runs in
+the same tab reuse its renderer and keep their memory, so the next page dies of a PartitionAlloc
+OOM ("Aw, Snap" 5). Perf tests run without the capture hook, in a fresh tab.
+
+**One real bug.** The backlog behind a deferred decode was capped at 4096 commands. This desktop
+sends about 500 commands a frame (mostly `CacheToSurface`), so the cap tripped 8 frames behind a
+Worker job that was simply next in line, and the channel closed ("too many PDUs held behind a
+deferred H.264 decode"). It is now bounded by bytes (64 MiB, `a7b35ac3`). The queue walks were
+measured too: 20,000 queued commands cost about 33 µs each, not worth changing.
+
+**Result.** Full-screen video, 3.5 minutes: 1 audio underrun (before: about 14 per 10 s), longest
+gap 167 ms, no slow decodes, no overflow. Windowed video (mixed mode) survives, with the main
+thread 16% busy and no long animation frames, but the one Worker is pegged at 100%: sharp-mode
+throughput is the limit, which is stage 3's job. Mixed mode also flips regions between H.264 and
+progressive refinement, by the server's choice; that looks worse than full-screen H.264 however
+fast the client decodes.
