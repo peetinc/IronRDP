@@ -61,7 +61,8 @@ function handle(message) {
             wasm.rfx_control(message.kind, message.surface, message.ctx);
             return;
         case 'return':
-            if (pool.length < POOL_MAX) {
+            // An empty result's buffer comes back too: pooled, it would only crowd out real ones.
+            if (0 < message.buffer.byteLength && pool.length < POOL_MAX) {
                 pool.push(message.buffer);
             }
             return;
