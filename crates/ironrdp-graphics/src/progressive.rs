@@ -1295,6 +1295,28 @@ fn charge_region_clipping_work(used: &mut usize, units: usize) -> Result<(), Pro
 /// Per-context progressive state, identified by `(surface_id, codec_context_id)`.
 struct ProgressiveContext {
     surface: SurfaceTiles,
+    /// Per tile slot (`SurfaceTiles` order): whether a first pass (Simple or First) was
+    /// accepted, owned or not. A sharded decoder holds tile state only for its own tiles,
+    /// and skips another shard's upgrade without a first pass, as its owner does
+    /// (`TileState::pass == 0`), by this. Replaced with the tile grid.
+    first_passed: Vec<bool>,
+}
+
+impl ProgressiveContext {
+    fn new(surface: SurfaceTiles) -> Self {
+        let first_passed = vec![false; surface.tiles.len()];
+        Self { surface, first_passed }
+    }
+}
+
+/// What decoding one tile block did.
+enum TileOutcome {
+    /// An owned tile, decoded.
+    Decoded(DecodedTile),
+    /// Another shard's tile, checked and not decoded.
+    Elsewhere { x_idx: u16, y_idx: u16 },
+    /// An upgrade of a tile with no first pass: nothing to do.
+    Skipped,
 }
 
 /// Where a tile updated in the current frame gets its pixels from.
@@ -1305,6 +1327,10 @@ enum FrameTile {
     /// RGBA8888 pixels reconstructed when the context holding the tile was deleted
     /// mid-frame. No larger than the tile state the deletion freed.
     Pixels(Vec<u8>),
+    /// Another shard's tile ([`ProgressiveDecoder::sharded`]): counted like the others, so
+    /// REGION clipping work and context deletion see the same frame tiles in every shard,
+    /// and painted by its owner.
+    Elsewhere,
 }
 
 /// High-level progressive bitmap decoder for EGFX WireToSurface2 processing.
@@ -1348,17 +1374,39 @@ pub struct ProgressiveDecoder {
     frame_tiles: BTreeMap<u16, BTreeMap<(u16, u16), FrameTile>>,
     frame_active: bool,
     surface_context_flags: BTreeMap<u16, bool>,
+    /// `(index, count)`: this decoder owns the tiles with `(x_idx + y_idx) % count == index`.
+    shard: (u8, u8),
 }
 
 impl ProgressiveDecoder {
     /// Create a new progressive decoder with no context state.
     pub fn new() -> Self {
+        Self::sharded(0, 1)
+    }
+
+    /// A decoder that decodes only shard `index` of `count`: the tiles with
+    /// `(x_idx + y_idx) % count == index`.
+    ///
+    /// It parses every block and runs every structural check on every tile, so a malformed
+    /// stream fails the same way in every shard, and keeps all stream-level state. It
+    /// decodes, stores and returns only its own tiles. Together, `count` shards fed the same
+    /// calls return exactly the tiles one unsharded decoder returns. A data error (RLGR,
+    /// SRL, a difference tile with no reference) is seen only by the owning shard, after
+    /// which the shards no longer agree: such an error ends the stream, as it does for one
+    /// decoder.
+    ///
+    /// # Panics
+    ///
+    /// If `count` is 0 or `index` is not below it.
+    pub fn sharded(index: u8, count: u8) -> Self {
+        assert!(index < count, "progressive shard {index} of {count}");
         Self {
             contexts: BTreeMap::new(),
             references: BTreeMap::new(),
             frame_tiles: BTreeMap::new(),
             frame_active: false,
             surface_context_flags: BTreeMap::new(),
+            shard: (index, count),
         }
     }
 
@@ -1436,6 +1484,10 @@ impl ProgressiveDecoder {
         }
 
         let (contexts, references, all_frame_tiles) = (&mut self.contexts, &mut self.references, &mut self.frame_tiles);
+        let (shard_index, shard_count) = self.shard;
+        let owns = |x_idx: u16, y_idx: u16| {
+            (u32::from(x_idx) + u32::from(y_idx)) % u32::from(shard_count) == u32::from(shard_index)
+        };
 
         // Get or create the context for this (surface_id, codec_context_id).
         let context_key = (surface_id, codec_context_id);
@@ -1443,7 +1495,7 @@ impl ProgressiveDecoder {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
                 let surface = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate)?;
-                e.insert(ProgressiveContext { surface })
+                e.insert(ProgressiveContext::new(surface))
             }
         };
 
@@ -1453,7 +1505,11 @@ impl ProgressiveDecoder {
         let surface_resized =
             context.surface.tiles_wide != expected_wide || context.surface.tiles_high != expected_high;
         if surface_resized {
-            context.surface = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate)?;
+            *context = ProgressiveContext::new(SurfaceTiles::new(
+                surface_width,
+                surface_height,
+                use_reduce_extrapolate,
+            )?);
         }
         context.surface.use_reduce_extrapolate = use_reduce_extrapolate;
 
@@ -1492,19 +1548,25 @@ impl ProgressiveDecoder {
             };
             let mut region_tiles = BTreeMap::new();
             for tile_block in &region.tiles {
-                let tiles = decode_tile_block(
+                let outcome = decode_tile_block(
                     surface_id,
-                    &mut context.surface,
+                    context,
                     references,
                     tile_block,
                     &region.quant_vals,
                     &region.quant_prog_vals,
-                    use_reduce_extrapolate,
+                    &owns,
                 )?;
-                for tile in tiles {
-                    let key = (tile.x_idx, tile.y_idx);
-                    frame_tiles.insert(key, FrameTile::Context(codec_context_id));
-                    region_tiles.insert(key, tile);
+                match outcome {
+                    TileOutcome::Decoded(tile) => {
+                        let key = (tile.x_idx, tile.y_idx);
+                        frame_tiles.insert(key, FrameTile::Context(codec_context_id));
+                        region_tiles.insert(key, tile);
+                    }
+                    TileOutcome::Elsewhere { x_idx, y_idx } => {
+                        frame_tiles.insert((x_idx, y_idx), FrameTile::Elsewhere);
+                    }
+                    TileOutcome::Skipped => {}
                 }
             }
 
@@ -1571,6 +1633,7 @@ impl ProgressiveDecoder {
                             pixels
                         }
                         FrameTile::Pixels(pixels) => pixels.clone(),
+                        FrameTile::Elsewhere => continue,
                     };
                     DecodedTile {
                         x_idx,
@@ -1636,6 +1699,14 @@ impl ProgressiveDecoder {
         self.frame_tiles.clear();
         self.frame_active = false;
     }
+    /// The positions this frame has marked on `surface_id`, in order.
+    #[cfg(test)]
+    fn frame_tile_keys(&self, surface_id: u16) -> Vec<(u16, u16)> {
+        self.frame_tiles
+            .get(&surface_id)
+            .map(|tiles| tiles.keys().copied().collect())
+            .unwrap_or_default()
+    }
 }
 
 /// Resolve the progressive quantization values a tile's `quality` byte selects.
@@ -1673,14 +1744,29 @@ fn progressive_quant_for(
 )]
 fn decode_tile_block(
     surface_id: u16,
-    surface: &mut SurfaceTiles,
+    context: &mut ProgressiveContext,
     references: &mut BTreeMap<SubBandDiffingTileKey, Box<DecDwtQ>>,
     tile_block: &ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>,
     quant_vals: &[ComponentCodecQuant],
     prog_quant_vals: &[ProgressiveCodecQuant],
-    use_reduce_extrapolate: bool,
-) -> Result<Vec<DecodedTile>, ProgressiveDecodeError> {
+    owns: &dyn Fn(u16, u16) -> bool,
+) -> Result<TileOutcome, ProgressiveDecodeError> {
     use ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile;
+
+    // A tile another shard owns gets the checks its owner runs before decoding, in the same
+    // order, so a malformed stream fails alike everywhere; only the difference-reference
+    // check is the owner's alone, as the references live with it.
+    let check_quant_indices = |indices: [u8; 3]| {
+        let [q_y, q_cb, q_cr] = indices.map(usize::from);
+        if q_y >= quant_vals.len() || q_cb >= quant_vals.len() || q_cr >= quant_vals.len() {
+            return Err(ProgressiveDecodeError::InvalidQuantIndex {
+                index: q_y.max(q_cb).max(q_cr),
+                table_len: quant_vals.len(),
+            });
+        }
+        Ok(())
+    };
+    let use_reduce_extrapolate = context.surface.use_reduce_extrapolate;
 
     match tile_block {
         ProgressiveTile::Simple(tile) => {
@@ -1688,8 +1774,13 @@ fn decode_tile_block(
             let y_idx = tile.y_idx;
             let is_difference = tile.flags & TILE_FLAG_DIFFERENCE != 0;
 
-            if surface.tile_index(x_idx, y_idx).is_none() {
+            let Some(slot) = context.surface.tile_index(x_idx, y_idx) else {
                 return Err(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx });
+            };
+            if !owns(x_idx, y_idx) {
+                check_quant_indices([tile.quant_idx_y, tile.quant_idx_cb, tile.quant_idx_cr])?;
+                context.first_passed[slot] = true;
+                return Ok(TileOutcome::Elsewhere { x_idx, y_idx });
             }
             let reference_key = (surface_id, x_idx, y_idx);
             let reference = if is_difference {
@@ -1702,20 +1793,15 @@ fn decode_tile_block(
             } else {
                 None
             };
-            let tile_state = surface
+            let tile_state = context
+                .surface
                 .get_or_create(x_idx, y_idx)
                 .ok_or(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx })?;
 
+            check_quant_indices([tile.quant_idx_y, tile.quant_idx_cb, tile.quant_idx_cr])?;
             let q_y = usize::from(tile.quant_idx_y);
             let q_cb = usize::from(tile.quant_idx_cb);
             let q_cr = usize::from(tile.quant_idx_cr);
-
-            if q_y >= quant_vals.len() || q_cb >= quant_vals.len() || q_cr >= quant_vals.len() {
-                return Err(ProgressiveDecodeError::InvalidQuantIndex {
-                    index: q_y.max(q_cb).max(q_cr),
-                    table_len: quant_vals.len(),
-                });
-            }
 
             // TILE_SIMPLE uses lossless progressive quant (no progressive refinement)
             let prog = ComponentCodecQuant::LOSSLESS;
@@ -1735,13 +1821,14 @@ fn decode_tile_block(
 
             let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
             tile_state.reconstruct_to_rgba(&mut pixels);
+            context.first_passed[slot] = true;
 
-            Ok(vec![DecodedTile {
+            Ok(TileOutcome::Decoded(DecodedTile {
                 x_idx,
                 y_idx,
                 pixels,
                 update_rectangles: Vec::new(),
-            }])
+            }))
         }
 
         ProgressiveTile::First(tile) => {
@@ -1749,8 +1836,14 @@ fn decode_tile_block(
             let y_idx = tile.y_idx;
             let is_difference = tile.flags & TILE_FLAG_DIFFERENCE != 0;
 
-            if surface.tile_index(x_idx, y_idx).is_none() {
+            let Some(slot) = context.surface.tile_index(x_idx, y_idx) else {
                 return Err(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx });
+            };
+            if !owns(x_idx, y_idx) {
+                check_quant_indices([tile.quant_idx_y, tile.quant_idx_cb, tile.quant_idx_cr])?;
+                progressive_quant_for(tile.quality, prog_quant_vals)?;
+                context.first_passed[slot] = true;
+                return Ok(TileOutcome::Elsewhere { x_idx, y_idx });
             }
             let reference_key = (surface_id, x_idx, y_idx);
             let reference = if is_difference {
@@ -1763,20 +1856,15 @@ fn decode_tile_block(
             } else {
                 None
             };
-            let tile_state = surface
+            let tile_state = context
+                .surface
                 .get_or_create(x_idx, y_idx)
                 .ok_or(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx })?;
 
+            check_quant_indices([tile.quant_idx_y, tile.quant_idx_cb, tile.quant_idx_cr])?;
             let q_y = usize::from(tile.quant_idx_y);
             let q_cb = usize::from(tile.quant_idx_cb);
             let q_cr = usize::from(tile.quant_idx_cr);
-
-            if q_y >= quant_vals.len() || q_cb >= quant_vals.len() || q_cr >= quant_vals.len() {
-                return Err(ProgressiveDecodeError::InvalidQuantIndex {
-                    index: q_y.max(q_cb).max(q_cr),
-                    table_len: quant_vals.len(),
-                });
-            }
 
             let pq = progressive_quant_for(tile.quality, prog_quant_vals)?;
 
@@ -1795,26 +1883,41 @@ fn decode_tile_block(
 
             let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
             tile_state.reconstruct_to_rgba(&mut pixels);
+            context.first_passed[slot] = true;
 
-            Ok(vec![DecodedTile {
+            Ok(TileOutcome::Decoded(DecodedTile {
                 x_idx,
                 y_idx,
                 pixels,
                 update_rectangles: Vec::new(),
-            }])
+            }))
         }
 
         ProgressiveTile::Upgrade(tile) => {
             let x_idx = tile.x_idx;
             let y_idx = tile.y_idx;
 
-            let tile_state = surface
+            if !owns(x_idx, y_idx) {
+                let slot = context
+                    .surface
+                    .tile_index(x_idx, y_idx)
+                    .ok_or(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx })?;
+                // As the owner skips it below, before looking at its quality.
+                if !context.first_passed[slot] {
+                    return Ok(TileOutcome::Skipped);
+                }
+                progressive_quant_for(tile.quality, prog_quant_vals)?;
+                return Ok(TileOutcome::Elsewhere { x_idx, y_idx });
+            }
+
+            let tile_state = context
+                .surface
                 .get_or_create(x_idx, y_idx)
                 .ok_or(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx })?;
 
             // If this tile hasn't had a first pass, skip the upgrade
             if tile_state.pass == 0 {
-                return Ok(Vec::new());
+                return Ok(TileOutcome::Skipped);
             }
 
             let pq = progressive_quant_for(tile.quality, prog_quant_vals)?;
@@ -1830,12 +1933,12 @@ fn decode_tile_block(
             let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
             tile_state.reconstruct_to_rgba(&mut pixels);
 
-            Ok(vec![DecodedTile {
+            Ok(TileOutcome::Decoded(DecodedTile {
                 x_idx,
                 y_idx,
                 pixels,
                 update_rectangles: Vec::new(),
-            }])
+            }))
         }
     }
 }
@@ -1929,6 +2032,8 @@ fn store_reference(
 #[cfg(test)]
 #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 mod tests {
+    use alloc::collections::BTreeSet;
+
     use super::*;
 
     fn minimal_progressive_stream(include_context: bool) -> Vec<u8> {
@@ -4298,5 +4403,503 @@ mod tests {
                 assert_eq!(*updated, retained.saturating_add(*delta));
             }
         }
+    }
+
+    // --- Sharding ----------------------------------------------------------------------
+
+    /// One step of a decoder's life, for [`assert_shards_match`].
+    enum Call<'a> {
+        Decode {
+            surface_id: u16,
+            context_id: u32,
+            width: u16,
+            height: u16,
+            data: &'a [u8],
+        },
+        BeginFrame,
+        EndFrame,
+        DeleteContext {
+            surface_id: u16,
+            context_id: u32,
+        },
+        DeleteSurface {
+            surface_id: u16,
+        },
+    }
+
+    /// A tile as a sortable value: position, rectangles, pixels.
+    type TileKey = (u16, u16, Vec<(u16, u16, u16, u16)>, Vec<u8>);
+
+    fn sorted_tiles(tiles: &[DecodedTile]) -> Vec<TileKey> {
+        let mut keys: Vec<TileKey> = tiles
+            .iter()
+            .map(|tile| {
+                let rectangles = tile
+                    .update_rectangles
+                    .iter()
+                    .map(|rectangle| (rectangle.left, rectangle.top, rectangle.right, rectangle.bottom))
+                    .collect();
+                (tile.y_idx, tile.x_idx, rectangles, tile.pixels.clone())
+            })
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Runs `calls` through an unsharded decoder and, for each count from 1 to 4, through
+    /// that many shards, and checks the sharding invariant after every call: the shards'
+    /// tiles together are the unsharded tiles (each from its owner), a structural error is
+    /// the same error in every shard, and every shard marks the same frame tiles. Stops at
+    /// the first error, as a session does.
+    fn assert_shards_match(calls: &[Call<'_>]) {
+        let surfaces: BTreeSet<u16> = calls
+            .iter()
+            .filter_map(|call| match call {
+                Call::Decode { surface_id, .. }
+                | Call::DeleteContext { surface_id, .. }
+                | Call::DeleteSurface { surface_id } => Some(*surface_id),
+                Call::BeginFrame | Call::EndFrame => None,
+            })
+            .collect();
+        for count in 1..=4u8 {
+            let mut whole = ProgressiveDecoder::new();
+            let mut shards: Vec<ProgressiveDecoder> = (0..count)
+                .map(|index| ProgressiveDecoder::sharded(index, count))
+                .collect();
+            'calls: for (step, call) in calls.iter().enumerate() {
+                match *call {
+                    Call::Decode {
+                        surface_id,
+                        context_id,
+                        width,
+                        height,
+                        data,
+                    } => {
+                        let expected = whole.decode_bitmap(surface_id, context_id, width, height, data);
+                        let results: Vec<_> = shards
+                            .iter_mut()
+                            .map(|shard| shard.decode_bitmap(surface_id, context_id, width, height, data))
+                            .collect();
+                        match expected {
+                            Ok(tiles) => {
+                                let mut union = Vec::new();
+                                for (index, result) in results.into_iter().enumerate() {
+                                    let shard_tiles = result.unwrap_or_else(|error| {
+                                        panic!("count {count}, shard {index}, call {step}: {error:?}")
+                                    });
+                                    for tile in &shard_tiles {
+                                        assert_eq!(
+                                            (u32::from(tile.x_idx) + u32::from(tile.y_idx)) % u32::from(count),
+                                            u32::from(index as u8),
+                                            "count {count}, call {step}: tile ({}, {}) from shard {index}",
+                                            tile.x_idx,
+                                            tile.y_idx
+                                        );
+                                    }
+                                    union.extend(shard_tiles);
+                                }
+                                assert!(
+                                    sorted_tiles(&union) == sorted_tiles(&tiles),
+                                    "count {count}, call {step}: the shards' tiles differ from the unsharded ones"
+                                );
+                            }
+                            Err(error) => {
+                                for (index, result) in results.iter().enumerate() {
+                                    match result {
+                                        Err(shard_error) => assert_eq!(
+                                            format!("{shard_error:?}"),
+                                            format!("{error:?}"),
+                                            "count {count}, shard {index}, call {step}"
+                                        ),
+                                        Ok(_) => {
+                                            panic!("count {count}, shard {index}, call {step}: expected {error:?}")
+                                        }
+                                    }
+                                }
+                                break 'calls;
+                            }
+                        }
+                    }
+                    Call::BeginFrame => {
+                        whole.begin_frame();
+                        shards.iter_mut().for_each(ProgressiveDecoder::begin_frame);
+                    }
+                    Call::EndFrame => {
+                        whole.end_frame();
+                        shards.iter_mut().for_each(ProgressiveDecoder::end_frame);
+                    }
+                    Call::DeleteContext { surface_id, context_id } => {
+                        whole.delete_context(surface_id, context_id);
+                        shards
+                            .iter_mut()
+                            .for_each(|shard| shard.delete_context(surface_id, context_id));
+                    }
+                    Call::DeleteSurface { surface_id } => {
+                        whole.delete_surface(surface_id);
+                        shards.iter_mut().for_each(|shard| shard.delete_surface(surface_id));
+                    }
+                }
+                for &surface_id in &surfaces {
+                    let expected = whole.frame_tile_keys(surface_id);
+                    for (index, shard) in shards.iter().enumerate() {
+                        assert_eq!(
+                            shard.frame_tile_keys(surface_id),
+                            expected,
+                            "count {count}, shard {index}, call {step}: frame tiles of surface {surface_id}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A SYNC, CONTEXT and one framed REGION over `rects`, holding `tiles`.
+    fn region_stream(
+        rects: Vec<ironrdp_pdu::codecs::rfx::RfxRectangle>,
+        quant_vals: Vec<ComponentCodecQuant>,
+        quant_prog_vals: Vec<ProgressiveCodecQuant>,
+        tiles: Vec<ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>>,
+    ) -> Vec<u8> {
+        use ironrdp_pdu::codecs::rfx::progressive::{
+            ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu,
+            ProgressiveRegion, ProgressiveSyncPdu, encode_progressive_stream,
+        };
+
+        encode_progressive_stream(&[
+            ProgressiveBlock::Sync(ProgressiveSyncPdu),
+            ProgressiveBlock::Context(ProgressiveContextPdu {
+                context_id: 0,
+                tile_size: 0x0040,
+                flags: 0,
+            }),
+            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                frame_index: 0,
+                region_count: 1,
+            }),
+            ProgressiveBlock::Region(ProgressiveRegion {
+                tile_size: 0x40,
+                rects,
+                quant_vals,
+                quant_prog_vals,
+                flags: 0,
+                tiles,
+            }),
+            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+        ])
+        .expect("synthetic progressive stream should encode")
+    }
+
+    /// The base quantizer of the grid streams: coarse, so upgrades refine it.
+    const GRID_BASE_QUANT: ComponentCodecQuant = ComponentCodecQuant {
+        ll3: 6,
+        hl3: 6,
+        lh3: 6,
+        hh3: 6,
+        hl2: 6,
+        lh2: 6,
+        hh2: 6,
+        hl1: 6,
+        lh1: 6,
+        hh1: 6,
+    };
+
+    /// Quality 0 for first passes, quality 1 for upgrades.
+    fn grid_prog_quants() -> Vec<ProgressiveCodecQuant> {
+        let mut first = ComponentCodecQuant::LOSSLESS;
+        first.ll3 = 1;
+        let progressive = |quality, quant| ProgressiveCodecQuant {
+            quality,
+            y_quant: quant,
+            cb_quant: quant,
+            cr_quant: quant,
+        };
+        vec![progressive(0, first), progressive(1, ComponentCodecQuant::LOSSLESS)]
+    }
+
+    /// RLGR1 data for a component whose only coefficient is `value`, distinct per tile.
+    fn grid_component(value: i16) -> Vec<u8> {
+        let mut coefficients = [0; COEFFICIENTS_PER_COMPONENT];
+        coefficients[4032] = value;
+        let mut encoded = vec![0; 16 * 1024];
+        let len = crate::rlgr::encode(EntropyAlgorithm::Rlgr1, &coefficients, &mut encoded)
+            .expect("RLGR encoding should succeed");
+        encoded.truncate(len);
+        encoded
+    }
+
+    /// The whole 150x150 surface: three tiles across and down, the last ones partial.
+    const GRID_SIZE: u16 = 150;
+
+    fn grid_rects() -> Vec<ironrdp_pdu::codecs::rfx::RfxRectangle> {
+        vec![rect(0, 0, GRID_SIZE, GRID_SIZE)]
+    }
+
+    fn grid_positions() -> impl Iterator<Item = (u16, u16)> {
+        (0..3u16).flat_map(|y_idx| (0..3u16).map(move |x_idx| (x_idx, y_idx)))
+    }
+
+    fn grid_simple_stream(components: &[[Vec<u8>; 3]]) -> Vec<u8> {
+        use ironrdp_pdu::codecs::rfx::progressive::{ProgressiveTile, TileSimple};
+
+        let tiles = grid_positions()
+            .zip(components)
+            .map(|((x_idx, y_idx), data)| {
+                ProgressiveTile::Simple(TileSimple {
+                    quant_idx_y: 0,
+                    quant_idx_cb: 0,
+                    quant_idx_cr: 0,
+                    x_idx,
+                    y_idx,
+                    flags: 0,
+                    y_data: &data[0],
+                    cb_data: &data[1],
+                    cr_data: &data[2],
+                    tail_data: &[],
+                })
+            })
+            .collect();
+        region_stream(grid_rects(), vec![ComponentCodecQuant::LOSSLESS], vec![], tiles)
+    }
+
+    fn grid_first_stream(components: &[Vec<u8>]) -> Vec<u8> {
+        use ironrdp_pdu::codecs::rfx::progressive::{ProgressiveTile, TileFirst};
+
+        let tiles = grid_positions()
+            .zip(components)
+            .map(|((x_idx, y_idx), data)| {
+                ProgressiveTile::First(TileFirst {
+                    quant_idx_y: 0,
+                    quant_idx_cb: 0,
+                    quant_idx_cr: 0,
+                    x_idx,
+                    y_idx,
+                    flags: 0,
+                    quality: 0,
+                    y_data: data,
+                    cb_data: data,
+                    cr_data: data,
+                    tail_data: &[],
+                })
+            })
+            .collect();
+        region_stream(grid_rects(), vec![GRID_BASE_QUANT], grid_prog_quants(), tiles)
+    }
+
+    /// Upgrade tiles at `positions`, of `quality`, against `quant_prog_vals`.
+    fn upgrade_stream(
+        positions: &[(u16, u16)],
+        quality: u8,
+        quant_prog_vals: Vec<ProgressiveCodecQuant>,
+        rects: Vec<ironrdp_pdu::codecs::rfx::RfxRectangle>,
+    ) -> Vec<u8> {
+        use ironrdp_pdu::codecs::rfx::progressive::{ProgressiveTile, TileUpgrade};
+
+        const RAW: [u8; 8] = [0xFF; 8];
+        let tiles = positions
+            .iter()
+            .map(|&(x_idx, y_idx)| {
+                ProgressiveTile::Upgrade(TileUpgrade {
+                    quant_idx_y: 0,
+                    quant_idx_cb: 0,
+                    quant_idx_cr: 0,
+                    x_idx,
+                    y_idx,
+                    quality,
+                    y_srl_data: &[],
+                    y_raw_data: &RAW,
+                    cb_srl_data: &[],
+                    cb_raw_data: &RAW,
+                    cr_srl_data: &[],
+                    cr_raw_data: &RAW,
+                })
+            })
+            .collect();
+        region_stream(rects, vec![GRID_BASE_QUANT], quant_prog_vals, tiles)
+    }
+
+    fn decode<'a>(surface_id: u16, context_id: u32, size: (u16, u16), data: &'a [u8]) -> Call<'a> {
+        Call::Decode {
+            surface_id,
+            context_id,
+            width: size.0,
+            height: size.1,
+            data,
+        }
+    }
+
+    #[test]
+    fn shards_match_on_the_windows_capture() {
+        const FIRST_PASS: &[u8] = include_bytes!("../tests/data/win2022-progressive-first-pass.bin");
+        const UPGRADE_PASS: &[u8] = include_bytes!("../tests/data/win2022-progressive-upgrade-pass.bin");
+
+        assert_shards_match(&[
+            decode(0, 1, (1280, 720), FIRST_PASS),
+            decode(0, 1, (1280, 720), UPGRADE_PASS),
+        ]);
+        assert_shards_match(&[
+            Call::BeginFrame,
+            decode(0, 1, (1280, 720), FIRST_PASS),
+            Call::EndFrame,
+            Call::BeginFrame,
+            decode(0, 1, (1280, 720), UPGRADE_PASS),
+            Call::EndFrame,
+        ]);
+    }
+
+    #[test]
+    fn shards_match_on_encoder_round_trips() {
+        let size = (GRID_SIZE, GRID_SIZE);
+        let simple: Vec<[Vec<u8>; 3]> = (0..9i16)
+            .map(|tile| {
+                [
+                    encode_full_quality_component(8 * tile - 32),
+                    encode_full_quality_component(16 - 3 * tile),
+                    encode_full_quality_component(5 * tile),
+                ]
+            })
+            .collect();
+        let first: Vec<Vec<u8>> = (0..9i16).map(|tile| grid_component(20 + 3 * tile)).collect();
+        let positions: Vec<(u16, u16)> = grid_positions().collect();
+        let simple = grid_simple_stream(&simple);
+        let first = grid_first_stream(&first);
+        let upgrade = upgrade_stream(&positions, 1, grid_prog_quants(), grid_rects());
+
+        assert_shards_match(&[
+            Call::BeginFrame,
+            decode(1, 7, size, &simple),
+            Call::EndFrame,
+            Call::BeginFrame,
+            decode(1, 8, size, &first),
+            decode(1, 8, size, &upgrade),
+            Call::EndFrame,
+            Call::BeginFrame,
+            decode(1, 8, size, &upgrade),
+            Call::EndFrame,
+        ]);
+    }
+
+    #[test]
+    fn shards_match_across_contexts_in_one_frame() {
+        let size = (GRID_SIZE, GRID_SIZE);
+        let simple: Vec<[Vec<u8>; 3]> = (0..9i16)
+            .map(|tile| {
+                let component = encode_full_quality_component(4 * tile - 16);
+                [component.clone(), component.clone(), component]
+            })
+            .collect();
+        let simple = grid_simple_stream(&simple);
+        let clip_left = region_stream(vec![rect(0, 0, 70, GRID_SIZE)], vec![], vec![], vec![]);
+        let clip_right = region_stream(vec![rect(70, 0, 80, GRID_SIZE)], vec![], vec![], vec![]);
+
+        assert_shards_match(&[
+            Call::BeginFrame,
+            decode(1, 21, size, &simple),
+            decode(1, 22, size, &clip_left),
+            Call::EndFrame,
+            // A context deleted mid-frame, its tiles clipped by a REGION under the next.
+            Call::BeginFrame,
+            decode(1, 23, size, &simple),
+            Call::DeleteContext {
+                surface_id: 1,
+                context_id: 23,
+            },
+            decode(1, 24, size, &clip_right),
+            Call::EndFrame,
+            Call::BeginFrame,
+            decode(1, 22, size, &clip_left),
+            Call::EndFrame,
+        ]);
+    }
+
+    #[test]
+    fn shards_match_on_the_region_clipping_limit() {
+        // Exhausts the budget in the rectangle loop; the per-frame-tile charge is covered
+        // by the frame-tile equality in the other cases.
+        let spanning = stream_with_rects(vec![rect(0, 0, 8192, 8192); 1_000]);
+        assert_shards_match(&[decode(1, 1, (8192, 8192), &spanning)]);
+    }
+
+    #[test]
+    fn shards_match_on_structural_errors() {
+        use ironrdp_pdu::codecs::rfx::progressive::{ProgressiveTile, TileSimple};
+
+        let component = encode_full_quality_component(10);
+        let simple_at = |x_idx, quant_idx_y| {
+            ProgressiveTile::Simple(TileSimple {
+                quant_idx_y,
+                quant_idx_cb: 0,
+                quant_idx_cr: 0,
+                x_idx,
+                y_idx: 0,
+                flags: 0,
+                y_data: &component,
+                cb_data: &component,
+                cr_data: &component,
+                tail_data: &[],
+            })
+        };
+        let out_of_bounds = region_stream(
+            grid_rects(),
+            vec![ComponentCodecQuant::LOSSLESS],
+            vec![],
+            vec![simple_at(0, 0), simple_at(1, 0), simple_at(7, 0)],
+        );
+        let bad_quant = region_stream(
+            grid_rects(),
+            vec![ComponentCodecQuant::LOSSLESS],
+            vec![],
+            vec![simple_at(0, 0), simple_at(1, 3)],
+        );
+        let size = (GRID_SIZE, GRID_SIZE);
+
+        assert_shards_match(&[decode(1, 1, size, &out_of_bounds)]);
+        assert_shards_match(&[decode(1, 1, size, &bad_quant)]);
+        // No CONTEXT block ever seen for this surface.
+        assert_shards_match(&[decode(1, 1, (64, 64), &simple_tile_stream(0, [1, 2, 3], false))]);
+    }
+
+    /// Upgrades of `positions` with quality 3 against an empty `quantProgVals`: the
+    /// unsharded decoder skips a tile with no first pass before looking at its quality, and
+    /// a shard that wrongly thinks it had one fails `InvalidQuantIndex`.
+    fn upgrade_without_quants(positions: &[(u16, u16)]) -> Vec<u8> {
+        upgrade_stream(positions, 3, vec![], grid_rects())
+    }
+
+    #[test]
+    fn shards_skip_an_upgrade_without_a_first_pass() {
+        let positions: Vec<(u16, u16)> = grid_positions().collect();
+        let upgrade = upgrade_without_quants(&positions);
+        assert_shards_match(&[
+            Call::BeginFrame,
+            decode(1, 1, (GRID_SIZE, GRID_SIZE), &upgrade),
+            Call::EndFrame,
+        ]);
+    }
+
+    #[test]
+    fn shards_forget_first_passes_when_a_surface_resizes() {
+        let first: Vec<Vec<u8>> = (0..9i16).map(|tile| grid_component(30 + tile)).collect();
+        let first = grid_first_stream(&first);
+        let positions: Vec<(u16, u16)> = grid_positions().collect();
+        let upgrade = upgrade_without_quants(&positions);
+        assert_shards_match(&[
+            decode(1, 1, (GRID_SIZE, GRID_SIZE), &first),
+            // 3x3 tiles to 4x4: a new tile grid, so no tile has had a first pass.
+            decode(1, 1, (256, 256), &upgrade),
+        ]);
+    }
+
+    #[test]
+    fn shards_forget_first_passes_when_a_surface_is_deleted() {
+        let first: Vec<Vec<u8>> = (0..9i16).map(|tile| grid_component(40 + tile)).collect();
+        let first = grid_first_stream(&first);
+        let positions: Vec<(u16, u16)> = grid_positions().collect();
+        let upgrade = upgrade_without_quants(&positions);
+        let size = (GRID_SIZE, GRID_SIZE);
+        assert_shards_match(&[
+            decode(1, 1, size, &first),
+            Call::DeleteSurface { surface_id: 1 },
+            decode(1, 1, size, &upgrade),
+        ]);
     }
 }
