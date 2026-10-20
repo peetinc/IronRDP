@@ -377,3 +377,29 @@ thread 16% busy and no long animation frames, but the one Worker is pegged at 10
 throughput is the limit, which is stage 3's job. Mixed mode also flips regions between H.264 and
 progressive refinement, by the server's choice; that looks worse than full-screen H.264 however
 fast the client decodes.
+
+## Stage 3 results (2026-10-19)
+
+Same Mac (Apple M1 Max, Chrome 154), bench `h264=1&gpu=1`, a fresh tab per run, no capture hook.
+
+| Capture | Workers | Replay | fps | Busiest Worker | Jobs/s | Main p95 | Max | Over 150 ms |
+|---|---|---|---|---|---|---|---|---|
+| rfx-heavy | 1 | 126 s | 33 | 101.1 s | 65 | 3.3 ms | 1,030 ms | 6 |
+| rfx-heavy | 4 | **60 s** | **68** | 39.9 s | **164** | 3.7 ms | 701 ms | 4 |
+| live-local-4k | 1 | 56 s | 61 | 45.5 s | 71 | 2.4 ms | 410 ms | 2 |
+| live-local-4k | 4 | **29 s** | **117** | 18.4 s | **177** | 2.7 ms | 781 ms | 3 |
+
+**Correctness:** `verify=workers` with 4 Workers, every job compared byte for byte with the
+unsharded decoder: rfx-heavy 6,531, live-local-4k 3,248, mixed-17-31 2,138, live-workers-fail
+4,098; 0 mismatches. The four Workers' busy times are within 4% of each other: the diagonal
+ownership rule balances the load.
+
+**Throughput is 2.5×, not 3×.** Run together, each Worker decodes slower: in the verify run,
+whose main thread feeds them slower, the busiest took 30.8 s on rfx-heavy (3.3×); flat out,
+39.9 s. Ruling: accepted for the live test; frame rate in the bench doubles.
+
+**Open: rare long main-thread messages** (2–6 per replay over 150 ms, up to about 1 s), in the
+1-Worker runs too, where stage 2's runs this morning had none. The 1-Worker rfx-heavy one is a
+624 ms GPU upload (stage 2's open unpack-buffer stall, bigger); the 4-Worker ones are not
+uploads. Not yet explained; a stage 2 A/B on the same machine state would separate code from
+environment.

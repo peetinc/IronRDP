@@ -185,10 +185,10 @@ export declare class EgfxBench {
     /**
      * A bench drawing to `canvas`. With `h264`, AVC frames decode through WebCodecs, as in a
      * session with H.264 on; with `gpu`, EGFX renders through the WebGL2 backend; with
-     * `workers` (and `gpu`), RemoteFX Progressive decodes in a Web Worker, and with
-     * `verify_workers` every Worker job is compared with in-thread decoding.
+     * `workers` above 0 (and `gpu`), RemoteFX Progressive decodes in that many Web Workers,
+     * and with `verify_workers` every job is compared with in-thread decoding.
      */
-    static create(canvas: HTMLCanvasElement, h264: boolean, gpu: boolean, workers: boolean, verify_workers: boolean): Promise<EgfxBench>;
+    static create(canvas: HTMLCanvasElement, h264: boolean, gpu: boolean, workers: number, verify_workers: boolean): Promise<EgfxBench>;
     /**
      * Replays `capture` as fast as the pipeline allows and returns
      * `{ messages, errors, frames, ms, fps, frameMsP50, frameMsP95, frameMsMax, decoderWaitMs,
