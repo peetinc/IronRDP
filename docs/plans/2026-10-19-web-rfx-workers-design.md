@@ -205,7 +205,10 @@ monotonic, and every completion wakes the loop.
 
 ### 4. Failure
 
-- **A Worker or the module fails to start:** that session decodes in-thread. One WARN.
+- **A Worker or the module fails to start:** that session decodes in-thread. One WARN. This
+  covers synchronous failures (`new Worker`, `postMessage`) only: a module that fails to
+  instantiate inside a Worker reports later, as an error event, and ends the session like a
+  Worker lost mid-session.
 - **A Worker errors mid-session:** its tile state is lost, so later upgrade passes and
   difference tiles would decode against nothing. The session ends with "RemoteFX worker
   failed", and the existing reconnect logic runs. That is the same rule as WebGL context loss.

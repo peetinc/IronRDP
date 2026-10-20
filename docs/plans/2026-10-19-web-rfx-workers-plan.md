@@ -384,10 +384,212 @@ The client:
   ac-v4 over Tailscale, Full-screen H.264 unticked, "RemoteFX workers" ticked, 3 minutes of
   the video, no audio dropouts.
 
-## Stages 3–4 (outlined)
+## Stage 3: four Workers (detailed after stage 2)
 
-- **Stage 3:** `ProgressiveDecoder::sharded`, with its structural pass, `FrameTile::Elsewhere`
-  and union tests for count 1–4, then N = 4. Proves:
-  - 3× throughput, byte-identical;
-  - the live sharp mode as smooth as H.264.
-- **Stage 4:** only if numbers require it: a pixel-unpack buffer, then an atlas.
+Stage 2 passed live on 2026-10-19 (spec, "Stage 2 live results"): the main thread is healthy
+and the one Worker is pegged at 100% in mixed mode. Stage 3 shards the decoder (spec §1) so
+up to 4 Workers share that work.
+
+**Stage 3 constraints** (added to Global Constraints):
+- Ownership: tile `(x_idx, y_idx)` belongs to shard `(x_idx + y_idx) % count`. `surface_id`
+  is not in the rule. `ProgressiveDecoder::new()` is `sharded(0, 1)`: native clients and the
+  in-thread path are unchanged.
+- Worker count: `N = clamp(navigator.hardwareConcurrency − 2, 1, 4)`, 1 when unknown. The bench
+  overrides it with `workers=N`.
+- Each job goes to all N Workers; it completes when all N have answered. One wake per completed
+  job, not per reply.
+- `max_in_flight` stays 8 jobs.
+- No `SharedArrayBuffer`. Workers only with GPU rendering, as in stage 2.
+
+**Shared names:**
+- `ironrdp-graphics`: `pub fn ProgressiveDecoder::sharded(index: u8, count: u8) -> Self`
+  (panics if `count == 0` or `count <= index`); `FrameTile::Elsewhere` (private).
+- `ironrdp-rfx-worker`: `pub fn WorkerDecoder::sharded(index: u8, count: u8) -> Self`; wasm
+  export `rfx_shard(index: u32, count: u32)`, which replaces the global decoder.
+- Worker messages: `init` gains `shard` and `shards`; the script calls
+  `rfx_shard(shard, shards)` after instantiating, before any queued message. Nothing else
+  changes.
+- `ironrdp-web` (`rfx_worker.rs`):
+  - `WorkerProgressiveBackend::new(count: usize, wake) -> Option<Self>`;
+  - `pub(crate) struct JobResults<T>`, shared by the N slots:
+    `new(shards)`, `complete(job, shard, outcome: Result<T, &'static str>) -> bool` (true when
+    that job now has all N), `take(job) -> Option<Result<Vec<T>, (&'static str, Vec<T>)>>`
+    (the parts in shard order; on error, the first error by shard order plus the successful
+    parts, for their buffers to go back), `fail()`;
+  - `take_tiles(handle) -> Option<Vec<ExternalTiles>>`; `with_tiles` likewise over the parts;
+  - `pub(crate) fn worker_count(hardware_concurrency: Option<f64>) -> usize`.
+
+**Stage 3 review focus:**
+1. A Worker that dies, or never starts, must not leave the session waiting for its replies:
+   the job fails and the session ends (Task 12, `a_lost_worker_fails_outstanding_jobs`).
+2. One shard's error must not leak the other shards' buffers (Task 12,
+   `a_failed_shard_fails_the_job_and_hands_back_the_rest`).
+3. A surface deleted and recreated with the same id must not inherit first-pass bits (Task 10,
+   `shards_forget_first_passes_when_a_surface_is_deleted`).
+4. A tile emitted twice in one job (two REGIONs) counts twice when comparing: the comparisons
+   are multisets, not sets (Tasks 10–12).
+5. `count = 1` must behave exactly as stage 2 (Task 10's count-1 runs; Task 13's `workers=1`).
+
+### Task 10: `ProgressiveDecoder::sharded`
+
+**Files:** Modify `crates/ironrdp-graphics/src/progressive.rs` (`ProgressiveDecoder`,
+`ProgressiveContext`, `FrameTile`, `decode_tile_block`, the REGION loop in `decode_bitmap`);
+tests in its `mod tests`; `crates/ironrdp-graphics/tests/ms_progressive.rs`.
+
+**Behaviour** (spec §1, plus what the code showed):
+- `decode_tile_block` takes `owned: bool`. For a tile it does not own it runs the same checks,
+  in the same order, that the owner runs before decoding, and decodes nothing:
+  - Simple, First: bounds (`tile_index`), then the quant indices, then (First)
+    `progressive_quant_for(quality)`. The difference-reference check is the owner's alone: the
+    references live with it (spec: a data error).
+  - Upgrade: bounds; then, if the tile has had no first pass in this context, skip it as the
+    owner does (`tile_state.pass == 0`), marking nothing; otherwise
+    `progressive_quant_for(quality)`.
+  - It allocates no `TileState`: the memory split is the point.
+- **First-pass bits:** the owner knows `pass == 0` from its tile state; the others cannot. So
+  `SurfaceTiles` gains a bit per tile slot, beside `tiles`, set when a Simple or First tile is
+  accepted (owned or not). Living in `SurfaceTiles`, it is cleared wherever the tile state is
+  (`new`, resize, `reset`, `delete_context`, `delete_surface`) with no extra code. Without it,
+  the other shards would mark the skipped tile, charge REGION clipping work the unsharded
+  decoder does not, and run `progressive_quant_for` where the owner returns first.
+- Accepted non-owned tiles go into `frame_tiles` as `FrameTile::Elsewhere`. The REGION loop
+  charges clipping work for them exactly as for the others and emits nothing for them.
+  `delete_context` keeps them as they are.
+- Owned tiles come out in the same relative order as unsharded.
+
+- [ ] **Step 1: Write the failing tests.** A test helper
+  `fn assert_shards_match(calls: &[Call])` runs one unsharded decoder and, for each count in
+  1..=4, `count` sharded decoders through the same calls (`decode_bitmap`, `begin_frame`,
+  `end_frame`, `delete_context`, `delete_surface`). It stops at the first error, as the
+  session does: after a data error the shards diverge by design. A `#[cfg(test)]
+  fn frame_tile_keys(&self, surface_id: u16) -> Vec<(u16, u16)>` must be equal across the
+  unsharded decoder and every shard after every call: it is the direct check of `Elsewhere`
+  marking and `delete_context` retention, and of the per-frame-tile clipping charge (exactly
+  one per key per REGION). Errors compare as `format!("{error:?}")`
+  (`ProgressiveDecodeError` has no `PartialEq`). After each `decode_bitmap` it asserts:
+  - if unsharded returned `Ok(tiles)`: every shard returned `Ok`, and the union of the shards'
+    tiles, sorted by `(y_idx, x_idx, update_rectangles, pixels)`, equals `tiles` sorted the
+    same way, and every tile comes from its owner;
+  - if unsharded returned a structural error (`TileOutOfBounds`, `InvalidQuantIndex`,
+    `MissingBlock`, `SurfaceTooLarge`, or `Pdu` for the clipping limit): every shard returned
+    that same error.
+
+  Cases, each a `#[test]`:
+  - `shards_match_on_the_windows_capture`: the win2022 first pass, then the upgrade pass, on a
+    1280×720 surface (`tests/data`; in `tests/ms_progressive.rs`);
+  - `shards_match_on_encoder_round_trips`: the `first_tile_stream` / `upgrade_tile_stream` /
+    `simple_tile_stream` builders over a 3×3 tile grid on a 150×150 surface (partial edge
+    tiles), first pass then two upgrades;
+  - `shards_match_across_contexts_in_one_frame`: the
+    `region_repaints_frame_tiles_from_another_codec_context` sequence, including its mid-frame
+    `delete_context`;
+  - `shards_match_on_the_region_clipping_limit`: the `decoder_bounds_region_clipping_work`
+    input: every shard fails with the same error. It exhausts the budget in the rectangle loop
+    only; the per-frame-tile charge is covered by the `frame_tile_keys` equality;
+  - `shards_match_on_structural_errors`: a tile out of bounds; a quant index past the table;
+    no CONTEXT ever seen;
+  - `shards_skip_an_upgrade_without_a_first_pass`: an upgrade of a tile that never had a first
+    pass, inside a REGION that clips it: no shard emits or marks it;
+  - `shards_forget_first_passes_when_a_surface_resizes`: first pass at 128×128, then an upgrade
+    at 192×192 with no new first pass: every shard skips it, as unsharded does.
+  - `shards_forget_first_passes_when_a_surface_is_deleted`: first pass, `delete_surface`, then
+    an upgrade on the same surface id: every shard skips it.
+
+  In these three the skipped upgrade has `quality` 3 and an empty `quantProgVals`: unsharded
+  returns `Ok([])` before looking at it, and a shard with a missing or stale bit fails
+  `InvalidQuantIndex`. Without that, a wrong mark would still return `Ok([])`.
+- [ ] **Step 2: Run.** `cargo test -p ironrdp-graphics shards_`. Expected: compile failure
+  (`sharded` missing).
+- [ ] **Step 3: Implement** as above. `sharded(0, 1)` must take the same code path as today.
+- [ ] **Step 4: Run.** `cargo test -p ironrdp-graphics` all pass, including every existing
+  test. Then `cargo test -p ironrdp-egfx --lib` and `cargo test -p ironrdp-rfx-worker`.
+- [ ] **Step 5: Commit.** `feat(graphics): ProgressiveDecoder::sharded, tiles split across decoders by position`.
+
+### Task 11: shard the Worker module
+
+**Files:** `crates/ironrdp-rfx-worker/src/lib.rs` and its `tests`; `crates/ironrdp-web/src/rfx_worker.js`.
+
+- [ ] **Step 1: Failing test** `sharded_workers_pack_the_unsharded_placements`: the win2022 first
+  then upgrade pass through `WorkerDecoder::new()` and through `WorkerDecoder::sharded(i, 3)`
+  for i in 0..3. The shards' placements together, each with its pixel bytes, sorted by
+  `(top, left, width, height)`, equal the unsharded ones sorted the same way.
+- [ ] **Step 2: Run.** `cargo test -p ironrdp-rfx-worker`. Expected: compile failure.
+- [ ] **Step 3: Implement** `WorkerDecoder::sharded` and `rfx_shard`. `rfx_shard` validates
+  (`count` 1..=255, `index < count`) and otherwise keeps `(0, 1)`: a panic in the Worker is a
+  trap, and a trap ends the session. In `rfx_worker.js`, `init` calls
+  `wasm.rfx_shard(message.shard ?? 0, message.shards ?? 1)` before draining `queued`, and
+  `takeBuffer(0)` returns `new ArrayBuffer(0)` rather than a pooled buffer.
+- [ ] **Step 4: Run.** Tests pass; the wasm build still imports nothing (stage 2's Node check).
+- [ ] **Step 5: Commit.** `feat(rfx-worker): one shard of the progressive decoder per Worker`.
+
+### Task 12: N Workers behind one backend
+
+**Files:** `crates/ironrdp-web/src/rfx_worker.rs`, `gpu/mod.rs` (`write_external_tiles`),
+`session.rs` (count), `bench.rs` (`workers` becomes a count).
+
+**Behaviour:**
+- `new(count, wake)` starts `count` slots from the one compiled module; slot `i` gets
+  `init {module, shard: i, shards: count}`. If any slot fails to start synchronously
+  (`Worker::new`, `postMessage`), terminate the ones that did and return `None` (in-thread
+  decoding, one WARN). A module that fails to instantiate inside a Worker reports later, as
+  `onerror`, and ends the session ("RemoteFX worker failed"), as in stage 2.
+- `submit` posts to every slot, each with its own copy of `data` (transferred). `control`
+  posts to every slot.
+- A slot's `result` becomes an `ExternalTiles` (or its error reason) and goes into the shared
+  `JobResults` with the slot's shard index. `wake()` only when `complete` returns true.
+- A slot's `onerror` calls `JobResults::fail()` and wakes: every outstanding and later job then
+  fails "RemoteFX worker failed", as in stage 2.
+- `poll(job)`: `take(job)`. On `Ok(parts)` store the parts under one handle:
+  `DecodedTiles { external: Some(handle), tiles: vec![] }`. On `Err((reason, parts))` give
+  every part's buffer back to its Worker, then return the error.
+- `write_external_tiles`: upload every part with placements (`upload_packed`) and skip empty
+  ones; return every part's buffer. The shards' placements never overlap, so their order does
+  not matter.
+- `JobResults` ignores a `complete` for a job already taken, or after `fail()`, and hands its
+  buffer back: a slow Worker's late reply must not leave an entry nobody polls.
+- Drop terminates every slot, revokes every URL, and clears the store for every owner.
+- Each Worker's `result` carries `ms`, its `rfx_submit` wall time, for the bench.
+- Session: `count = worker_count(navigator.hardwareConcurrency)`. Bench: `workers=N` (0 or
+  absent = in-thread), and `verify=workers` compares the union of the parts with the
+  in-thread `WorkerDecoder::new()` as a multiset of `(rect, pixel bytes)`.
+
+- [ ] **Step 1: Failing native tests** in `rfx_worker.rs`:
+  - `a_job_completes_when_every_shard_has_answered`: 3 shards; `complete` returns false, false,
+    true; `take` gives the parts in shard order even when they arrived out of order.
+  - `a_failed_shard_fails_the_job_and_hands_back_the_rest`: one shard `Err`; `take` gives that
+    reason and the other two parts.
+  - `a_lost_worker_fails_outstanding_jobs`: after `fail()`, `take` on a job with 2 of 3 parts is
+    `Err(("RemoteFX worker failed", the 2 parts))`, and on an unanswered later job the same with
+    no parts. A job complete before `fail()` still gives `Ok`.
+  - `a_late_reply_after_take_is_dropped`: `complete` for a taken job returns false and keeps
+    no entry; the caller gets the outcome back to return its buffer.
+  - `worker_count_leaves_two_cores_and_caps_at_four`: `None` → 1, `Some(1.0)` → 1, `Some(4.0)` →
+    2, `Some(10.0)` → 4.
+- [ ] **Step 2: Run.** `cargo test -p ironrdp-web --lib rfx_worker`. Expected: compile failure.
+- [ ] **Step 3: Implement.** Replace stage 2's per-slot `Results` with `JobResults<ExternalTiles>`.
+- [ ] **Step 4: Run.** Tests pass; `cargo xtask web build -v` succeeds; wasm clippy clean on the
+  changed files.
+- [ ] **Step 5: Commit.** `feat(web): RemoteFX decoding across up to four Workers`.
+
+### Task 13: bench, acceptance, live
+
+- [ ] **Bench** (this Mac, fresh tab, vite without `VITE_RIG_DUMP_EGFX`), `h264=1&gpu=1`, on
+  rfx-heavy, live-local-4k, mixed-17-31 and live-workers-fail, with `workers=1` and `workers=4`.
+  Expected:
+  - `verify=workers` with `workers=4`: `workerMismatches` 0 on all four;
+  - message p95 under 50 ms and none over 150 ms with `workers=4`;
+  - decode throughput: jobs ÷ the busiest Worker's summed `ms` (the bench reports
+    `workerBusyMs` per shard and `jobsPerSecond`). With `workers=4` at least 3× `workers=1`'s
+    on rfx-heavy and live-local-4k passes; 2–3× is a ruling with the numbers; under 2× fails
+    the stage, and stage 3 stops for a rethink. Replay `ms` is reported too, as secondary: it
+    includes H.264 and main-thread work.
+
+  Record in the ledger and append "Stage 3 results" to the spec.
+- [ ] **Build the dist, commit, push `feat/web-h264`.** Then the live test, by the user: windowed
+  video in mixed mode, Full-screen H.264 unticked, RemoteFX workers ticked, 3 minutes; the
+  Worker threads are sampled for CPU, and the sharp regions should be no jerkier to the eye than
+  H.264.
+
+## Stage 4 (outlined)
+
+Only if numbers require it: a pixel-unpack buffer per Worker part, then an atlas.
