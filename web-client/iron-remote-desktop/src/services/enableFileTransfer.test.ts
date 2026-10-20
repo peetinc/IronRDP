@@ -242,3 +242,27 @@ describe('PublicAPI clipboard monitoring suppression', () => {
         expect(resumeSpy).toHaveBeenCalledTimes(1);
     });
 });
+
+describe('PublicAPI invokeExtension', () => {
+    it('returns what the session answers', async () => {
+        vi.clearAllMocks();
+        mockBuilderInstance = new MockSessionBuilder();
+        const module = createMockModule();
+        const service = new RemoteDesktopService(module);
+        service.setCanvas(document.createElement('canvas'));
+        const api = new PublicAPI(service, new ClipboardService(service, module)).getExposedFunctions();
+        await service.connect({
+            proxyAddress: 'wss://test',
+            destination: 'test:3389',
+            serverDomain: '',
+            password: 'pass',
+            authToken: 'token',
+            username: 'user',
+            desktopSize: { width: 1920, height: 1080 },
+            extensions: [],
+        });
+
+        mockSession.invokeExtension.mockReturnValueOnce(true);
+        expect(api.invokeExtension({} as never)).toBe(true);
+    });
+});

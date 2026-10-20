@@ -101,8 +101,8 @@ export class PublicAPI {
         return await this.clipboardService.sendClipboardData();
     }
 
-    private invokeExtension(ext: Extension) {
-        this.remoteDesktopService.invokeExtension(ext);
+    private invokeExtension(ext: Extension): unknown {
+        return this.remoteDesktopService.invokeExtension(ext);
     }
 
     private enableFileTransfer(provider: FileTransferProvider): FileTransferProvider {

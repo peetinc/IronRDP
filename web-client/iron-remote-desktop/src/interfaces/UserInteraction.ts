@@ -76,7 +76,8 @@ export interface UserInteraction {
 
     sendClipboardData(): Promise<void>;
 
-    invokeExtension(ext: Extension): void;
+    /** Runs a backend-specific extension on the live session; returns the backend's answer, if any. */
+    invokeExtension(ext: Extension): unknown;
 
     /**
      * Enable file transfer support. Must be called before connect().
