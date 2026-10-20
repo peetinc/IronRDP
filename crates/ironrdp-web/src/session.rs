@@ -4,6 +4,7 @@ use core::num::NonZeroU32;
 use core::time::Duration;
 use std::borrow::Cow;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use base64::Engine as _;
@@ -153,6 +154,9 @@ struct SessionBuilderInner {
     /// Decode RemoteFX Progressive in a Web Worker. Off by default, set by the `rfx_workers`
     /// extension. Used only with GPU rendering; otherwise RemoteFX decodes on the main thread.
     rfx_workers: bool,
+    /// The size of the last EGFX ResetGraphics not yet seen by the session loop, set by the
+    /// graphics pipeline's handler (see [`ResizeTracker::reset`]).
+    graphics_reset: Arc<Mutex<Option<(u32, u32)>>>,
     enable_audio_playback: bool,
     /// Same-origin URL of `playout_worklet.js`, for pages whose CSP `script-src` does not
     /// allow `blob:`; set by the `audio_worklet_url` extension.
@@ -217,6 +221,7 @@ impl Default for SessionBuilderInner {
             frame_ack_suspend: false,
             avc_thin_client: false,
             rfx_workers: false,
+            graphics_reset: Arc::new(Mutex::new(None)),
             enable_audio_playback: false,
             audio_worklet_url: None,
             performance_flags: None,
@@ -822,6 +827,7 @@ impl SessionBuilder {
 
         let use_display_control = self.0.borrow().use_display_control;
         let avc_thin_client = self.0.borrow().avc_thin_client;
+        let graphics_reset = Arc::clone(&self.0.borrow().graphics_reset);
 
         let (connection_result, stream, rdp_leftover) = connect(ConnectParams {
             ws,
@@ -848,6 +854,7 @@ impl SessionBuilder {
                 FrameAckPolicy::EveryFrame
             },
             avc_thin_client,
+            graphics_reset,
             redirect,
             rdpsnd_backend,
         })
@@ -1094,6 +1101,8 @@ impl Session {
         );
 
         let mut requested_resize = None;
+        let mut resize_tracker = ResizeTracker::default();
+        let graphics_reset = Arc::clone(&self.builder.0.borrow().graphics_reset);
 
         // Reused across frames so per-region extraction doesn't allocate on every draw.
         let mut draw_buffer = WriteBuf::new();
@@ -1288,21 +1297,37 @@ impl Session {
                                     (width, height)
                                 };
                                 let (width, height) = MonitorLayoutEntry::adjust_display_size(width, height);
-                                match active_stage.encode_resize(width, height, scale_factor, physical_size) {
-                                    Some(Ok(response_frame)) => {
-                                        let width = NonZeroU32::new(width).expect("adjusted width is at least 200");
-                                        let height = NonZeroU32::new(height).expect("adjusted height is at least 200");
+                                let request = ResizeRequest {
+                                    width,
+                                    height,
+                                    scale_factor,
+                                    physical_size,
+                                };
+                                let desktop = self.desktop_size.get();
+                                if resize_tracker
+                                    .request(request, (u32::from(desktop.width), u32::from(desktop.height)))
+                                    .is_none()
+                                {
+                                    debug!(width, height, "Resize already applied, not sent again");
+                                    Vec::new()
+                                } else {
+                                    match active_stage.encode_resize(width, height, scale_factor, physical_size) {
+                                        Some(Ok(response_frame)) => {
+                                            resize_tracker.sent(request);
+                                            let width = NonZeroU32::new(width).expect("adjusted width is at least 200");
+                                            let height = NonZeroU32::new(height).expect("adjusted height is at least 200");
 
-                                        requested_resize = Some((width, height));
-                                        vec![ActiveStageOutput::ResponseFrame(response_frame)]
-                                    }
-                                    Some(Err(error)) => {
-                                        warn!(%error, width, height, "Resize request could not be encoded, ignoring");
-                                        Vec::new()
-                                    }
-                                    None => {
-                                        debug!("Resize event ignored");
-                                        Vec::new()
+                                            requested_resize = Some((width, height));
+                                            vec![ActiveStageOutput::ResponseFrame(response_frame)]
+                                        }
+                                        Some(Err(error)) => {
+                                            warn!(%error, width, height, "Resize request could not be encoded, ignoring");
+                                            Vec::new()
+                                        }
+                                        None => {
+                                            debug!("Resize event ignored");
+                                            Vec::new()
+                                        }
                                     }
                                 }
                             }
@@ -1406,6 +1431,36 @@ impl Session {
             // server still trusts its cache: the session cannot continue, and reconnects.
             if let Some(reason) = gui.failure() {
                 return Err(anyhow::anyhow!(reason).into());
+            }
+
+            // Windows ignores layouts while the user logs on, then resets to the size it
+            // connected at: ask again for the wanted one.
+            let reset = graphics_reset.lock().ok().and_then(|mut reset| reset.take());
+            if let Some(request) = reset.and_then(|size| resize_tracker.reset(size)) {
+                match active_stage.encode_resize(
+                    request.width,
+                    request.height,
+                    request.scale_factor,
+                    request.physical_size,
+                ) {
+                    Some(Ok(response_frame)) => {
+                        info!(
+                            width = request.width,
+                            height = request.height,
+                            "Asking again for the wanted desktop size after a graphics reset"
+                        );
+                        self.writer_tx
+                            .borrow()
+                            .unbounded_send(response_frame)
+                            .context("Send frame to writer task")?;
+                        resize_tracker.sent(request);
+                        requested_resize = NonZeroU32::new(request.width).zip(NonZeroU32::new(request.height));
+                    }
+                    Some(Err(error)) => {
+                        warn!(%error, width = request.width, height = request.height, "Resize request could not be encoded, ignoring");
+                    }
+                    None => {}
+                }
             }
 
             // On the GPU, ResetGraphics resizes the canvas inside the EGFX backend and no
@@ -2398,6 +2453,7 @@ struct ConnectParams {
     gpu_backend: Option<crate::gpu::GlBackend>,
     frame_ack_policy: FrameAckPolicy,
     avc_thin_client: bool,
+    graphics_reset: Arc<Mutex<Option<(u32, u32)>>>,
     /// Set when this connection follows a Server Redirection PDU.
     redirect: Option<RedirectConnector>,
     /// `Some` when the `enable_audio_playback` extension is on and Web Audio is available.
@@ -2458,6 +2514,7 @@ async fn connect(
         gpu_backend,
         frame_ack_policy,
         avc_thin_client,
+        graphics_reset,
         redirect,
         rdpsnd_backend,
     }: ConnectParams,
@@ -2579,6 +2636,7 @@ async fn connect(
                 h264: bool,
                 avc_thin_client: bool,
                 logged_first_frame: bool,
+                graphics_reset: Arc<Mutex<Option<(u32, u32)>>>,
             }
 
             impl GraphicsPipelineHandler for WebEgfxHandler {
@@ -2601,6 +2659,9 @@ async fn connect(
                     // Proves a resize took the ResetGraphics path rather than a
                     // deactivate-reactivate round trip.
                     info!(width, height, "EGFX ResetGraphics");
+                    if let Ok(mut reset) = self.graphics_reset.lock() {
+                        *reset = Some((width, height));
+                    }
                 }
 
                 fn on_frame_complete(&mut self, frame_id: u32) {
@@ -2625,6 +2686,7 @@ async fn connect(
                 h264: h264_decoder.is_some(),
                 avc_thin_client,
                 logged_first_frame: false,
+                graphics_reset,
             };
             let graphics = GraphicsPipelineClient::new(Box::new(handler), h264_decoder)
                 .with_frame_ack_policy(frame_ack_policy, crate::clock_ms);
@@ -2911,6 +2973,49 @@ fn fit_h264_desktop(width: u32, height: u32) -> (u32, u32) {
     (fitted_width, fitted_height)
 }
 
+/// A Display Control monitor layout the session asks for, already fitted and adjusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResizeRequest {
+    width: u32,
+    height: u32,
+    scale_factor: Option<u32>,
+    physical_size: Option<(u32, u32)>,
+}
+
+/// Which resize requests go to the server.
+///
+/// The page repeats a request (about once a second while the window settles), and Windows
+/// answers each layout it receives with a ResetGraphics, a full repaint, even one that
+/// changes nothing. Windows also ignores layouts while the user logs on, then resets to the
+/// size it connected at. So a request that repeats the last one sent for the size the
+/// desktop already has is dropped, and a reset to any other size than the wanted one sends
+/// it again.
+#[derive(Debug, Default)]
+struct ResizeTracker {
+    wanted: Option<ResizeRequest>,
+    last_sent: Option<ResizeRequest>,
+}
+
+impl ResizeTracker {
+    /// Records `request` as the wanted layout; returns it when it should be sent, given the
+    /// desktop's current size.
+    fn request(&mut self, request: ResizeRequest, desktop: (u32, u32)) -> Option<ResizeRequest> {
+        self.wanted = Some(request);
+        let applied = self.last_sent == Some(request) && desktop == (request.width, request.height);
+        (!applied).then_some(request)
+    }
+
+    /// `request` went out to the server.
+    fn sent(&mut self, request: ResizeRequest) {
+        self.last_sent = Some(request);
+    }
+
+    /// The server reset its graphics to `size`: the wanted layout, when that is not it.
+    fn reset(&mut self, size: (u32, u32)) -> Option<ResizeRequest> {
+        self.wanted.filter(|wanted| (wanted.width, wanted.height) != size)
+    }
+}
+
 #[expect(clippy::as_conversions, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn f64_to_u16_saturating_cast(value: f64) -> u16 {
     value as u16
@@ -2919,6 +3024,75 @@ fn f64_to_u16_saturating_cast(value: f64) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resize_request(width: u32, height: u32) -> ResizeRequest {
+        ResizeRequest {
+            width,
+            height,
+            scale_factor: Some(200),
+            physical_size: None,
+        }
+    }
+
+    #[test]
+    fn a_repeated_request_for_the_current_size_is_not_sent() {
+        let mut tracker = ResizeTracker::default();
+        let request = resize_request(4096, 1632);
+        assert_eq!(tracker.request(request, (3840, 2160)), Some(request));
+        tracker.sent(request);
+        assert_eq!(
+            tracker.request(request, (4096, 1632)),
+            None,
+            "the desktop already has it"
+        );
+    }
+
+    #[test]
+    fn a_request_is_repeated_until_it_is_sent() {
+        // Display Control not ready yet: the caller could not send it.
+        let mut tracker = ResizeTracker::default();
+        let request = resize_request(4096, 1632);
+        assert_eq!(tracker.request(request, (3840, 2160)), Some(request));
+        assert_eq!(tracker.request(request, (3840, 2160)), Some(request));
+    }
+
+    #[test]
+    fn a_request_the_server_has_not_applied_is_sent_again() {
+        let mut tracker = ResizeTracker::default();
+        let request = resize_request(4096, 1632);
+        tracker.request(request, (3840, 2160));
+        tracker.sent(request);
+        assert_eq!(tracker.request(request, (3840, 2160)), Some(request));
+    }
+
+    #[test]
+    fn a_new_scale_factor_is_sent_at_the_same_size() {
+        let mut tracker = ResizeTracker::default();
+        let request = resize_request(4096, 1632);
+        tracker.request(request, (3840, 2160));
+        tracker.sent(request);
+        let rescaled = ResizeRequest {
+            scale_factor: Some(100),
+            ..request
+        };
+        assert_eq!(tracker.request(rescaled, (4096, 1632)), Some(rescaled));
+    }
+
+    #[test]
+    fn a_reset_to_another_size_resends_the_wanted_one() {
+        // Windows ignores layouts during logon, then resets to the size it connected at.
+        let mut tracker = ResizeTracker::default();
+        let request = resize_request(4096, 1467);
+        tracker.request(request, (3840, 2160));
+        tracker.sent(request);
+        assert_eq!(tracker.reset((3840, 2160)), Some(request));
+        assert_eq!(tracker.reset((4096, 1467)), None, "the reset applied it");
+    }
+
+    #[test]
+    fn a_reset_before_any_request_sends_nothing() {
+        assert_eq!(ResizeTracker::default().reset((3840, 2160)), None);
+    }
 
     #[test]
     fn h264_desktop_keeps_sizes_windows_encodes() {
