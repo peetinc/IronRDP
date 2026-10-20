@@ -50,6 +50,12 @@ impl Volume {
         right: 0xFFFF,
     };
 
+    /// The volume actually played: silence while the user has muted this browser, the
+    /// server's volume otherwise. Muting never changes what the server set.
+    pub(crate) fn heard(self, muted: bool) -> Self {
+        if muted { Self { left: 0, right: 0 } } else { self }
+    }
+
     /// Linear gain per output channel. Same lane mapping as the native backend: left on
     /// channel 0, right on channel 1; mono takes the left level.
     pub(crate) fn gains(self) -> [f32; 2] {
@@ -334,6 +340,17 @@ mod tests {
         let audio = decode_fresh(&pcm(2, 44100), &le(&[16384, 16384]), volume).expect("decodes");
         assert_eq!(audio.channels[0], vec![0.5]);
         assert_eq!(audio.channels[1], vec![0.0]);
+    }
+
+    #[test]
+    fn muting_silences_every_lane_and_unmuting_restores_the_server_volume() {
+        let volume = Volume {
+            left: 0xFFFF,
+            right: 0x8000,
+        };
+        let muted = decode_fresh(&pcm(2, 44100), &le(&[16384, 16384]), volume.heard(true)).expect("decodes");
+        assert_eq!(muted.channels, vec![vec![0.0], vec![0.0]]);
+        assert_eq!(volume.heard(false), volume);
     }
 
     #[test]

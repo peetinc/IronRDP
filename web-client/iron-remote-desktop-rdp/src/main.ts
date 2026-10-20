@@ -243,5 +243,6 @@ export {
     printerDeviceId,
     printerDriverName,
     driveShare,
+    audioMuted,
 } from './extensions';
 export type { PrintJobStreamCallbacks, DriveShareParams } from './extensions';

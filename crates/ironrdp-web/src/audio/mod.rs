@@ -38,6 +38,8 @@ const MAX_AAC_FAILURES: u32 = 3;
 pub(crate) struct Output {
     player: Player,
     volume: Volume,
+    /// Set by the page (the `audio_muted` extension): plays silence, leaving `volume` alone.
+    muted: Rc<Cell<bool>>,
     /// Decode target reused across blocks.
     decoded: DecodedAudio,
 }
@@ -48,6 +50,7 @@ impl Output {
         let Self {
             player,
             volume,
+            muted,
             decoded,
         } = self;
 
@@ -70,7 +73,8 @@ impl Output {
         let sample_rate = data.sample_rate() as u32;
         decoded.begin(sample_rate, n_channels, frames);
 
-        for (index, (channel, gain)) in decoded.channels.iter_mut().zip(volume.gains()).enumerate() {
+        let gains = volume.heard(muted.get()).gains();
+        for (index, (channel, gain)) in decoded.channels.iter_mut().zip(gains).enumerate() {
             channel.resize(frames, 0.0);
             let options = Object::new();
             // Setting a property on a fresh plain object cannot fail.
@@ -116,12 +120,13 @@ unsafe impl Send for WasmRdpsndBackend {}
 
 impl WasmRdpsndBackend {
     /// `worklet_url` serves the playout worklet module from the page's origin; `None` loads
-    /// it from a Blob URL (see [`Player::new`]).
-    pub(crate) fn new(worklet_url: Option<String>) -> anyhow::Result<Self> {
+    /// it from a Blob URL (see [`Player::new`]). While `muted` is set, blocks play as silence.
+    pub(crate) fn new(worklet_url: Option<String>, muted: Rc<Cell<bool>>) -> anyhow::Result<Self> {
         Ok(Self {
             output: Rc::new(RefCell::new(Output {
                 player: Player::new(worklet_url)?,
                 volume: Volume::FULL,
+                muted,
                 decoded: DecodedAudio::default(),
             })),
             aac_supported: aac::probe_support(),
@@ -209,9 +214,10 @@ impl RdpsndClientHandler for WasmRdpsndBackend {
         let Output {
             player,
             volume,
+            muted,
             decoded,
         } = &mut *output;
-        if codec::decode(format, &data, *volume, decoded) {
+        if codec::decode(format, &data, volume.heard(muted.get()), decoded) {
             player.enqueue(decoded);
         } else {
             trace!(len = data.len(), "Dropping undecodable RDPSND block");

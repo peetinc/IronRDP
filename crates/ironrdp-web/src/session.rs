@@ -161,6 +161,9 @@ struct SessionBuilderInner {
     /// Same-origin URL of `playout_worklet.js`, for pages whose CSP `script-src` does not
     /// allow `blob:`; set by the `audio_worklet_url` extension.
     audio_worklet_url: Option<String>,
+    /// Whether the page has muted the session's sound (the `audio_muted` runtime
+    /// extension). Shared with each connection's RDPSND backend, so it survives redirects.
+    audio_muted: Rc<Cell<bool>>,
     enable_credssp: bool,
     enable_standard_rdp_security: bool,
     enable_server_pointer: bool,
@@ -224,6 +227,7 @@ impl Default for SessionBuilderInner {
             graphics_reset: Arc::new(Mutex::new(None)),
             enable_audio_playback: false,
             audio_worklet_url: None,
+            audio_muted: Rc::new(Cell::new(false)),
             performance_flags: None,
             desktop_scale_factor: None,
             enable_credssp: true,
@@ -656,7 +660,11 @@ impl SessionBuilder {
         // connection: fall back to the no-op backend and leave `INFO_NOAUDIOPLAYBACK` set, so the
         // server neither redirects audio nor plays it (MS-RDPBCGR 2.2.1.11.1.1).
         let rdpsnd_backend = if self.0.borrow().enable_audio_playback {
-            match WasmRdpsndBackend::new(self.0.borrow().audio_worklet_url.clone()) {
+            let (worklet_url, muted) = {
+                let inner = self.0.borrow();
+                (inner.audio_worklet_url.clone(), Rc::clone(&inner.audio_muted))
+            };
+            match WasmRdpsndBackend::new(worklet_url, muted) {
                 Ok(backend) => Some(backend),
                 Err(error) => {
                     warn!(%error, "Audio playback unavailable; continuing without sound");
@@ -667,6 +675,7 @@ impl SessionBuilder {
             None
         };
         config.enable_audio_playback = rdpsnd_backend.is_some();
+        let has_audio = rdpsnd_backend.is_some();
 
         // Created before anything draws: the canvas carries one context type for good.
         let gpu_backend = if use_egfx && self.0.borrow().use_gpu_rendering {
@@ -889,6 +898,7 @@ impl SessionBuilder {
             printer: RefCell::new(Some(printer)),
             drive_slot,
             drive_device_id: resolve_drive_device_id(DRIVE_DEVICE_ID, printer_device_id),
+            has_audio,
         })
     }
 }
@@ -1041,6 +1051,8 @@ pub(crate) struct Session {
     /// Device id a mid-session drive is announced under — the same value `connect` resolves,
     /// recomputed here from the same pure function of the printer id.
     drive_device_id: u32,
+    /// Whether this connection plays sound: audio was asked for and the browser could start it.
+    has_audio: bool,
 }
 
 impl Session {
@@ -1940,6 +1952,15 @@ impl iron_remote_desktop::Session for Session {
         // to keep the iron-remote-desktop trait surface protocol-agnostic.
         iron_remote_desktop::extension_match! {
             match ext;
+            |audio_muted: JsValue| {
+                // Mutes this browser only: the server keeps sending sound. Answers whether
+                // the session plays sound at all, so the page can show a mute control or not.
+                let muted = audio_muted
+                    .as_bool()
+                    .ok_or_else(|| IronError::from(anyhow::anyhow!("audio_muted expects a boolean")))?;
+                self.builder.0.borrow().audio_muted.set(muted);
+                return Ok(JsValue::from_bool(self.has_audio));
+            };
             |request_file_contents: JsValue| {
                 let obj = into_object(request_file_contents)?;
                 let stream_id = get_u32(&obj, "stream_id")?;

@@ -125,6 +125,12 @@ export function submitFileContents(params: { stream_id: number; is_error: boolea
     return new Extension('submit_file_contents', params as unknown);
 }
 
+// Mutes this browser only; the server keeps sending sound. Returns whether the session has
+// sound at all (false when audio was off or could not start), for showing a mute control.
+export function audioMuted(muted: boolean): Extension {
+    return new Extension('audio_muted', muted);
+}
+
 export function initiateFileCopy(files: FileInfo[]): Extension {
     return new Extension('initiate_file_copy', files as unknown);
 }
