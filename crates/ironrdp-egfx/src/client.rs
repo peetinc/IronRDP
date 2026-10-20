@@ -1965,6 +1965,8 @@ impl DvcProcessor for GraphicsPipelineClient {
         self.queued_frames = 0;
         self.queued_bytes = 0;
         self.just_deferred = None;
+        self.progressive_in_flight = 0;
+        self.just_deferred_progressive = None;
         self.handler.on_close();
     }
 
@@ -3725,6 +3727,17 @@ mod tests {
         DvcProcessor::close(&mut client, 0);
 
         assert!(!client.is_awaiting_decoder());
+    }
+
+    #[test]
+    fn closing_drops_progressive_jobs() {
+        let (mut client, _state, _h264) = async_progressive_client(4);
+        client.dispatch_pdu(progressive_update(1)).expect("progressive job");
+        assert!(client.is_awaiting_decoder());
+
+        DvcProcessor::close(&mut client, 0);
+
+        assert!(!client.is_awaiting_decoder(), "no job outlives the channel");
     }
 
     /// What a [`PipelineDecoder`] has been asked to do, and the results it hands back in order.
