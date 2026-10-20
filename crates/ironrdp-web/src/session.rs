@@ -466,6 +466,13 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 }
 
 impl SessionBuilder {
+    /// Whether this session asks Windows for full-screen H.264, so its desktop must fit
+    /// [`fit_h264_desktop`].
+    fn h264_desktop_limit(&self) -> bool {
+        let inner = self.0.borrow();
+        inner.use_egfx && inner.use_h264 && inner.avc_thin_client
+    }
+
     /// Connects, either fresh (`redirect` and `reuse` both `None`) or following a
     /// Server Redirection PDU, in which case the live session's input channel and
     /// drive slot carry over so nothing JS holds goes stale.
@@ -479,7 +486,7 @@ impl SessionBuilder {
             vmconnect,
             kdc_proxy_url,
             client_name,
-            desktop_size,
+            mut desktop_size,
             render_canvas,
             set_cursor_style_callback,
             set_cursor_style_callback_context,
@@ -585,6 +592,23 @@ impl SessionBuilder {
         // the DRDYNVC attach below decides whether to register the channel.
         // `legacy_graphics` asks for a codec-free session, so it wins over EGFX.
         let use_egfx = self.0.borrow().use_egfx && !legacy_graphics;
+        if use_egfx && self.h264_desktop_limit() {
+            let (width, height) = fit_h264_desktop(u32::from(desktop_size.width), u32::from(desktop_size.height));
+            let (width, height) = (
+                u16::try_from(width).unwrap_or(desktop_size.width),
+                u16::try_from(height).unwrap_or(desktop_size.height),
+            );
+            if (width, height) != (desktop_size.width, desktop_size.height) {
+                info!(
+                    requested_width = desktop_size.width,
+                    requested_height = desktop_size.height,
+                    width,
+                    height,
+                    "Fitting the desktop to what Windows encodes as H.264"
+                );
+                desktop_size = DesktopSize { width, height };
+            }
+        }
 
         let mut config = build_config(
             username,
@@ -1258,6 +1282,11 @@ impl Session {
                                 // Adjusting here keeps the request and the remembered size in
                                 // agreement, and a size outside the range (a pane under 200px)
                                 // no longer fails the encode, which used to end the session.
+                                let (width, height) = if self.builder.h264_desktop_limit() {
+                                    fit_h264_desktop(width, height)
+                                } else {
+                                    (width, height)
+                                };
                                 let (width, height) = MonitorLayoutEntry::adjust_display_size(width, height);
                                 match active_stage.encode_resize(width, height, scale_factor, physical_size) {
                                     Some(Ok(response_frame)) => {
@@ -2855,6 +2884,33 @@ fn egfx_capabilities(h264: bool, avc_thin_client: bool) -> Vec<CapabilitySet> {
     caps
 }
 
+/// Widest and tallest desktop Windows encodes as H.264. Seen live: at 4150 wide it confirms
+/// `AVC_DISABLED`, and a session resized past 4096 wide gets frames in an undocumented codec
+/// (`0x0001`), which ends it.
+const H264_MAX_SIDE: u32 = 4096;
+
+/// Most 16x16 macroblocks in an H.264 frame at level 5.1/5.2 (4096x2304).
+const H264_MAX_MACROBLOCKS: u32 = 36_864;
+
+/// The largest desktop of `width` by `height`'s shape that Windows encodes as H.264: the
+/// size itself when it fits, otherwise scaled down, with an even width (RDPEDISP 2.2.2.2.1).
+fn fit_h264_desktop(width: u32, height: u32) -> (u32, u32) {
+    let macroblocks = |width: u32, height: u32| width.div_ceil(16) * height.div_ceil(16);
+    if width <= H264_MAX_SIDE && height <= H264_MAX_SIDE && macroblocks(width, height) <= H264_MAX_MACROBLOCKS {
+        return (width, height);
+    }
+    let scaled = |numerator: u32, value: u32, denominator: u32| {
+        u32::try_from(u64::from(value) * u64::from(numerator) / u64::from(denominator.max(1))).unwrap_or(u32::MAX)
+    };
+    let mut fitted_width = width.min(H264_MAX_SIDE).min(scaled(H264_MAX_SIDE, width, height)) & !1;
+    let mut fitted_height = scaled(fitted_width, height, width);
+    while 2 < fitted_width && H264_MAX_MACROBLOCKS < macroblocks(fitted_width, fitted_height) {
+        fitted_width -= 2;
+        fitted_height = scaled(fitted_width, height, width);
+    }
+    (fitted_width, fitted_height)
+}
+
 #[expect(clippy::as_conversions, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn f64_to_u16_saturating_cast(value: f64) -> u16 {
     value as u16
@@ -2863,6 +2919,48 @@ fn f64_to_u16_saturating_cast(value: f64) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn h264_desktop_keeps_sizes_windows_encodes() {
+        assert_eq!(fit_h264_desktop(3840, 2160), (3840, 2160));
+        assert_eq!(fit_h264_desktop(4096, 1468), (4096, 1468));
+        assert_eq!(fit_h264_desktop(1280, 720), (1280, 720));
+    }
+
+    #[test]
+    fn h264_desktop_scales_wide_sizes_to_4096_keeping_their_shape() {
+        // Both seen live: Windows refused H.264 at 4150 wide, and sent an undocumented codec
+        // when a session resized to these.
+        assert_eq!(fit_h264_desktop(4150, 1468), (4096, 1448));
+        assert_eq!(fit_h264_desktop(5120, 2040), (4096, 1632));
+        assert_eq!(fit_h264_desktop(5040, 1806), (4096, 1467));
+    }
+
+    #[test]
+    fn h264_desktop_respects_the_macroblock_budget() {
+        assert_eq!(fit_h264_desktop(4096, 4096), (3072, 3072));
+    }
+
+    #[test]
+    fn h264_desktop_always_fits_and_only_shrinks() {
+        for width in (200..=8192).step_by(331) {
+            for height in (200..=8192).step_by(317) {
+                let (fitted_width, fitted_height) = fit_h264_desktop(width, height);
+                assert!(fitted_width <= width && fitted_height <= height, "{width}x{height}");
+                assert!(fitted_width <= 4096 && fitted_height <= 4096, "{width}x{height}");
+                assert!(
+                    fitted_width.div_ceil(16) * fitted_height.div_ceil(16) <= 36_864,
+                    "{width}x{height}"
+                );
+                if (fitted_width, fitted_height) != (width, height) {
+                    assert_eq!(fitted_width % 2, 0, "{width}x{height}: odd width");
+                    let ratio = f64::from(width) / f64::from(height);
+                    let fitted_ratio = f64::from(fitted_width) / f64::from(fitted_height);
+                    assert!((ratio - fitted_ratio).abs() / ratio < 0.01, "{width}x{height}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn avc_thin_client_sets_the_flag_on_the_10_7_set_only() {
