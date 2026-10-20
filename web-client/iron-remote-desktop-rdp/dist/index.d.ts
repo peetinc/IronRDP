@@ -1,3 +1,5 @@
+export declare function audioMuted(muted: boolean): Extension;
+
 /**
  * URL of the audio playout worklet module (`playout_worklet.js`, shipped next to this
  * package's bundle), for pages whose Content Security Policy does not allow `blob:` in
