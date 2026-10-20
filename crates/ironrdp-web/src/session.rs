@@ -1433,10 +1433,15 @@ impl Session {
                 return Err(anyhow::anyhow!(reason).into());
             }
 
-            // Windows ignores layouts while the user logs on, then resets to the size it
-            // connected at: ask again for the wanted one.
+            // Windows opens Display Control only once the user has logged on, so a layout
+            // asked for before then goes out when it can; and after a reset to another size
+            // (the end of logon resets to the size the session connected at) the wanted
+            // layout is asked for again.
             let reset = graphics_reset.lock().ok().and_then(|mut reset| reset.take());
-            if let Some(request) = reset.and_then(|size| resize_tracker.reset(size)) {
+            if let Some(request) = reset
+                .and_then(|size| resize_tracker.reset(size))
+                .or_else(|| resize_tracker.unsent())
+            {
                 match active_stage.encode_resize(
                     request.width,
                     request.height,
@@ -1447,7 +1452,7 @@ impl Session {
                         info!(
                             width = request.width,
                             height = request.height,
-                            "Asking again for the wanted desktop size after a graphics reset"
+                            "Sent the wanted desktop size"
                         );
                         self.writer_tx
                             .borrow()
@@ -1458,7 +1463,10 @@ impl Session {
                     }
                     Some(Err(error)) => {
                         warn!(%error, width = request.width, height = request.height, "Resize request could not be encoded, ignoring");
+                        // Given up on, not retried on every pass.
+                        resize_tracker.sent(request);
                     }
+                    // Display Control is not ready yet: tried again on the next pass.
                     None => {}
                 }
             }
@@ -2989,11 +2997,13 @@ struct ResizeRequest {
 /// changes nothing. Windows also ignores layouts while the user logs on, then resets to the
 /// size it connected at. So a request that repeats the last one sent for the size the
 /// desktop already has is dropped, and a reset to any other size than the wanted one sends
-/// it again.
+/// it again, once: Windows may settle on another size than asked.
 #[derive(Debug, Default)]
 struct ResizeTracker {
     wanted: Option<ResizeRequest>,
     last_sent: Option<ResizeRequest>,
+    /// The wanted layout already asked for again after a reset.
+    resent: Option<ResizeRequest>,
 }
 
 impl ResizeTracker {
@@ -3010,9 +3020,18 @@ impl ResizeTracker {
         self.last_sent = Some(request);
     }
 
+    /// The wanted layout, when it has not gone out yet (Display Control was not ready).
+    fn unsent(&self) -> Option<ResizeRequest> {
+        self.wanted.filter(|wanted| self.last_sent != Some(*wanted))
+    }
+
     /// The server reset its graphics to `size`: the wanted layout, when that is not it.
     fn reset(&mut self, size: (u32, u32)) -> Option<ResizeRequest> {
-        self.wanted.filter(|wanted| (wanted.width, wanted.height) != size)
+        let wanted = self
+            .wanted
+            .filter(|wanted| (wanted.width, wanted.height) != size && self.resent != Some(*wanted))?;
+        self.resent = Some(wanted);
+        Some(wanted)
     }
 }
 
@@ -3087,6 +3106,42 @@ mod tests {
         tracker.sent(request);
         assert_eq!(tracker.reset((3840, 2160)), Some(request));
         assert_eq!(tracker.reset((4096, 1467)), None, "the reset applied it");
+    }
+
+    #[test]
+    fn a_request_not_yet_sent_stays_unsent_until_it_is() {
+        // Windows opens Display Control only once the user has logged on.
+        let mut tracker = ResizeTracker::default();
+        assert_eq!(tracker.unsent(), None);
+        let request = resize_request(4096, 1694);
+        tracker.request(request, (3840, 2160));
+        assert_eq!(tracker.unsent(), Some(request));
+        tracker.sent(request);
+        assert_eq!(tracker.unsent(), None);
+        let next = resize_request(4096, 1302);
+        tracker.request(next, (4096, 1694));
+        assert_eq!(tracker.unsent(), Some(next));
+    }
+
+    #[test]
+    fn a_reset_resends_the_wanted_layout_once() {
+        // Windows may settle on another size than asked: asking after every reset would
+        // loop, a full repaint each round.
+        let mut tracker = ResizeTracker::default();
+        let request = resize_request(4096, 1467);
+        tracker.request(request, (3840, 2160));
+        tracker.sent(request);
+        assert_eq!(tracker.reset((4090, 1460)), Some(request));
+        tracker.sent(request);
+        assert_eq!(tracker.reset((4090, 1460)), None, "asked once already");
+        let next = resize_request(4096, 1302);
+        tracker.request(next, (4090, 1460));
+        tracker.sent(next);
+        assert_eq!(
+            tracker.reset((4090, 1460)),
+            Some(next),
+            "a new layout gets its own retry"
+        );
     }
 
     #[test]
