@@ -3445,7 +3445,7 @@ class Un {
   }
   invokeExtension(e) {
     var _a2;
-    (_a2 = this.session) == null ? void 0 : _a2.invokeExtension(e);
+    return (_a2 = this.session) == null ? void 0 : _a2.invokeExtension(e);
   }
   releaseAllInputs() {
     var _a2;
@@ -3635,7 +3635,7 @@ class Bn {
     return await this.clipboardService.sendClipboardData();
   }
   invokeExtension(e) {
-    this.remoteDesktopService.invokeExtension(e);
+    return this.remoteDesktopService.invokeExtension(e);
   }
   enableFileTransfer(e) {
     const i = e.onUploadStarted, r = e.onUploadFinished;
