@@ -454,6 +454,9 @@ pub struct GraphicsPipelineClient {
     in_flight: usize,
     /// How many `EndFrame` commands `pending` holds: whole frames the client is behind.
     queued_frames: usize,
+    /// Encoded size of the [`Pending::Pdu`] and [`Pending::Forwarded`] commands `pending`
+    /// holds, bounded by [`MAX_DEFERRED_BACKLOG_BYTES`].
+    queued_bytes: usize,
     /// Set by [`Self::submit_avc420`] when a picture is not applied at once, for the caller
     /// to queue.
     just_deferred: Option<DeferredAvc420>,
@@ -540,12 +543,14 @@ struct DeferredProgressive {
     surface_id: u16,
 }
 
-/// Most PDUs held behind a deferred H.264 decode.
+/// Most bytes of commands held behind a deferred decode (their encoded size).
 ///
 /// The server's frame-acknowledgement window normally bounds the backlog, because an
 /// `EndFrame` is only acknowledged once it replays; this caps what a server that ignores
-/// that window can make the client buffer.
-const MAX_DEFERRED_BACKLOG: usize = 4096;
+/// that window can make the client buffer. It counts bytes, not commands: a cache-heavy
+/// desktop sends hundreds of small commands a frame, so a few frames behind a slow decode
+/// is thousands of them.
+const MAX_DEFERRED_BACKLOG_BYTES: usize = 64 * 1024 * 1024;
 
 /// What is needed to apply an AVC420 frame once an asynchronous decoder delivers it.
 struct DeferredAvc420 {
@@ -587,6 +592,7 @@ impl GraphicsPipelineClient {
             pending: VecDeque::new(),
             in_flight: 0,
             queued_frames: 0,
+            queued_bytes: 0,
             just_deferred: None,
             submitting_ahead: false,
             progressive_in_flight: 0,
@@ -755,6 +761,7 @@ impl GraphicsPipelineClient {
                         Some(Pending::Forwarded(pdu)) => (pdu, true),
                         _ => break,
                     };
+                    self.queued_bytes -= pdu.size();
                     if matches!(pdu, GfxPdu::EndFrame(_)) {
                         self.queued_frames -= 1;
                     }
@@ -809,7 +816,7 @@ impl GraphicsPipelineClient {
             }
             return Ok(replies);
         }
-        if MAX_DEFERRED_BACKLOG <= self.pending.len() - self.in_flight - self.progressive_in_flight {
+        if MAX_DEFERRED_BACKLOG_BYTES < self.queued_bytes + pdu.size() {
             // DIAG
             let front = match self.pending.front() {
                 Some(Pending::Avc420(_)) => "avc420".to_owned(),
@@ -818,7 +825,11 @@ impl GraphicsPipelineClient {
                 Some(Pending::Forwarded(pdu)) => format!("forwarded {pdu:?}").chars().take(80).collect(),
                 None => "none".to_owned(),
             };
-            let progressive_entries = self.pending.iter().filter(|e| matches!(e, Pending::Progressive(_))).count();
+            let progressive_entries = self
+                .pending
+                .iter()
+                .filter(|e| matches!(e, Pending::Progressive(_)))
+                .count();
             let avc_entries = self.pending.iter().filter(|e| matches!(e, Pending::Avc420(_))).count();
             warn!(
                 pending = self.pending.len(),
@@ -831,11 +842,12 @@ impl GraphicsPipelineClient {
                 %front,
                 "DIAG backlog overflow"
             );
-            return Err(pdu_other_err!("too many PDUs held behind a deferred H.264 decode"));
+            return Err(pdu_other_err!("too many bytes held behind a deferred decode"));
         }
         if matches!(pdu, GfxPdu::EndFrame(_)) {
             self.queued_frames += 1;
         }
+        self.queued_bytes += pdu.size();
         self.pending.push_back(Pending::Pdu(pdu));
         self.submit_ahead()?;
 
@@ -843,14 +855,7 @@ impl GraphicsPipelineClient {
         // applies, an unthrottled server has queued far more.
         let mut replies = Vec::new();
         if self.acks_suspended && (RESUME_AFTER_FRAMES <= self.queued_frames || RESUME_AT <= self.pending.len()) {
-            let queued_bytes: usize = self
-                .pending
-                .iter()
-                .map(|entry| match entry {
-                    Pending::Pdu(pdu) | Pending::Forwarded(pdu) => pdu.size(),
-                    Pending::Avc420(_) | Pending::Progressive(_) => 0,
-                })
-                .sum();
+            let queued_bytes = self.queued_bytes;
             let queue_depth = QueueDepth::AvailableBytes(u32::try_from(queued_bytes).unwrap_or(u32::MAX - 1).max(1));
             info!(
                 queued = self.pending.len(),
@@ -907,6 +912,9 @@ impl GraphicsPipelineClient {
                     if limit <= self.progressive_in_flight {
                         break;
                     }
+                    if let Pending::Pdu(pdu) = &self.pending[index] {
+                        self.queued_bytes -= pdu.size();
+                    }
                     let Some(Pending::Pdu(GfxPdu::WireToSurface2(pdu))) = self.pending.remove(index) else {
                         break;
                     };
@@ -959,6 +967,9 @@ impl GraphicsPipelineClient {
             if !is_h264 {
                 index += 1;
                 continue;
+            }
+            if let Pending::Pdu(pdu) = &self.pending[index] {
+                self.queued_bytes -= pdu.size();
             }
             let Some(Pending::Pdu(GfxPdu::WireToSurface1(wire))) = self.pending.remove(index) else {
                 break;
@@ -1977,6 +1988,7 @@ impl DvcProcessor for GraphicsPipelineClient {
         self.pending.clear();
         self.in_flight = 0;
         self.queued_frames = 0;
+        self.queued_bytes = 0;
         self.just_deferred = None;
         self.handler.on_close();
     }
@@ -3684,11 +3696,47 @@ mod tests {
             .dispatch_pdu(avc420_update(&deferred_rect(0, 0, 16, 16)))
             .expect("deferred decode");
 
-        let fill = red_fill(&deferred_rect(0, 0, 1, 1));
-        for _ in 0..MAX_DEFERRED_BACKLOG {
+        // About 64 KiB each.
+        let fill = GfxPdu::SolidFill(SolidFillPdu {
+            surface_id: DEFERRED_SURFACE,
+            fill_pixel: crate::pdu::Color {
+                b: 0,
+                g: 0,
+                r: 0xFF,
+                xa: 0xFF,
+            },
+            rectangles: vec![deferred_rect(0, 0, 1, 1); 8192],
+        });
+        for _ in 0..MAX_DEFERRED_BACKLOG_BYTES / fill.size() {
             client.dispatch_pdu(fill.clone()).expect("within the backlog limit");
         }
         assert!(client.dispatch_pdu(fill).is_err(), "one more PDU overflows the backlog");
+    }
+
+    #[test]
+    fn deferred_backlog_holds_many_small_commands() {
+        // A cache-heavy desktop sends about 500 commands a frame: 20 frames of them are a
+        // normal backlog behind one slow decode.
+        let (mut client, _state) = deferred_client();
+        client.dispatch_pdu(deferred_start_frame(1)).expect("start frame");
+        client
+            .dispatch_pdu(avc420_update(&deferred_rect(0, 0, 16, 16)))
+            .expect("deferred decode");
+
+        let fill = red_fill(&deferred_rect(0, 0, 1, 1));
+        for frame_id in 2..22 {
+            client
+                .dispatch_pdu(deferred_start_frame(frame_id))
+                .expect("start frame");
+            for _ in 0..500 {
+                client
+                    .dispatch_pdu(fill.clone())
+                    .expect("small commands fit the backlog");
+            }
+            client
+                .dispatch_pdu(GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id }))
+                .expect("end frame");
+        }
     }
 
     #[test]
