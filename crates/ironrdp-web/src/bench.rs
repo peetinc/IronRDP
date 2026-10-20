@@ -11,7 +11,6 @@ use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp_egfx::decode::{DecodedTiles, ProgressiveBackend, ProgressiveControl, ProgressiveJobError};
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast as _; // DIAG
 use web_sys::HtmlCanvasElement;
 
 use crate::canvas::{Canvas, Presenter};
@@ -321,31 +320,6 @@ impl EgfxBench {
                 }
             }
             message_ms.push(now() - message_started - (decoder_wait_ms - wait_before));
-            // DIAG
-            if index % 100 == 0 || index < 600 {
-                let global = js_sys::global();
-                let memory = Reflect::get(&global, &JsValue::from_str("performance"))
-                    .and_then(|p| Reflect::get(&p, &JsValue::from_str("memory")))
-                    .ok();
-                let heap = |key: &str| memory.as_ref().and_then(|m| Reflect::get(m, &JsValue::from_str(key)).ok()).and_then(|v| v.as_f64()).unwrap_or(-1.0) / 1e6;
-                let main_wasm = wasm_bindgen::memory().unchecked_into::<js_sys::WebAssembly::Memory>().buffer().unchecked_into::<js_sys::ArrayBuffer>().byte_length();
-                let line = format!(
-                    "[DIAG] i={index} t={:.0} queued={} awaiting={} mainWasmMB={:.1} jsHeapMB={:.1}/{:.1} {}",
-                    now() - started,
-                    client.queued_len(),
-                    client.is_awaiting_decoder(),
-                    f64::from(main_wasm) / 1e6,
-                    heap("usedJSHeapSize"),
-                    heap("totalJSHeapSize"),
-                    crate::rfx_worker::diag(),
-                );
-                let line = format!("{line} msgBytes={} msgMs={:.1}", message.len(), message_ms.last().copied().unwrap_or(0.0));
-                let post = js_sys::Function::new_with_args(
-                    "l",
-                    "const x=new XMLHttpRequest();x.open('POST','http://localhost:9097',false);x.setRequestHeader('content-type','application/json');x.send(JSON.stringify(['[DIAG-SYNC] '+l]));",
-                );
-                let _ = post.call1(&JsValue::NULL, &JsValue::from_str(&line));
-            }
             let (ms, calls) = crate::gpu::take_upload_stats();
             upload_ms += ms;
             upload_calls += calls;

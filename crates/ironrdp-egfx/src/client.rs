@@ -817,31 +817,6 @@ impl GraphicsPipelineClient {
             return Ok(replies);
         }
         if MAX_DEFERRED_BACKLOG_BYTES < self.queued_bytes + pdu.size() {
-            // DIAG
-            let front = match self.pending.front() {
-                Some(Pending::Avc420(_)) => "avc420".to_owned(),
-                Some(Pending::Progressive(deferred)) => format!("progressive job={}", deferred.job),
-                Some(Pending::Pdu(pdu)) => format!("pdu {pdu:?}").chars().take(80).collect(),
-                Some(Pending::Forwarded(pdu)) => format!("forwarded {pdu:?}").chars().take(80).collect(),
-                None => "none".to_owned(),
-            };
-            let progressive_entries = self
-                .pending
-                .iter()
-                .filter(|e| matches!(e, Pending::Progressive(_)))
-                .count();
-            let avc_entries = self.pending.iter().filter(|e| matches!(e, Pending::Avc420(_))).count();
-            warn!(
-                pending = self.pending.len(),
-                in_flight = self.in_flight,
-                progressive_in_flight = self.progressive_in_flight,
-                progressive_entries,
-                avc_entries,
-                queued_frames = self.queued_frames,
-                next_progressive_job = self.next_progressive_job,
-                %front,
-                "DIAG backlog overflow"
-            );
             return Err(pdu_other_err!("too many bytes held behind a deferred decode"));
         }
         if matches!(pdu, GfxPdu::EndFrame(_)) {

@@ -36,7 +36,7 @@ function handle(message) {
             const error = wasm.rfx_submit(message.surface, message.ctx, message.width, message.height, pointer, data.length);
             wasm.rfx_free(pointer, data.length);
             if (error !== 0) {
-                self.postMessage({ type: 'result', job: message.job, error, wasmBytes: wasm.memory.buffer.byteLength, pool: pool.length }); // DIAG
+                self.postMessage({ type: 'result', job: message.job, error });
                 return;
             }
             const pixelsLength = wasm.rfx_pixels_len();
@@ -45,7 +45,7 @@ function handle(message) {
             const placements = new Int32Array(wasm.rfx_placements_len() / 4);
             placements.set(new Int32Array(wasm.memory.buffer, wasm.rfx_placements_ptr(), placements.length));
             self.postMessage(
-                { type: 'result', job: message.job, error: 0, pixels, pixelsLength, placements, wasmBytes: wasm.memory.buffer.byteLength, pool: pool.length, poolBytes: pool.reduce((a, b) => a + b.byteLength, 0) }, // DIAG
+                { type: 'result', job: message.job, error: 0, pixels, pixelsLength, placements },
                 [pixels, placements.buffer],
             );
             return;
