@@ -4,8 +4,9 @@
     // Usage: /bench?capture=mixed-17-31.bin&h264=1&gpu=1
     // verify=1 replays on the CPU and then the GPU and compares sampled pixels every 100 frames.
     // lose=1 (with gpu=1) drops the GPU context mid-run.
-    // workers=1 (with gpu=1) decodes RemoteFX in a Web Worker; verify=workers also decodes every
-    // job in-thread and compares the Worker's bytes (workerJobs, workerMismatches).
+    // workers=N (with gpu=1) decodes RemoteFX in N Web Workers, one shard each (workerBusyMs,
+    // jobsPerSecond); verify=workers also decodes every job in-thread and compares the Workers'
+    // bytes (workerJobs, workerMismatches).
     import { onMount } from 'svelte';
     import { init, EgfxBench } from '../../../static/iron-remote-desktop-rdp';
 
@@ -48,7 +49,7 @@
         const h264 = params.get('h264') === '1';
         const gpu = params.get('gpu') === '1';
         const verify = params.get('verify') === '1';
-        const workers = params.get('workers') === '1' || params.get('verify') === 'workers';
+        const workers = Number(params.get('workers') ?? (params.get('verify') === 'workers' ? 1 : 0)) || 0;
         const verifyWorkers = params.get('verify') === 'workers';
         try {
             await init('warn');

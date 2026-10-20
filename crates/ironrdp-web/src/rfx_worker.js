@@ -8,7 +8,7 @@
 //   { type: 'control', kind, surface, ctx }
 //   { type: 'return', buffer }                                a pixel buffer back for reuse
 // and gets one reply per job:
-//   { type: 'result', job, error, pixels, pixelsLength, placements }
+//   { type: 'result', job, error, pixels, pixelsLength, placements, ms }
 // `pixels` holds the packed tiles (`pixelsLength` bytes of it), `placements` five i32s per
 // placement: left, top, width, height, byte offset. Both are transferred. `error` is 0 or a
 // decode error code. A wasm trap ends the Worker; the main thread sees it as an error event.
@@ -36,12 +36,14 @@ function handle(message) {
     switch (message.type) {
         case 'submit': {
             const data = new Uint8Array(message.data);
+            const started = performance.now();
             const pointer = wasm.rfx_alloc(data.length);
             new Uint8Array(wasm.memory.buffer, pointer, data.length).set(data);
             const error = wasm.rfx_submit(message.surface, message.ctx, message.width, message.height, pointer, data.length);
             wasm.rfx_free(pointer, data.length);
+            const ms = performance.now() - started;
             if (error !== 0) {
-                self.postMessage({ type: 'result', job: message.job, error });
+                self.postMessage({ type: 'result', job: message.job, error, ms });
                 return;
             }
             const pixelsLength = wasm.rfx_pixels_len();
@@ -50,7 +52,7 @@ function handle(message) {
             const placements = new Int32Array(wasm.rfx_placements_len() / 4);
             placements.set(new Int32Array(wasm.memory.buffer, wasm.rfx_placements_ptr(), placements.length));
             self.postMessage(
-                { type: 'result', job: message.job, error: 0, pixels, pixelsLength, placements },
+                { type: 'result', job: message.job, error: 0, pixels, pixelsLength, placements, ms },
                 [pixels, placements.buffer],
             );
             return;

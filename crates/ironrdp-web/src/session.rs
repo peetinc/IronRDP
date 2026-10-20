@@ -692,7 +692,9 @@ impl SessionBuilder {
         let progressive_backend: Option<Box<dyn ProgressiveBackend>> =
             if use_egfx && gpu_backend.is_some() && self.0.borrow().rfx_workers {
                 let wake_tx = input_events_tx.clone();
-                crate::rfx_worker::WorkerProgressiveBackend::new(move || {
+                let hardware_concurrency = web_sys::window().map(|window| window.navigator().hardware_concurrency());
+                let count = crate::rfx_worker::worker_count(hardware_concurrency);
+                crate::rfx_worker::WorkerProgressiveBackend::new(count, move || {
                     // The session loop owns the receiver; a closed channel means the session ended.
                     let _ = wake_tx.unbounded_send(RdpInputEvent::GraphicsDecoded);
                 })

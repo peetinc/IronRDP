@@ -120,9 +120,31 @@ impl ProgressiveBackend for VerifyingBackend {
         let expected = self.expected.remove(&job);
         let matches = match (&result, &expected) {
             (Ok(tiles), Some(Ok((pixels, placements)))) => tiles.external.is_some_and(|handle| {
-                crate::rfx_worker::with_tiles(handle, |actual| {
-                    let actual_pixels = Uint8Array::new_with_byte_offset_and_length(&actual.pixels, 0, actual.length);
-                    actual.placements == crate::rfx_worker::placements(placements) && actual_pixels.to_vec() == *pixels
+                // The Workers' parts together, as a multiset of (rectangle, pixel bytes): each
+                // part keeps its own order, and the parts never overlap.
+                let placed = |placements: &[crate::rfx_worker::Placement], pixels: &[u8]| {
+                    placements
+                        .iter()
+                        .map(|placement| {
+                            let rect = &placement.rect;
+                            let (left, top, right, bottom) = (rect.left, rect.top, rect.right, rect.bottom);
+                            let start = usize::try_from(placement.offset).unwrap_or(usize::MAX);
+                            let len = usize::from(right - left) * usize::from(bottom - top) * 4;
+                            let bytes = pixels.get(start..start.saturating_add(len)).map(<[u8]>::to_vec);
+                            ((top, left, bottom, right), bytes)
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let mut expected = placed(&crate::rfx_worker::placements(placements), pixels);
+                expected.sort();
+                crate::rfx_worker::with_tiles(handle, |parts| {
+                    let mut actual = Vec::new();
+                    for part in parts {
+                        let bytes = Uint8Array::new_with_byte_offset_and_length(&part.pixels, 0, part.length).to_vec();
+                        actual.extend(placed(&part.placements, &bytes));
+                    }
+                    actual.sort();
+                    actual == expected
                 })
                 .unwrap_or(false)
             }),
@@ -155,8 +177,9 @@ impl GraphicsPipelineHandler for BenchHandler {
 pub struct EgfxBench {
     presenter: Presenter,
     h264: bool,
-    /// RemoteFX Progressive decodes in a Web Worker (GPU rendering only).
-    workers: bool,
+    /// RemoteFX Progressive decodes in this many Web Workers (GPU rendering only); 0 decodes
+    /// it in-thread.
+    workers: u32,
     /// With `workers`, every job is also decoded in-thread and compared.
     verify_workers: bool,
 }
@@ -165,14 +188,14 @@ pub struct EgfxBench {
 impl EgfxBench {
     /// A bench drawing to `canvas`. With `h264`, AVC frames decode through WebCodecs, as in a
     /// session with H.264 on; with `gpu`, EGFX renders through the WebGL2 backend; with
-    /// `workers` (and `gpu`), RemoteFX Progressive decodes in a Web Worker, and with
-    /// `verify_workers` every Worker job is compared with in-thread decoding.
+    /// `workers` above 0 (and `gpu`), RemoteFX Progressive decodes in that many Web Workers,
+    /// and with `verify_workers` every job is compared with in-thread decoding.
     #[wasm_bindgen(js_name = create)]
     pub async fn create(
         canvas: HtmlCanvasElement,
         h264: bool,
         gpu: bool,
-        workers: bool,
+        workers: u32,
         verify_workers: bool,
     ) -> Result<EgfxBench, JsValue> {
         let h264 = h264 && crate::h264::probe_support().await;
@@ -186,7 +209,7 @@ impl EgfxBench {
         Ok(Self {
             presenter,
             h264,
-            workers: workers && gpu,
+            workers: if gpu { workers } else { 0 },
             verify_workers,
         })
     }
@@ -210,9 +233,10 @@ impl EgfxBench {
         };
         let (wake_tx, mut wake_rx) = futures_channel::mpsc::unbounded::<()>();
         let worker_counts = Arc::new(Mutex::new((0u32, 0u32)));
-        let progressive: Option<Box<dyn ProgressiveBackend>> = if self.workers {
+        let progressive: Option<Box<dyn ProgressiveBackend>> = if 0 < self.workers {
             let wake_tx = wake_tx.clone();
-            let backend = crate::rfx_worker::WorkerProgressiveBackend::new(move || {
+            let count = usize::try_from(self.workers).unwrap_or(1);
+            let backend = crate::rfx_worker::WorkerProgressiveBackend::new(count, move || {
                 let _ = wake_tx.unbounded_send(());
             })
             .ok_or_else(|| JsValue::from_str("RemoteFX worker unavailable"))?;
@@ -339,6 +363,14 @@ impl EgfxBench {
         let (over_budget, over_limit) = (over(50.0), over(150.0));
         let message = percentiles(&mut message_ms);
         let (worker_jobs, worker_mismatches) = worker_counts.lock().map(|counts| *counts).unwrap_or_default();
+        // Decode throughput: jobs over the busiest Worker's decoding time (each Worker gets
+        // every job, its shard of the tiles).
+        let (busy_ms, decoded_jobs) = if 0 < self.workers {
+            crate::rfx_worker::busy_ms()
+        } else {
+            (Vec::new(), 0)
+        };
+        let busiest_ms = busy_ms.iter().copied().fold(0.0, f64::max);
 
         let result = Object::new();
         let frames = frame_ends.len();
@@ -367,11 +399,27 @@ impl EgfxBench {
             ("uploadMsMaxPerMessage", upload_ms_max),
             ("workerJobs", f64::from(worker_jobs)),
             ("workerMismatches", f64::from(worker_mismatches)),
+            ("workers", f64::from(self.workers)),
+            ("workerJobsDecoded", f64::from(decoded_jobs)),
+            ("workerBusyMsMax", busiest_ms),
+            (
+                "jobsPerSecond",
+                if 0.0 < busiest_ms {
+                    f64::from(decoded_jobs) * 1000.0 / busiest_ms
+                } else {
+                    0.0
+                },
+            ),
         ];
         for (key, value) in fields {
             Reflect::set(&result, &JsValue::from_str(key), &JsValue::from_f64(value))?;
         }
         Reflect::set(&result, &JsValue::from_str("samples"), &samples)?;
+        let busy = Array::new();
+        for ms in busy_ms {
+            busy.push(&JsValue::from_f64(ms));
+        }
+        Reflect::set(&result, &JsValue::from_str("workerBusyMs"), &busy)?;
         Ok(result.into())
     }
 }

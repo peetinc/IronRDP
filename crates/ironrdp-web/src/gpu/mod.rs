@@ -932,12 +932,17 @@ impl SurfaceBackend for GlBackend {
     }
 
     fn write_external_tiles(&mut self, surface_id: u16, handle: u64) {
-        let Some(tiles) = crate::rfx_worker::take_tiles(handle) else {
+        let Some(parts) = crate::rfx_worker::take_tiles(handle) else {
             warn!(surface_id, handle, "RemoteFX tiles are gone before drawing");
             return;
         };
-        self.with(|state| state.upload_packed(surface_id, &tiles));
-        crate::rfx_worker::return_buffer(tiles);
+        // One part per Worker; their placements never overlap, so the order does not matter.
+        for tiles in parts {
+            if !tiles.placements.is_empty() {
+                self.with(|state| state.upload_packed(surface_id, &tiles));
+            }
+            crate::rfx_worker::return_buffer(tiles);
+        }
     }
 
     fn end_frame(&mut self) {
